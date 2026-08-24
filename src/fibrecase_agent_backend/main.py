@@ -13,9 +13,10 @@ engine, repository and service; everything else is passed down.
 from __future__ import annotations
 
 import logging
+import sys
 
 from .agent.service import AgentService
-from .config import Config, load_config
+from .config import Config, ConfigError, load_config
 from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
 from .llm.client import OpenAIClient
@@ -26,7 +27,14 @@ logger = logging.getLogger("main")
 
 
 class AgentBackend:
-    """Owns the runtime objects and their lifecycle (startup/shutdown)."""
+    """Owns the runtime objects and their lifecycle (startup/shutdown).
+
+    The Telegram ``Application.run_polling()`` call is *blocking* and owns its
+    own event loop (it must not itself be awaited inside ``asyncio.run``). So
+    we drive the whole program from a plain synchronous function and do our
+    own DB/LLM work inside the application's ``post_init`` / ``post_shutdown``
+    hooks, which PTB runs inside that loop.
+    """
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -45,46 +53,49 @@ class AgentBackend:
             system_prompt=config.system_prompt,
             max_context_messages=config.max_context_messages,
         )
-        self.application = build_application(config, self.service, self.repository)
+        application = build_application(config, self.service, self.repository)
+        application.post_init = self._post_init
+        application.post_shutdown = self._post_shutdown
+        self.application = application
 
-    async def init(self) -> None:
+    # PTB lifecycle hooks (run inside the application's own event loop) ------
+    async def _post_init(self, application) -> None:
         await init_db(self.engine)
         logger.info(
             "agent backend initialised",
             extra={"model": self.config.openai_model, "allowed_users": sorted(self.config.allowed_user_ids)},
         )
 
-    async def run(self) -> None:
-        """Start long polling and block until the process is stopped.
-
-        ``run_polling`` owns the PTB lifecycle (initialize → start → poll →
-        stop → shutdown). We only add our own cleanup for the objects PTB
-        does not manage (the LLM client and the DB engine).
-        """
+    async def _post_shutdown(self, application) -> None:
+        logger.info("shutting down agent backend")
         try:
-            await self.application.run_polling(drop_pending_updates=True)
-            logger.info("telegram long polling stopped")
-        finally:
-            logger.info("shutting down agent backend")
             await self.llm.aclose()
+        finally:
             await self.engine.dispose()
 
-
-async def async_main() -> None:
-    config = load_config()
-    configure_logging(config.log_level)
-
-    backend = AgentBackend(config)
-    await backend.init()
-    await backend.run()
+    def run(self) -> None:
+        """Start long polling and block until the process is stopped (Ctrl+C)."""
+        logger.info("starting telegram long polling")
+        self.application.run_polling(drop_pending_updates=True)
 
 
 def main() -> None:
-    """Synchronous entrypoint (used by the console script and ``-m``)."""
-    import asyncio
+    """Synchronous entrypoint (used by the console script and ``-m``).
 
+    ``load_config`` may raise :class:`ConfigError` for missing secrets; that is
+    a configuration problem, not a crash, so we print a clean message.
+    """
     try:
-        asyncio.run(async_main())
+        config = load_config()
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        print("Hint: cp .env.example .env and fill in the values, then re-run.", file=sys.stderr)
+        sys.exit(2)
+
+    configure_logging(config.log_level)
+    backend = AgentBackend(config)
+    try:
+        backend.run()
     except KeyboardInterrupt:
         pass
 
