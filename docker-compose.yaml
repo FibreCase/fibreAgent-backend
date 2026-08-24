@@ -1,0 +1,35 @@
+# Agent Backend — single-service deployment.
+#
+#   cp .env.docker.example .env.docker   # fill in tokens (never committed)
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# The app is outbound-only (Telegram long polling + LLM API): nothing to expose.
+
+services:
+  agent-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fibrecase-agent-backend
+    container_name: fibrecase-agent-backend
+
+    # Config comes from a local env file, NOT baked into the image.
+    # `cp .env.docker.example .env.docker` first — it is git-ignored.
+    env_file:
+      - .env.docker
+
+    # Persist the SQLite conversation store across restarts and image rebuilds.
+    volumes:
+      - agent-data:/app/data
+    # Optional: point at a different system prompt without rebuilding the image:
+    # - ./config/system_prompt.txt:/app/config/system_prompt.txt:ro
+
+    # Restart if it exits (OOM, transient LLM/Telegram hiccup, host reboot).
+    # The bot is a single long-running process; this keeps it up.
+    restart: unless-stopped
+
+    # Outbound-only long polling — no inbound ports.
+
+volumes:
+  agent-data:

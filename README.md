@@ -240,9 +240,45 @@ sqlite3 data/agent.db "select role, substr(content,1,40) from messages order by 
 
 ---
 
+## 12. Docker 部署
+
+仓库自带 `Dockerfile` 与 `docker-compose.yaml`。镜像构建走 `uv`，安装的是 `uv.lock` 里锁定的**精确**依赖版本；运行时以非 root 用户（uid 10001）启动。
+
+**关键点：** 本服务只发起**出站**连接（Telegram long polling + LLM API），**没有任何入站端口**，所以 compose 里**不声明 `ports`**——这是正常的，不是漏配。
+
+### 用 Docker Compose（推荐）
+
+```bash
+cp .env.docker.example .env.docker   # 填入真实 token / 模型配置（.env.docker 已被 gitignore）
+docker compose up -d --build         # 构建并后台运行
+docker compose logs -f               # 看日志；出现 "agent backend initialised" 即就绪
+docker compose down                  # 停止（数据卷保留）
+```
+
+### 用原生 docker
+
+```bash
+docker build -t fibrecase-agent-backend .
+docker run --rm -d \
+  --name fibrecase-agent-backend \
+  --env-file .env.docker \
+  -v agent-data:/app/data \
+  --restart unless-stopped \
+  fibrecase-agent-backend
+```
+
+### 持久化与配置
+
+- **数据持久化**：SQLite 库在容器内 `/app/data/agent.db`。用 `agent-data` 数据卷（compose）或 `-v agent-data:/app/data`（docker run）挂载，重启、`compose down`、甚至**重建镜像**都不会丢对话。
+- **配置来源**：容器内从**环境变量**读取（`env_file` / `--env-file`），`.env.docker` **不会**被打进镜像（`.dockerignore` 已排除）。`.env.docker.example` 是可提交的模板，`.env.docker` 是含密钥的本地文件，二者都**绝不提交**（`.gitignore` 处理）。
+- **系统提示词**：镜像里已内置 `config/system_prompt.txt`（`WORKDIR=/app`，与 `.env` 中 `SYSTEM_PROMPT_PATH` 的相对路径一致）。想临时改用别的文件而不重建镜像，可在 compose 里加一行挂载（文件内已注明）。
+- **优雅停机**：`docker stop` / `compose down` 发 SIGTERM，PTB 会捕获并触发 `post_shutdown`（关闭 LLM 客户端与数据库连接），不会丢正在写的 SQLite 数据。
+
+---
+
 ## Future architecture
 
-Phase 1 明确**不实现**：MCP、SSH、Docker、Web search、RAG、向量库、Redis、PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/图像/TTS/STT。
+Phase 1 明确**不实现**：MCP、SSH、让 Agent *调用* Docker（作为工具）、Web search、RAG、向量库、Redis、PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/图像/TTS/STT。
 
 扩展方向（已在代码结构中留好接口，但尚未实现）：
 

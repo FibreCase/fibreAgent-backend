@@ -14,6 +14,7 @@ wheels/
 .env
 .env.*
 !.env.example
+!.env.docker.example
 
 # Local runtime data (SQLite database, etc.) — keep the dir via .gitkeep
 data/*

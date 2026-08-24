@@ -1,0 +1,33 @@
+# --- Secrets / local config: NEVER build these into the image ---------------
+.env
+.env.*
+
+# --- Local runtime data (SQLite DB, etc.) -----------------------------------
+data/*
+
+# --- Virtual environments (installed fresh by uv during the build) ----------
+.venv
+**/.venv
+
+# --- Python build / test artifacts ------------------------------------------
+__pycache__/
+*.py[oc]
+*.egg-info
+build/
+dist/
+wheels/
+.pytest_cache/
+
+# --- Dev-only: tests aren't needed at runtime -------------------------------
+tests/
+
+# --- Repo / OS noise --------------------------------------------------------
+.git/
+.gitignore
+.github/
+Dockerfile
+docker-compose.yaml
+.dockerignore
+TASK.md
+CLAUDE.md
+.DS_Store
