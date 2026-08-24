@@ -8,6 +8,6 @@ Keep this package init light — subpackages are imported where needed so that
 importing the package does not pull in the OpenAI/Telegram SDKs.
 """
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 __all__ = ["__version__"]
