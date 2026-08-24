@@ -4,10 +4,9 @@
 .envrc
 
 # --- Local runtime data (SQLite DB + WAL/SHM sidecar files) ------------------
-# `agent-data/` is the local dir behind the compose bind mount (./agent-data) —
+# data/ is the local dir behind the compose bind mount (./data:/app/data) —
 # it holds a live DB and must never be baked into the image.
 data/*
-agent-data/
 *.db
 *.sqlite
 *.sqlite3

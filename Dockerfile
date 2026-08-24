@@ -3,7 +3,7 @@
 # Agent Backend — production image.
 #
 #   docker build -t fibrecase-agent-backend .
-#   docker run --rm --env-file .env -v agent-data:/app/data fibrecase-agent-backend
+#   docker run --rm --env-file .env --user "$(id -u):$(id -g)" -v ./data:/app/data fibrecase-agent-backend
 #
 # The app only makes *outbound* connections (Telegram long polling + the
 # OpenAI-compatible API). There is nothing to expose inbound, so no EXPOSE.
@@ -51,6 +51,10 @@ ENV VIRTUAL_ENV=/opt/venv \
 # runtime, so only it needs to be owned by the agent user; the rest of /app
 # (source, config, /opt/venv) is just read, and root's COPY/uv output is
 # world-readable by default.
+#
+# For a *named volume* this pre-creates the dir with the right owner. For a
+# *bind mount* (compose mounts ./data over it) the host dir's own ownership
+# wins, so run the container as the host uid (compose `user:` / see README).
 RUN mkdir -p /app/data && chown agent:agent /app/data
 USER agent
 

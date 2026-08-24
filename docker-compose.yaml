@@ -20,9 +20,19 @@ services:
     env_file:
       - .env
 
+    # Run the container as the *host* user so the bind-mounted ./data keeps
+    # normal host permissions (owned by you, 755) AND is writable by the
+    # container — no chown, and the DB stays readable from the host.
+    # Set HOST_UID/HOST_GID in .env to your uid/gid (`id -u` / `id -g`).
+    #   Linux desktop first user: 1000 · macOS default user: 501
+    # (If you'd rather keep the dedicated uid 10001, drop this line and use a
+    # named volume instead of the bind mount — see README 12.)
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+
     # Persist the SQLite conversation store across restarts and image rebuilds.
+    # ./data is shared with the local `uv run` — same file, same permissions.
     volumes:
-      - ./agent-data:/app/data
+      - ./data:/app/data
     # Optional: point at a different system prompt without rebuilding the image:
     # - ./config/system_prompt.txt:/app/config/system_prompt.txt:ro
 
