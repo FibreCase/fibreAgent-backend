@@ -12,9 +12,14 @@ Responsibilities, per message:
 2. load history,
 3. append + persist the user message,
 4. build context (system prompt + recent window),
-5. call the LLM,
+5. call the LLM — via the tool loop when tools are enabled, or a single
+   completion when they are not (phase-one behaviour),
 6. persist the assistant reply,
 7. return the reply text.
+
+Only the user turn and the *final* assistant turn are persisted; the
+intermediate tool-call / tool-result turns of the loop are not stored, so the
+conversation schema is unchanged from phase one.
 
 Provider failures are translated into a :class:`AgentError` whose ``user_safe``
 message is generic and safe to show to a user, while the structured cause is
@@ -29,17 +34,20 @@ from contextlib import asynccontextmanager
 
 from ..database.repository import ConversationRepository, MessageRecord
 from ..llm.client import LLMError, OpenAIClient
+from ..tools.registry import ToolRegistry
 from .context import ChatMessage, build_context
+from .tool_loop import ToolLoopLimitError, run_tool_loop
 
 logger = logging.getLogger("agent")
 
-# Stable, user-safe replies per provider failure category. None of these leak
+# Stable, user-safe replies per failure category. None of these leak
 # internal details (stack traces, keys, headers, paths).
 _USER_SAFE: dict[str, str] = {
     "timeout": "模型请求超时，请稍后重试。",
     "http_error": "模型服务暂时不可用。",
     "connection": "无法连接模型服务，请稍后重试。",
     "empty_response": "模型服务暂时不可用。",
+    "tool_limit": "处理该请求时工具调用次数过多，请重新尝试。",
     "error": "模型服务暂时不可用。",
 }
 _DEFAULT_USER_SAFE = "模型服务暂时不可用。"
@@ -66,11 +74,19 @@ class AgentService:
         *,
         system_prompt: str,
         max_context_messages: int = 50,
+        registry: ToolRegistry | None = None,
+        enable_tools: bool = False,
+        max_tool_iterations: int = 5,
     ) -> None:
         self._repo = repository
         self._llm = llm
         self._system_prompt = system_prompt
         self._max_context_messages = max_context_messages
+        # Tools are opt-in: when disabled (or no registry is supplied) the
+        # service behaves exactly as in phase one — a single LLM call, no tools.
+        self._enable_tools = enable_tools
+        self._registry = registry
+        self._max_tool_iterations = max_tool_iterations
         self._locks: dict[int, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ locks
@@ -115,13 +131,31 @@ class AgentService:
             context = build_context(self._system_prompt, [*history, ChatMessage("user", text)])
 
             try:
-                result = await self._llm.complete(context)
+                if self._enable_tools:
+                    result = await run_tool_loop(
+                        self._llm,
+                        context,
+                        self._registry,
+                        max_iterations=self._max_tool_iterations,
+                    )
+                else:
+                    # Phase-one path: one completion, no tools.
+                    result = await self._llm.complete(context)
             except LLMError as exc:
                 logger.error(
                     "llm failure",
                     extra={"conversation_id": conversation_id, "category": exc.category},
                 )
                 raise AgentError(_user_safe_for(exc.category), exc.category) from exc
+            except ToolLoopLimitError as exc:
+                logger.error(
+                    "tool loop limit reached",
+                    extra={
+                        "conversation_id": conversation_id,
+                        "max_iterations": self._max_tool_iterations,
+                    },
+                )
+                raise AgentError(_user_safe_for("tool_limit"), "tool_limit") from exc
 
             await self._repo.add_message(conversation_id, "assistant", result.text)
             logger.info(

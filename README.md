@@ -2,19 +2,21 @@
 
 一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**。
 
-当前阶段（Phase 1）只做一件事：让你在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，并且**对话历史持久化**——重启后上下文不丢失。
+当前阶段（Phase 1 + Phase 2.1）让你在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失。Phase 2.1 在此之上加入了**工具调用**：Agent 可以调用少量安全的内置工具来回答问题。
 
-> **重要：当前 Agent 没有任何工具权限，它只能聊天。**
-> 它不能执行命令、控制设备、读写文件。如果用户要求执行操作，它只会明确说明「当前 Agent 尚未配置工具能力」。
+> **重要：当前内置工具仅限只读/无害操作**：`get_current_time`（当前时间）、`echo`（回显）、`system_info`（主机名/平台/Python 版本）。
+> 它**不能**执行命令、控制设备、读写文件、联网扫描。如果用户要求超出工具能力的操作，它会明确说明「当前尚未配置相应工具」。
 
-架构上它不是「一个 Telegram chatbot」，而是从第一版就分层：
+架构上它不是「一个 Telegram chatbot」，而是从第一版就分层，Tool loop 也已经插在 `Agent Service` 和 `LLM Client` 之间：
 
 ```
-Telegram Adapter   →   Agent Service   →   LLM Client   →   Persistent Conversation
-（适配器）            （渠道无关的核心）    （OpenAI 兼容）   （SQLite）
+Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   →   Persistent Conversation
+（适配器）            （渠道无关的核心）    （工具循环）    （OpenAI 兼容）   （SQLite）
+                                  ↑
+                          Tool Registry（get_current_time / echo / system_info）
 ```
 
-以后在 `Agent Service` 和 `LLM Client` 之间插入 Tool/MCP loop 即可扩展能力，而不用重写 Telegram 层。
+要扩展能力，只需往 Tool Registry 里加一个实现 `Tool` 接口的工具（未来 MCP/SSH/Docker/Pi 都是这样接入的 Tool Provider），**不用重写 Telegram 层**。
 
 ---
 
@@ -23,8 +25,9 @@ Telegram Adapter   →   Agent Service   →   LLM Client   →   Persistent Con
 - 通过 **Telegram Bot**（long polling）与 Agent 对话。
 - 使用远程 **OpenAI 兼容**（Chat Completions API）的 LLM 生成回复。
 - 对话历史持久化到 **SQLite**，重启后可完整恢复 conversation context。
+- 支持 **工具调用**（Phase 2.1）：内置 `get_current_time` / `echo` / `system_info` 三个只读安全工具，可开启/关闭。
 - 仅允许你配置的 Telegram User ID 使用，其他人静默拒绝。
-- 无 Web UI、无 MCP、无工具、无外部依赖数据库。
+- 无 Web UI、无 MCP（Phase 2.2+）、无危险/状态变更类工具、无外部依赖数据库。
 
 ---
 
@@ -110,6 +113,8 @@ cp .env.example .env
 | `SYSTEM_PROMPT_PATH` | system prompt 文件路径，默认 `config/system_prompt.txt`。 |
 | `SYSTEM_PROMPT` | 可选：内联 system prompt，**若设置则覆盖文件**。 |
 | `MAX_CONTEXT_MESSAGES` | context 中携带的**最近 N 条消息**（消息数，不是 token 数），默认 `50`，另加一条 system 消息。 |
+| `ENABLE_TOOLS` | 是否启用工具调用循环，默认 `true`。设为 `false` 时完全退回 Phase 1 纯对话行为（不传 tools、不做任何工具相关持久化）。 |
+| `MAX_TOOL_ITERATIONS` | 单条消息内 LLM↔工具的最大往返次数，默认 `5`。超过则返回一条通用的「工具调用次数过多」提示。 |
 | `LOG_LEVEL` | 日志级别，默认 `INFO`。 |
 
 > ⚠️ `OPENAI_BASE_URL` 是最容易踩坑的一项。已经用本地 HTTP server 实测验证：填 `.../v1` 时，SDK 实际请求的就是 `.../v1/chat/completions`，与你的 endpoint 完全一致。
@@ -190,7 +195,7 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
   | --- | --- |
   | `id` | 自增主键 |
   | `conversation_id` | 外键 → conversations.id（级联删除） |
-  | `role` | `system` / `user` / `assistant`（schema 已允许 `tool`，供未来 tool 使用） |
+  | `role` | `system` / `user` / `assistant`（schema 已允许 `tool`，为工具调用预留；当前只写 user/assistant） |
   | `content` | 消息文本 |
   | `created_at` | 时间戳 |
 
@@ -268,27 +273,39 @@ docker compose down                    # 停止（数据卷保留）
 
 ---
 
-## Future architecture
+## Tool calling（Phase 2.1 已实现）
 
-Phase 1 明确**不实现**：MCP、SSH、让 Agent *调用* Docker（作为工具）、Web search、RAG、向量库、Redis、PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/图像/TTS/STT。
-
-扩展方向（已在代码结构中留好接口，但尚未实现）：
+工具调用循环已经在 `Agent Service` 和 `LLM Client` 之间落地：
 
 ```
-Agent
-  ↓
-LLM（已支持 OpenAI-style tool calling 的模型）
-  ↓  ← 未来在这里插入 Tool / MCP loop
-Tool Calls
-  ↓
-MCP Client
-  ↓
-Tools（SSH / Docker / Filesystem / Pi / Camera / Home Assistant / Web Search …）
+Telegram → Agent Service → Tool Loop → LLM（支持 OpenAI-style tool calling 的模型）
+                                   ↑ tool_calls?
+                              Tool Registry
+                                   ↓
+              get_current_time / echo / system_info   （未来：MCP / SSH / Docker / Pi …）
 ```
 
-因为 `AgentService` 已经渠道无关、`OpenAIClient.complete()` 的 messages 已经是 OpenAI 结构、`messages.role` 也已允许 `tool`，所以加 tool 时：
-- 在 `AgentService.process_message` 里，拿到模型返回的 `tool_calls` 后循环执行工具、把 `tool` 结果回灌 messages，直到模型给出最终文本；
-- `OpenAIClient` 增加对 `tools=` 参数与 `tool_calls` 返回的透传；
-- 可再引入一个 `MCPClient` 统一管理外部工具。
+- `agent/tool_loop.py`：拿到模型返回的 `tool_calls` 后循环执行工具、把 `tool` 结果回灌 messages，直到模型给出最终文本（或用尽 `MAX_TOOL_ITERATIONS`）。
+- `tools/`：`Tool` 接口 + `ToolRegistry`（注册 / 生成 OpenAI tools schema / 按名执行）+ 三个内置只读工具。
+- `OpenAIClient.complete()` 已支持 `tools=` 参数与 `tool_calls` 返回透传。
+- **持久化不变**：只存 `user` + 最终 `assistant`，不存中间的 tool 往返，`messages.role` 虽已允许 `tool` 但不会被写入。
+- `ENABLE_TOOLS=false` 时完全退回 Phase 1 纯对话路径。
 
-Telegram 层与 Agent Service 之间的边界保持不变，届时接新渠道也无需改动。
+**加一个新工具**：实现 `tools.base.Tool`（`name`/`description`/`parameters`/`async execute`），在 `tools/builtin/__init__.py::build_default_tools()` 里 `registry.add(…)` 即可——**不要**在别处写 `if name == "…"` 分支，registry 是唯一分发点。
+
+## 当前限制（Phase 2.1）
+
+- 仅 3 个只读内置工具；**无** shell 执行、文件读写、联网扫描、SSH/Docker、任何状态变更类工具（有意为之）。
+- 工具参数**不做 schema 校验**就直接 `execute`；**无**权限审批（只有 allow-list 的 chat 能触发已注册工具）；单个工具**无独立超时**。
+- tool 往返不落库，无法事后回放/审计。
+
+## Future（Phase 2.2+，尚未实现）
+
+Phase 1 起就明确不实现、Phase 2.1 仍未涉及：**MCP、SSH、让 Agent *调用* Docker、Web search、RAG**、向量库、Redis、PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/图像/TTS/STT。
+
+下一批能力都应作为 **Tool Provider** 接入同一个 `Tool`/`ToolRegistry` 接口，而不是改动 service / LLM client / Telegram 层：
+
+- **MCP**：实现一个 `MCPClient`，把远端 server 的工具列表拉下来、逐个包装成 `Tool`（`execute` 转发到 MCP 调用），启动时 `registry.add(...)`。循环本身已经是工具无关的。
+- **SSH / Docker / Pi**：同样是 `Tool`（或产出多个工具的小 Provider），subprocess 等副作用关在工具内部。**注意：这类有副作用的工具上线前必须先加权限审批**（见"当前限制"）。
+
+保持不变式：Agent service 里不放 Telegram 逻辑；OpenAI SDK 只在 `llm/client.py` 引入；日志不出现任何 secret 或完整消息体；`ENABLE_TOOLS=false` 永远是完整的 Phase 1 降级。

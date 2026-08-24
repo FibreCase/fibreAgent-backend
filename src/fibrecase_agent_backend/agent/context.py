@@ -9,17 +9,31 @@ token-based strategy is introduced later.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
 class ChatMessage:
-    """A single chat message in an OpenAI-compatible shape."""
+    """A single chat message in an OpenAI-compatible shape.
+
+    ``tool_calls`` / ``tool_call_id`` are only populated on the assistant and
+    tool turns created by the tool loop (:mod:`.tool_loop`); they stay ``None``
+    for every phase-one (chat-only) message, so ``to_dict()`` output — and the
+    messages persisted to the database — are unchanged there.
+    """
 
     role: str
     content: str
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"role": self.role, "content": self.content}
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.tool_calls is not None:
+            d["tool_calls"] = self.tool_calls
+        if self.tool_call_id is not None:
+            d["tool_call_id"] = self.tool_call_id
+        return d
 
 
 def build_context(

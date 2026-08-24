@@ -2,21 +2,57 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from fibrecase_agent_backend.agent.service import AgentError, AgentService
-from fibrecase_agent_backend.llm.client import LLMError
+from fibrecase_agent_backend.llm.client import LLMError, LLMResult
+from fibrecase_agent_backend.tools import build_default_tools
 
 from conftest import FakeLLM, RecordingLLM
 
 
-def _service(repo, llm, max_context=50):
+def _service(repo, llm, max_context=50, **kwargs):
     return AgentService(
         repo,
         llm,
         system_prompt="You are a test agent.",
         max_context_messages=max_context,
+        **kwargs,
     )
+
+
+def _tc(name, args, cid="call_1"):
+    return {
+        "id": cid,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args)},
+    }
+
+
+class ScriptedToolLLM:
+    """Returns a scripted list of results, one per complete() call."""
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = 0
+
+    async def complete(self, messages, **kwargs):
+        self.calls += 1
+        return self.results.pop(0)
+
+
+class AlwaysCallsToolLLM:
+    """Always requests a tool — never produces a final text answer."""
+
+    def __init__(self, name="echo", args=None):
+        self._tc = _tc(name, args or {"message": "x"})
+        self.calls = 0
+
+    async def complete(self, messages, **kwargs):
+        self.calls += 1
+        return LLMResult(content=None, tool_calls=[self._tc])
 
 
 async def test_process_message_saves_and_returns(repo):
@@ -146,3 +182,61 @@ async def test_different_conversations_run_concurrently(repo):
     assert [r.role for r in a_records] == ["user", "assistant", "user", "assistant"]
     b_records = await repo.get_messages(b.id)
     assert [r.role for r in b_records] == ["user", "assistant", "user", "assistant"]
+
+
+# ---------------------------------------------------------------------------
+# tool-calling integration (phase 2.1)
+# ---------------------------------------------------------------------------
+async def test_enabled_tools_persist_only_user_and_final_assistant(repo):
+    conv = await repo.get_or_create_conversation(1, 1)
+    llm = ScriptedToolLLM([
+        LLMResult(content=None, tool_calls=[_tc("get_current_time", {})]),
+        LLMResult(content="It's 12:00."),
+    ])
+    service = _service(
+        repo, llm,
+        registry=build_default_tools(), enable_tools=True, max_tool_iterations=5,
+    )
+
+    reply = await service.process_message(conv.id, "what time is it?")
+    assert reply == "It's 12:00."
+
+    # Only the user turn and the final assistant turn are stored — the
+    # intermediate tool-call / tool-result turns are NOT persisted.
+    records = await repo.get_messages(conv.id)
+    assert [(r.role, r.content) for r in records] == [
+        ("user", "what time is it?"),
+        ("assistant", "It's 12:00."),
+    ]
+
+
+async def test_enabled_tools_limit_raises_user_safe_error(repo):
+    conv = await repo.get_or_create_conversation(1, 1)
+    llm = AlwaysCallsToolLLM()
+    service = _service(
+        repo, llm,
+        registry=build_default_tools(), enable_tools=True, max_tool_iterations=5,
+    )
+
+    with pytest.raises(AgentError) as excinfo:
+        await service.process_message(conv.id, "keep calling")
+
+    assert excinfo.value.category == "tool_limit"
+    assert "Traceback" not in excinfo.value.user_safe
+    assert "Bearer" not in excinfo.value.user_safe
+    # The loop made exactly max_tool_iterations LLM calls before giving up.
+    assert llm.calls == 5
+    # On failure no assistant message is persisted.
+    assert [r.role for r in await repo.get_messages(conv.id)] == ["user"]
+
+
+async def test_tools_disabled_stays_single_call(repo):
+    conv = await repo.get_or_create_conversation(1, 1)
+    llm = FakeLLM(replies=["plain reply"])
+    # enable_tools=False (the default): even with a registry present, no tools.
+    service = _service(repo, llm, registry=build_default_tools(), enable_tools=False)
+
+    reply = await service.process_message(conv.id, "hi")
+    assert reply == "plain reply"
+    assert len(llm.calls) == 1
+    assert [r.role for r in await repo.get_messages(conv.id)] == ["user", "assistant"]

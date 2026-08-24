@@ -40,6 +40,9 @@ class Config:
     system_prompt_path: Path
     max_context_messages: int
 
+    enable_tools: bool
+    max_tool_iterations: int
+
     log_level: str = "INFO"
     system_prompt_override: str | None = field(default=None)
 
@@ -59,6 +62,8 @@ class Config:
             raise ConfigError("OPENAI_MODEL is not set")
         if self.max_context_messages < 1:
             raise ConfigError("MAX_CONTEXT_MESSAGES must be >= 1")
+        if self.max_tool_iterations < 1:
+            raise ConfigError("MAX_TOOL_ITERATIONS must be >= 1")
 
     @property
     def system_prompt(self) -> str:
@@ -70,7 +75,7 @@ class Config:
         return (
             "你是一个运行在用户私人服务器上的个人 AI Agent。"
             "你需要准确、简洁地回答用户问题。"
-            "当前你只能进行对话，不能执行任何外部操作。"
+            "你可以调用可用工具来回答问题（例如查询当前时间、获取系统信息）。"
         )
 
 
@@ -85,6 +90,17 @@ def _parse_user_ids(raw: str) -> frozenset[int]:
         except ValueError as exc:
             raise ConfigError(f"invalid Telegram user id in TELEGRAM_ALLOWED_USER_IDS: {part!r}") from exc
     return frozenset(ids)
+
+
+def _parse_bool(raw: str, default: bool) -> bool:
+    raw = raw.strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on", "y", "t"):
+        return True
+    if raw in ("0", "false", "no", "off", "n", "f"):
+        return False
+    raise ConfigError(f"invalid boolean value: {raw!r}")
 
 
 def _parse_float(raw: str, default: float) -> float:
@@ -124,6 +140,8 @@ def load_config() -> Config:
         database_url=os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/agent.db").strip(),
         system_prompt_path=Path(os.environ.get("SYSTEM_PROMPT_PATH", "config/system_prompt.txt")),
         max_context_messages=_parse_int(os.environ.get("MAX_CONTEXT_MESSAGES", ""), 50),
+        enable_tools=_parse_bool(os.environ.get("ENABLE_TOOLS", ""), True),
+        max_tool_iterations=_parse_int(os.environ.get("MAX_TOOL_ITERATIONS", ""), 5),
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,
     )

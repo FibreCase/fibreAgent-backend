@@ -1,13 +1,14 @@
 """Application entrypoint and composition root.
 
-Wires the four low-coupling pieces together and runs the long-polling bot:
+Wires the low-coupling pieces together and runs the long-polling bot:
 
-    config ──┐
+    config ─┐
     database ─┼─▶ AgentService ─▶ Telegram Application (long polling)
-    llm ──────┘
+    llm ──────┤            ▲
+    tools ────┘            └─ tool registry (only active when ENABLE_TOOLS)
 
 This module is the *only* place that constructs the concrete LLM client,
-engine, repository and service; everything else is passed down.
+engine, repository, tool registry and service; everything else is passed down.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from .database.session import create_engine, create_session_factory, init_db
 from .llm.client import OpenAIClient
 from .logging_setup import configure_logging
 from .telegram.bot import build_application, compose_startup_hooks, register_command_menu
+from .tools.builtin import build_default_tools
 
 logger = logging.getLogger("main")
 
@@ -47,11 +49,18 @@ class AgentBackend:
             model=config.openai_model,
             timeout=config.openai_timeout,
         )
+        # The tool registry is built only when tools are enabled; when disabled
+        # the service degrades to the phase-one single-completion path.
+        registry = build_default_tools() if config.enable_tools else None
+        self.registry = registry
         self.service = AgentService(
             self.repository,
             self.llm,
             system_prompt=config.system_prompt,
             max_context_messages=config.max_context_messages,
+            registry=registry,
+            enable_tools=config.enable_tools,
+            max_tool_iterations=config.max_tool_iterations,
         )
         application = build_application(config, self.service, self.repository)
         # Chain the Telegram adapter's command-menu registration with our own
@@ -65,7 +74,12 @@ class AgentBackend:
         await init_db(self.engine)
         logger.info(
             "agent backend initialised",
-            extra={"model": self.config.openai_model, "allowed_users": sorted(self.config.allowed_user_ids)},
+            extra={
+                "model": self.config.openai_model,
+                "allowed_users": sorted(self.config.allowed_user_ids),
+                "tools_enabled": self.config.enable_tools,
+                "tools": self.registry.names() if self.registry else [],
+            },
         )
 
     async def _post_shutdown(self, application) -> None:
