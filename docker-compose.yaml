@@ -22,7 +22,7 @@ services:
 
     # Persist the SQLite conversation store across restarts and image rebuilds.
     volumes:
-      - agent-data:/app/data
+      - ./agent-data:/app/data
     # Optional: point at a different system prompt without rebuilding the image:
     # - ./config/system_prompt.txt:/app/config/system_prompt.txt:ro
 
@@ -31,6 +31,3 @@ services:
     restart: unless-stopped
 
     # Outbound-only long polling — no inbound ports.
-
-volumes:
-  agent-data:

@@ -19,6 +19,11 @@ wheels/
 data/*
 !data/.gitkeep
 
+# Local SQLite store for the Docker bind mount (docker-compose.yaml: ./agent-data).
+# Same data as data/, but kept out of git so a local `docker compose up` never
+# commits the DB.
+agent-data/
+
 # Local temporary notes / task specs — not part of the project
 TASK.md
 

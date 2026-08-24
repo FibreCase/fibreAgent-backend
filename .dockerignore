@@ -1,9 +1,19 @@
 # --- Secrets / local config: NEVER build these into the image ---------------
 .env
 .env.*
+.envrc
 
-# --- Local runtime data (SQLite DB, etc.) -----------------------------------
+# --- Local runtime data (SQLite DB + WAL/SHM sidecar files) ------------------
+# `agent-data/` is the local dir behind the compose bind mount (./agent-data) —
+# it holds a live DB and must never be baked into the image.
 data/*
+agent-data/
+*.db
+*.sqlite
+*.sqlite3
+*-journal
+*-wal
+*-shm
 
 # --- Virtual environments (installed fresh by uv during the build) ----------
 .venv
@@ -21,13 +31,23 @@ wheels/
 # --- Dev-only: tests aren't needed at runtime -------------------------------
 tests/
 
-# --- Repo / OS noise --------------------------------------------------------
+# --- Repo / CI / editor / tooling noise -------------------------------------
+# NOTE: README.md is intentionally NOT ignored — `uv sync` reads it (pyproject
+# `readme = README.md`) and the build fails without it in context.
 .git/
-.gitignore
 .github/
+.gitignore
+.gitattributes
 Dockerfile
 docker-compose.yaml
 .dockerignore
+.docker/
+Makefile
 TASK.md
 CLAUDE.md
+.ropeproject/
+.idea/
+.vscode/
+.claude/
+*.log
 .DS_Store
