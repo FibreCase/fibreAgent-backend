@@ -12,6 +12,18 @@ The design goal is that this is *not* a "Telegram chatbot". It is layered from d
 Telegram Adapter → Agent Service → LLM Client → Persistent Conversation (SQLite)
 ```
 
+## Status
+
+**Phase 1 is complete, tested, and shipped** — current version **v1.1.1** (tagged; a GitHub Action builds & pushes the image to **ghcr.io** on every `v*` tag push). Everything below is done, mocked-tested (50 tests), and verified running:
+
+- Telegram long-polling adapter: allow-list auth, `/start` `/new` `/help` `/status`, typing keep-alive, long-reply chunking, graceful error handling.
+- Channel-agnostic `AgentService` with per-conversation `asyncio.Lock` (serialise one chat, parallelise across chats).
+- `OpenAIClient` (OpenAI-compatible) with user-safe LLM-error translation.
+- Persistent SQLite conversations that **survive restarts** (verified across a simulated restart).
+- **Docker deployment** (`Dockerfile` + `docker-compose.yaml`, single shared `.env`).
+
+Only the "Extending (phase 2, not yet)" section remains unbuilt. Two runtime bugs were found and fixed *after* the initial implementation (both now covered by tests): the nested event-loop crash on startup, and the missing `CallbackContext` shortcuts (see Gotchas).
+
 ## Commands
 
 Dependency/env management is **uv**. There is no top-level `app/`; the package is `src/fibrecase_agent_backend`.
@@ -45,6 +57,7 @@ Two non-obvious rules:
 - **`database/`** — `models.py` (ORM), `session.py` (engine/session factory + `init_db`), `repository.py` (the only layer that touches ORM; handlers never write SQL). One Telegram chat = one conversation, keyed by `telegram_chat_id`.
 
 ### Gotchas that are easy to get wrong
+- **This PTB build strips `CallbackContext` shortcuts**: `context.user` / `.chat` / `.message` (and `.user_id`/`.chat_id`/`.effective_user`) do **not** exist here — only `.application`, `.bot`, `.bot_data`, `.error`, `.user_data`, `.chat_data`, … Reading any of the stripped attributes raises `AttributeError` at runtime. Handlers therefore read the sender/chat/message from the **`Update` object** (`update.effective_user` / `.effective_chat` / `.effective_message`). This build also has **no `Middleware` API**, so auth is per-handler. `Chat`/`Update`/`User`/`Message` are frozen `TelegramObject`s (you can't set attributes on instances — patch `Chat.send_message` at the **class** level in tests).
 - **OpenAI is a fork**: the installed `openai` uses `httpx2` (not plain `httpx`) as its HTTP layer. When mocking `client._client.chat.completions.create`, construct error responses with `httpx2.Response(...)` (see `tests/test_llm_client.py`).
 - **SQLAlchemy**: sessions use `expire_on_commit=False`. Do **not** read lazy-loaded ORM attributes (e.g. `conversation.messages`) after the session closes — use the repository's scalar return types (`MessageRecord`). SQLite has FK enforcement turned **on** via a connect event (needed for cascade deletes on reset).
 - **`conversations.id` uses `sqlite_autoincrement`** so a `/new` always yields a new, larger id (visible to the user). Don't remove it.
@@ -53,6 +66,14 @@ Two non-obvious rules:
 ## Testing
 
 `tests/conftest.py` provides an in-memory `repo` fixture and `FakeLLM` / `RecordingLLM` fakes. All 10 required behaviours are covered (db init, create conversation, save message, load history, reset, context builder, unauthorized user, LLM client, `process_message`, concurrency lock). **Never call the real LLM endpoint or Telegram in tests** — mock the SDK's `create` and the PTB handlers.
+
+## Deployment (Docker + CI) — done
+
+- **`Dockerfile`**: `python:3.14-slim` + `uv` (pinned to the lockfile's generator version), builds from the committed `uv.lock` for exact locked deps. Runs as an unprivileged user; `/app/data` is the only writable path. **No `EXPOSE`** — the app is outbound-only (Telegram long polling + LLM API), there is nothing inbound. `UV_PROJECT_ENVIRONMENT=/opt/venv` pins the venv (uv's `sync` ignores `--python` for venv selection — verified).
+- **`docker-compose.yaml`**: single service. Config from the **same `.env`** the local `uv run` uses (`env_file: .env`, git-ignored, never baked into the image). Persists SQLite via a **bind mount** `./data:/app/data` (shares the `data/` dir with the local run). `restart: unless-stopped`.
+- **`.dockerignore`**: keeps `.env*`, `data/`, `.venv`, `tests/`, `.git`, etc. out of the image. **`README.md` is deliberately NOT ignored** — `uv sync` reads it (`pyproject` `readme = README.md`) and the build fails without it.
+- **Host-uid mount**: the container runs as the host user (`user: "${HOST_UID:-1000}:${HOST_GID:-1000}"`, from `.env`) so the bind-mounted `./data` keeps normal host permissions (owned by you, `755`) **and** is writable by the container — no `chown` needed. A bind mount takes the host dir's ownership over the image's `/app/data`, so a non-owning uid would hit `EACCES` on first DB create.
+- **CI** (`.github/workflows/build-image.yml`): on every `v*` tag push, builds the image and pushes to **ghcr.io** (`ghcr.io/fibrecase/fibreagent-backend:<tag>` + `:<short-sha>`) using the built-in `GITHUB_TOKEN` with `packages: write`. Actions are on their Node-24 majors. Bump version in `pyproject.toml` + `src/fibrecase_agent_backend/__init__.py`, run `uv lock`, commit, `git tag -a vX.Y.Z`, `git push` + `git push origin vX.Y.Z`.
 
 ## Extending (phase 2, not yet)
 
