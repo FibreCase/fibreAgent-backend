@@ -34,7 +34,7 @@ Telegram Adapter   →   Agent Service   →   LLM Client   →   Persistent Con
                         ┌─────────────────────────────────────────┐
    Telegram  ──poll──▶  │  telegram/bot.py  (Adapter)             │
    (long polling)       │  · 鉴权 (allow-list)                    │
-                        │  · /start /reset /status               │
+                        │  · /start /new /help /status           │
                         │  · typing 保活                          │
                         │  · 长消息分块发送                        │
                         └───────────────┬─────────────────────────┘
@@ -148,6 +148,19 @@ uv run fibrecase-agent-backend
 
 > long polling 的原因：你的服务器可能没有公网 HTTP 入站能力，long polling 只出站连接 Telegram。
 
+### 可用命令
+
+Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或发 `/help` 查看）：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/start` | 启动 Agent / 查看当前会话（无会话时自动创建） |
+| `/new` | 开始新会话，清空本 chat 的历史上下文 |
+| `/status` | 查看运行状态（模型、会话 id、消息数） |
+| `/help` | 列出本帮助 |
+
+其它任何文字消息都会作为对话发给 Agent。
+
 ---
 
 ## 8. System Prompt 配置
@@ -181,7 +194,7 @@ uv run fibrecase-agent-backend
   | `content` | 消息文本 |
   | `created_at` | 时间戳 |
 
-- **一个 Telegram chat 对应一个 conversation**，`/reset` 只影响该 chat。
+- **一个 Telegram chat 对应一个 conversation**，`/new` 只影响该 chat。
 - 用命令行直接查看（可选）：
   ```bash
   uv run python -c "import sqlite3;print(sqlite3.connect('data/agent.db').execute('select count(*) from messages').fetchone())"
@@ -211,9 +224,10 @@ uv run fibrecase-agent-backend
 1. **启动** → 发 `/start` → 应正常返回「Agent 已启动…」
 2. 发「你好，我叫 Alice。」→ 再发「我叫什么？」→ 应回答「Alice。」
 3. **重启** backend，再发「我叫什么？」→ 仍应回答「Alice。」（**最关键的一条：上下文跨重启恢复**）
-4. 发 `/reset` → 再发「我叫什么？」→ 应**不**再知道 Alice。
-5. 发一条超长消息 → 不会触发 Telegram API 错误（自动分块，内容完整）。
-6. 快速连发两条消息 → 同一 conversation 串行处理，不会互相覆盖 context。
+4. 发 `/new` → 再发「我叫什么？」→ 应**不**再知道 Alice。（新会话，历史已清空）
+5. 发 `/help` → 应列出 `/start` `/new` `/status` `/help`。
+6. 发一条超长消息 → 不会触发 Telegram API 错误（自动分块，内容完整）。
+7. 快速连发两条消息 → 同一 conversation 串行处理，不会互相覆盖 context。
 
 ### 如何验证 SQLite 持久化（Test 3 的底层原理）
 

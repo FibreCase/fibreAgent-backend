@@ -5,7 +5,7 @@ to the channel-agnostic :class:`~..agent.service.AgentService` and handles the
 concerns specific to this transport:
 
 * user authorisation (only configured Telegram user ids may use the bot),
-* the ``/start``, ``/reset`` and ``/status`` commands,
+* the ``/start``, ``/new``, ``/help`` and ``/status`` commands,
 * a "typing…" keep-alive while the model is generating,
 * chunking of long model replies (the full reply is persisted *once*,
   upstream, in the Agent service),
@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Callable
 
-from telegram import Chat
+from telegram import BotCommand, Chat
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -51,6 +52,15 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 CHUNK_SIZE = 4000
 # Telegram only displays "typing…" for ~5 seconds, so refresh a bit faster.
 TYPING_REFRESH_SECONDS = 4.0
+
+# Single source of truth for the command list: rendered by ``cmd_help`` and
+# advertised to Telegram's native "/" menu. ``(command, short_description)``.
+_COMMANDS: list[tuple[str, str]] = [
+    ("start", "启动 / 查看当前 Agent"),
+    ("new", "开始新会话（清空历史）"),
+    ("status", "查看运行状态"),
+    ("help", "显示本帮助"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -188,14 +198,27 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def cmd_reset(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_new(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start a fresh conversation for this chat (drops all its history)."""
     if not _is_authorized(update, context):
         return
     chat = update.effective_chat
     user_id = update.effective_user.id
     service: AgentService = context.application.bot_data["agent_service"]
     await service.reset(chat.id, user_id)
-    await _send_long(chat, "会话已重置。")
+    await _send_long(chat, "已开始新的会话（历史已清空）。")
+
+
+async def cmd_help(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the available commands (generated from ``_COMMANDS``)."""
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    lines = ["可用命令：", ""]
+    for cmd, desc in _COMMANDS:
+        lines.append(f"/{cmd} — {desc}")
+    lines += ["", "其它文字消息都会发给 Agent。"]
+    await _send_long(chat, "\n".join(lines))
 
 
 async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -296,6 +319,36 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# startup hooks
+# ---------------------------------------------------------------------------
+def compose_startup_hooks(*hooks) -> Callable:
+    """Chain zero or more ``async (application) -> None`` hooks into one.
+
+    Lets the Telegram adapter advertise its command menu and the composition
+    root initialise the database without each overwriting the other's
+    ``post_init``. ``None`` hooks are skipped, so callers can pass optional
+    hooks positionally.
+    """
+    async def chained(application) -> None:
+        for hook in hooks:
+            if hook is not None:
+                await hook(application)
+    return chained
+
+
+async def register_command_menu(application) -> None:
+    """Advertise our commands in Telegram's native "/" menu (best-effort).
+
+    Runs in ``post_init`` (inside the running event loop) because it is a
+    network call. A failure here must not stop the bot from starting.
+    """
+    try:
+        await application.bot.set_my_commands([BotCommand(c, d) for c, d in _COMMANDS])
+    except TelegramError:
+        logger.warning("failed to set bot command menu", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # wiring
 # ---------------------------------------------------------------------------
 def build_application(
@@ -303,7 +356,11 @@ def build_application(
     service: AgentService,
     repository: ConversationRepository,
 ) -> Application:
-    """Assemble the PTB :class:`Application` and register all handlers."""
+    """Assemble the PTB :class:`Application` and register all handlers.
+
+    Startup work (command menu, DB init) is wired by the caller via
+    :func:`compose_startup_hooks`, not here — this only registers handlers.
+    """
     application = (
         ApplicationBuilder()
         .token(config.telegram_bot_token)
@@ -316,7 +373,8 @@ def build_application(
     application.bot_data["allowed_user_ids"] = set(config.allowed_user_ids)
 
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("reset", cmd_reset))
+    application.add_handler(CommandHandler("new", cmd_new))
+    application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("status", cmd_status))
     # Plain text messages (commands are excluded and handled above).
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

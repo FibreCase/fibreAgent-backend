@@ -38,7 +38,7 @@ Two non-obvious rules:
 
 ## Architecture & invariants (read before editing)
 
-- **`telegram/bot.py`** — the *only* module that knows about Telegram. Auth is an allow-list check (`_is_authorized`) done **in each handler** (this PTB build has no `Middleware` API). Unauthorised users are silently ignored — never reply to them. It calls `AgentService.process_message()` and never the OpenAI SDK. It also owns: `/start` `/reset` `/status`, a `typing` keep-alive loop, and **long-reply chunking** (`split_into_chunks`, which must never lose content).
+- **`telegram/bot.py`** — the *only* module that knows about Telegram. Auth is an allow-list check (`_is_authorized`) done **in each handler** (this PTB build has no `Middleware` API). Unauthorised users are silently ignored — never reply to them. It calls `AgentService.process_message()` and never the OpenAI SDK. It also owns: `/start` `/new` `/help` `/status`, a `typing` keep-alive loop, and **long-reply chunking** (`split_into_chunks`, which must never lose content). The command list lives in `_COMMANDS` (single source of truth for the `/help` reply *and* the native Telegram command menu advertised via `set_my_commands` in `register_command_menu`). Startup hooks (command menu + DB init) are chained with `compose_startup_hooks`.
 - **`agent/service.py`** — the channel-agnostic core (reusable for a future web/Discord/API). It holds a **per-conversation `asyncio.Lock`** (`conversation_lock`) so one chat is serialised while different chats run concurrently. Flow: acquire lock → load history → persist user turn → build context → call LLM → persist assistant turn → return text. LLM failures are translated to `AgentError` with a **generic, user-safe message** (no stack traces / keys / paths leak to Telegram).
 - **`agent/context.py`** — `build_context(system, history, max_n)` = system prompt + most recent N **messages** (N is a *message* count, not tokens; `MAX_CONTEXT_MESSAGES`). This is the single place to swap in token-based context management later.
 - **`llm/client.py`** — the *only* module that knows the OpenAI SDK. Wraps `AsyncOpenAI` in `complete() -> LLMResult` and translates all provider errors into one `LLMError` with a stable `category` (`timeout` / `http_error` / `connection` / `empty_response` / `error`). Empty/blank model content is treated as `empty_response`. `stream=True` is accepted but raises `NotImplementedError` (phase 1 is non-streaming).
@@ -47,7 +47,7 @@ Two non-obvious rules:
 ### Gotchas that are easy to get wrong
 - **OpenAI is a fork**: the installed `openai` uses `httpx2` (not plain `httpx`) as its HTTP layer. When mocking `client._client.chat.completions.create`, construct error responses with `httpx2.Response(...)` (see `tests/test_llm_client.py`).
 - **SQLAlchemy**: sessions use `expire_on_commit=False`. Do **not** read lazy-loaded ORM attributes (e.g. `conversation.messages`) after the session closes — use the repository's scalar return types (`MessageRecord`). SQLite has FK enforcement turned **on** via a connect event (needed for cascade deletes on reset).
-- **`conversations.id` uses `sqlite_autoincrement`** so a `/reset` always yields a new, larger id (visible to the user). Don't remove it.
+- **`conversations.id` uses `sqlite_autoincrement`** so a `/new` always yields a new, larger id (visible to the user). Don't remove it.
 - `data/` and its `.db` are created automatically at startup (`create_engine` makes the parent dir). Tests use in-memory SQLite via `StaticPool` — keep them that way (no real files).
 
 ## Testing

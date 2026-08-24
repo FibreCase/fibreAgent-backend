@@ -18,8 +18,11 @@ from telegram.ext import CallbackContext
 from fibrecase_agent_backend.telegram.bot import (
     CHUNK_SIZE,
     _is_authorized,
+    cmd_help,
+    cmd_new,
     cmd_start,
     cmd_status,
+    compose_startup_hooks,
     handle_message,
     split_into_chunks,
 )
@@ -182,6 +185,58 @@ async def test_cmd_status_reports_conversation():
         await cmd_status(update, context)
     sent = send.await_args.kwargs["text"]
     assert "Status: OK" in sent and "test-model" in sent
+
+
+async def test_cmd_new_resets_and_confirms():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/new", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_new(update, context)
+    assert service.reset_calls == [(1, 1)]  # reset triggered for this chat/user
+    assert "新的会话" in send.await_args.kwargs["text"]
+
+
+async def test_cmd_new_unauthorized_noop():
+    update, chat, context, app, bot = _make(user_id=999, chat_id=1, text="/new", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_new(update, context)
+    send.assert_not_awaited()
+    assert service.reset_calls == []
+
+
+async def test_cmd_help_lists_commands():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/help", allowed=(1,))
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_help(update, context)
+    sent = send.await_args.kwargs["text"]
+    for cmd in ("/start", "/new", "/status", "/help"):
+        assert cmd in sent
+
+
+# ---------------------------------------------------------------------------
+# startup-hook composition (main.py chains the command-menu + DB-init hooks)
+# ---------------------------------------------------------------------------
+async def test_compose_startup_hooks_runs_all_in_order():
+    calls = []
+
+    async def h1(application):
+        calls.append("h1")
+
+    async def h2(application):
+        calls.append("h2")
+
+    chained = compose_startup_hooks(h1, None, h2)  # None must be skipped
+    await chained(object())
+    assert calls == ["h1", "h2"]
+
+
+async def test_compose_startup_hooks_with_none_is_noop():
+    chained = compose_startup_hooks()
+    await chained(object())  # should not raise
+
 
 
 # ---------------------------------------------------------------------------

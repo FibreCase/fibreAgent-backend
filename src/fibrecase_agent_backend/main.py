@@ -21,7 +21,7 @@ from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
 from .llm.client import OpenAIClient
 from .logging_setup import configure_logging
-from .telegram.bot import build_application
+from .telegram.bot import build_application, compose_startup_hooks, register_command_menu
 
 logger = logging.getLogger("main")
 
@@ -54,7 +54,9 @@ class AgentBackend:
             max_context_messages=config.max_context_messages,
         )
         application = build_application(config, self.service, self.repository)
-        application.post_init = self._post_init
+        # Chain the Telegram adapter's command-menu registration with our own
+        # DB init into a single post_init (both run inside the app's loop).
+        application.post_init = compose_startup_hooks(register_command_menu, self._post_init)
         application.post_shutdown = self._post_shutdown
         self.application = application
 
