@@ -13,6 +13,12 @@ concerns specific to this transport:
 
 The adapter never talks to the LLM directly — only to the Agent service and
 the repository.
+
+Note on this PTB build: ``CallbackContext`` does not expose the usual
+``.user`` / ``.chat`` / ``.message`` shortcuts, so handlers read the sender,
+chat and message from the ``Update`` object (``update.effective_user``,
+``update.effective_chat``, ``update.effective_message``) and shared state from
+``context.application.bot_data``.
 """
 
 from __future__ import annotations
@@ -104,7 +110,7 @@ async def _safe_reply(chat: Chat, text: str) -> None:
 # ---------------------------------------------------------------------------
 # authorization
 # ---------------------------------------------------------------------------
-def _is_authorized(context: ContextTypes.DEFAULT_TYPE) -> bool:
+def _is_authorized(update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Return True if the sender is in the configured allow-list.
 
     Unknown users are logged (without revealing anything to them) and ignored.
@@ -112,7 +118,7 @@ def _is_authorized(context: ContextTypes.DEFAULT_TYPE) -> bool:
     the bot's existence or leak details.
     """
     allowed = context.application.bot_data.get("allowed_user_ids") or set()
-    user = context.user
+    user = update.effective_user
     user_id = user.id if user is not None else None
     if user is None or user_id not in allowed:
         logger.warning(
@@ -139,10 +145,10 @@ async def _typing_loop(bot, chat_id: int, stop: asyncio.Event) -> None:
             continue
 
 
-async def _with_typing(context: ContextTypes.DEFAULT_TYPE, coro):
+async def _with_typing(bot, chat_id: int, coro):
     """Run ``coro`` while keeping the "typing…" indicator alive."""
     stop = asyncio.Event()
-    task = asyncio.create_task(_typing_loop(context.bot, context.chat.id, stop))
+    task = asyncio.create_task(_typing_loop(bot, chat_id, stop))
     try:
         return await coro
     finally:
@@ -158,18 +164,18 @@ async def _with_typing(context: ContextTypes.DEFAULT_TYPE, coro):
 # handlers
 # ---------------------------------------------------------------------------
 async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_authorized(context):
+    if not _is_authorized(update, context):
         return
-    chat_id = context.chat.id
-    user_id = context.user.id
+    chat = update.effective_chat
+    user_id = update.effective_user.id
     repo: ConversationRepository = context.application.bot_data["repository"]
     config: Config = context.application.bot_data["config"]
 
-    conversation = await repo.get_conversation(chat_id)
+    conversation = await repo.get_conversation(chat.id)
     if conversation is None:
-        conversation = await repo.get_or_create_conversation(chat_id, user_id)
+        conversation = await repo.get_or_create_conversation(chat.id, user_id)
         await _send_long(
-            context.chat,
+            chat,
             "Agent 已启动。\n\n"
             f"当前模型：\n{config.openai_model}\n\n"
             f"当前会话：\n{conversation.id}\n\n"
@@ -177,27 +183,30 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         await _send_long(
-            context.chat,
+            chat,
             f"Agent 已在运行。当前会话：{conversation.id}。",
         )
 
 
 async def cmd_reset(update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_authorized(context):
+    if not _is_authorized(update, context):
         return
+    chat = update.effective_chat
+    user_id = update.effective_user.id
     service: AgentService = context.application.bot_data["agent_service"]
-    await service.reset(context.chat.id, context.user.id)
-    await _send_long(context.chat, "会话已重置。")
+    await service.reset(chat.id, user_id)
+    await _send_long(chat, "会话已重置。")
 
 
 async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_authorized(context):
+    if not _is_authorized(update, context):
         return
+    chat = update.effective_chat
     service: AgentService = context.application.bot_data["agent_service"]
     repo: ConversationRepository = context.application.bot_data["repository"]
     config: Config = context.application.bot_data["config"]
 
-    conversation = await repo.get_conversation(context.chat.id)
+    conversation = await repo.get_conversation(chat.id)
     if conversation is None:
         lines = [
             "Agent Backend",
@@ -224,23 +233,23 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Database:\nOK",
         ]
     # None of the above exposes keys, tokens, or file paths.
-    await _send_long(context.chat, "\n".join(lines))
+    await _send_long(chat, "\n".join(lines))
 
 
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_authorized(context):
+    if not _is_authorized(update, context):
         return
-    message = context.message
+    chat = update.effective_chat
+    message = update.effective_message
     if message is None or not message.text or not message.text.strip():
         return
     text = message.text
+    user_id = update.effective_user.id
 
-    chat_id = context.chat.id
-    user_id = context.user.id
     service: AgentService = context.application.bot_data["agent_service"]
     repo: ConversationRepository = context.application.bot_data["repository"]
 
-    conversation = await repo.get_or_create_conversation(chat_id, user_id)
+    conversation = await repo.get_or_create_conversation(chat.id, user_id)
     conversation_id = conversation.id
     logger.info(
         "received message",
@@ -248,25 +257,42 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     try:
-        reply = await _with_typing(context, service.process_message(conversation_id, text))
+        reply = await _with_typing(context.bot, chat.id, service.process_message(conversation_id, text))
     except AgentError as exc:
         logger.info(
             "llm error surfaced to user",
             extra={"conversation_id": conversation_id, "category": exc.category},
         )
-        await _safe_reply(context.chat, exc.user_safe)
+        await _safe_reply(chat, exc.user_safe)
         return
     except Exception:
         logger.exception("unexpected error handling message", extra={"conversation_id": conversation_id})
-        await _safe_reply(context.chat, "出现了一个意外错误，请稍后重试。")
+        await _safe_reply(chat, "出现了一个意外错误，请稍后重试。")
         return
 
     if not reply:
         return
     try:
-        await _send_long(context.chat, reply)
+        await _send_long(chat, reply)
     except TelegramError:
         logger.error("failed to send reply", extra={"conversation_id": conversation_id}, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# error handling
+# ---------------------------------------------------------------------------
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all so an unexpected failure logs cleanly instead of crashing.
+
+    Telegram API errors (FloodWait, timeouts, …) are a warning; anything else
+    is logged with its traceback. In neither case do we leak details to the
+    user or kill the process.
+    """
+    err = context.error
+    if isinstance(err, TelegramError):
+        logger.warning("telegram API error: %s", getattr(err, "message", repr(err)))
+    else:
+        logger.error("unhandled exception processing update", exc_info=err)
 
 
 # ---------------------------------------------------------------------------
@@ -294,4 +320,6 @@ def build_application(
     application.add_handler(CommandHandler("status", cmd_status))
     # Plain text messages (commands are excluded and handled above).
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Log any unhandled update error instead of crashing.
+    application.add_error_handler(on_error)
     return application
