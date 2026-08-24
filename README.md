@@ -1,0 +1,252 @@
+# Agent Backend
+
+一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**。
+
+当前阶段（Phase 1）只做一件事：让你在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，并且**对话历史持久化**——重启后上下文不丢失。
+
+> **重要：当前 Agent 没有任何工具权限，它只能聊天。**
+> 它不能执行命令、控制设备、读写文件。如果用户要求执行操作，它只会明确说明「当前 Agent 尚未配置工具能力」。
+
+架构上它不是「一个 Telegram chatbot」，而是从第一版就分层：
+
+```
+Telegram Adapter   →   Agent Service   →   LLM Client   →   Persistent Conversation
+（适配器）            （渠道无关的核心）    （OpenAI 兼容）   （SQLite）
+```
+
+以后在 `Agent Service` 和 `LLM Client` 之间插入 Tool/MCP loop 即可扩展能力，而不用重写 Telegram 层。
+
+---
+
+## 1. 项目简介
+
+- 通过 **Telegram Bot**（long polling）与 Agent 对话。
+- 使用远程 **OpenAI 兼容**（Chat Completions API）的 LLM 生成回复。
+- 对话历史持久化到 **SQLite**，重启后可完整恢复 conversation context。
+- 仅允许你配置的 Telegram User ID 使用，其他人静默拒绝。
+- 无 Web UI、无 MCP、无工具、无外部依赖数据库。
+
+---
+
+## 2. Architecture
+
+```
+                        ┌─────────────────────────────────────────┐
+   Telegram  ──poll──▶  │  telegram/bot.py  (Adapter)             │
+   (long polling)       │  · 鉴权 (allow-list)                    │
+                        │  · /start /reset /status               │
+                        │  · typing 保活                          │
+                        │  · 长消息分块发送                        │
+                        └───────────────┬─────────────────────────┘
+                                        │  只调用 AgentService
+                                        ▼
+                        ┌─────────────────────────────────────────┐
+                        │  agent/service.py  (AgentService)       │
+                        │  · per-conversation asyncio.Lock        │
+                        │  · 组装 context (system + 最近 N 条)      │
+                        │  · 保存 user / assistant 消息            │
+                        └───────────────┬─────────────┬───────────┘
+                                        │             │
+                              ┌────────────────┐   ┌────────────────────────┐
+                              │ llm/client.py  │   │ database/repository.py │
+                              │ (OpenAIClient) │   │ SQLAlchemy 2.x async   │
+                              │ OpenAI SDK     │   │ aiosqlite / SQLite     │
+                              └────────────────┘   └────────────────────────┘
+```
+
+关键分层约束：
+
+- **Telegram 层从不直接调用 OpenAI SDK**，只调用 `AgentService.process_message()`。
+- **Agent Service 渠道无关**：未来接 Web UI / Discord / HTTP API 都复用同一个 `AgentService`。
+- **只有 `llm/client.py` 知道 OpenAI 协议**；只有 `database/` 知道 ORM/SQL。
+- 四个模块（Telegram / Agent / LLM / Database）之间低耦合。
+
+---
+
+## 3. Requirements
+
+- **Python 3.13+**（本项目已在 Python 3.14 上验证）。
+- **[uv](https://docs.astral.sh/uv/)**（用于管理依赖与虚拟环境）。
+- 一个 **OpenAI 兼容**的 LLM API endpoint + API key（如 OpenAI 本身、本地模型服务或第三方中转）。
+- 一个 Telegram Bot token。
+
+不需要安装任何数据库服务——SQLite 文件在启动时自动创建。
+
+---
+
+## 4. Installation
+
+```bash
+# 在仓库根目录
+uv sync                 # 安装运行时 + 开发依赖到 .venv
+```
+
+验证测试可运行（全部用 mock，不会真的调用你的 LLM）：
+
+```bash
+uv run pytest -q
+```
+
+---
+
+## 5. Configuration
+
+所有配置都来自环境变量（或 `.env` 文件）。**Secret 永远不要写进代码，也不要提交 Git**（`.env` 与 `data/` 已在 `.gitignore` 中忽略）。
+
+```bash
+cp .env.example .env
+# 然后编辑 .env 填入真实值
+```
+
+| 变量 | 说明 |
+| --- | --- |
+| `OPENAI_BASE_URL` | **API 前缀**。你的 endpoint 形如 `https://<host>/v1/chat/completions`，但 OpenAI SDK 会自动追加 `/chat/completions`，所以这里只填前缀（如 `https://<host>/v1`，**不要**填完整 URL）。**必填。** |
+| `OPENAI_API_KEY` | LLM API key（**必填，仅来自环境变量**）。 |
+| `OPENAI_MODEL` | 模型名（**必填**，填你的服务端支持的模型名）。 |
+| `OPENAI_TIMEOUT` | 单次请求超时（秒），默认 `120`。 |
+| `TELEGRAM_BOT_TOKEN` | Bot token（**必填，仅来自环境变量**）。 |
+| `TELEGRAM_ALLOWED_USER_IDS` | 允许的 Telegram user id，逗号分隔，如 `123456789,987654321`。其他人会被静默拒绝（仅记服务端日志）。 |
+| `DATABASE_URL` | SQLite 连接串，默认 `sqlite+aiosqlite:///./data/agent.db`。父目录会自动创建。 |
+| `SYSTEM_PROMPT_PATH` | system prompt 文件路径，默认 `config/system_prompt.txt`。 |
+| `SYSTEM_PROMPT` | 可选：内联 system prompt，**若设置则覆盖文件**。 |
+| `MAX_CONTEXT_MESSAGES` | context 中携带的**最近 N 条消息**（消息数，不是 token 数），默认 `50`，另加一条 system 消息。 |
+| `LOG_LEVEL` | 日志级别，默认 `INFO`。 |
+
+> ⚠️ `OPENAI_BASE_URL` 是最容易踩坑的一项。已经用本地 HTTP server 实测验证：填 `.../v1` 时，SDK 实际请求的就是 `.../v1/chat/completions`，与你的 endpoint 完全一致。
+
+---
+
+## 6. Telegram Bot 创建方法
+
+1. 在 Telegram 里搜索 **@BotFather** 并发送 `/start`。
+2. 发送 `/newbot`，按提示给 bot 起名字和用户名（用户名必须以 `bot` 结尾）。
+3. BotFather 会返回一段 **Bot Token**（形如 `123456789:AA...`）。把它填到 `.env` 的 `TELEGRAM_BOT_TOKEN`。
+4. 获取**你自己的 Telegram user id**：
+   - 给 **@userinfobot** 发任意消息，它会回复你的 `id`。
+   - 把它填到 `TELEGRAM_ALLOWED_USER_IDS`。
+5. **必须先用 @BotFather 把 bot 设为 privacy 模式？不需要**——本项目只处理你主动发给它的消息，默认即可。
+
+> 注意：bot 只能收到「你主动发给它」或「以 `/` 开头的命令」消息。首次使用请先发 `/start`。
+
+---
+
+## 7. 启动方法
+
+```bash
+# 确保在仓库根目录，且 .venv 已 uv sync
+uv run python -m fibrecase_agent_backend
+# 或等价地
+uv run fibrecase-agent-backend
+```
+
+启动后：
+
+- 自动创建 `data/agent.db`（如不存在）。
+- 开始 Telegram long polling（无需公网入站/无需 webhook）。
+- 看到日志 `telegram long polling started` 即表示就绪。
+- 用 `Ctrl+C` 停止；会优雅关闭 LLM 客户端与数据库连接。
+
+> long polling 的原因：你的服务器可能没有公网 HTTP 入站能力，long polling 只出站连接 Telegram。
+
+---
+
+## 8. System Prompt 配置
+
+默认读取 `config/system_prompt.txt`（文件优先）。也可以改用环境变量 `SYSTEM_PROMPT` 覆盖文件（设置后忽略文件）。若两者都没有，使用一个内置兜底 prompt。
+
+编辑 `config/system_prompt.txt` 即可调整 Agent 的语气与边界，无需改代码。
+
+---
+
+## 9. SQLite 数据库说明
+
+- 文件：默认 `./data/agent.db`（由 `DATABASE_URL` 决定）。
+- 启动时自动初始化（`CREATE TABLE IF NOT EXISTS`），可安全重复启动。
+- 表结构：
+
+  **conversations**
+  | 字段 | 说明 |
+  | --- | --- |
+  | `id` | 自增主键（`AUTOINCREMENT`，reset 后必为新的更大 id） |
+  | `telegram_chat_id` | Telegram chat 唯一 id（一个 chat 对应一个 conversation） |
+  | `telegram_user_id` | 创建该 conversation 的 Telegram user id |
+  | `created_at` / `updated_at` | 时间戳 |
+
+  **messages**
+  | 字段 | 说明 |
+  | --- | --- |
+  | `id` | 自增主键 |
+  | `conversation_id` | 外键 → conversations.id（级联删除） |
+  | `role` | `system` / `user` / `assistant`（schema 已允许 `tool`，供未来 tool 使用） |
+  | `content` | 消息文本 |
+  | `created_at` | 时间戳 |
+
+- **一个 Telegram chat 对应一个 conversation**，`/reset` 只影响该 chat。
+- 用命令行直接查看（可选）：
+  ```bash
+  uv run python -c "import sqlite3;print(sqlite3.connect('data/agent.db').execute('select count(*) from messages').fetchone())"
+  ```
+
+---
+
+## 10. Troubleshooting
+
+| 现象 | 排查 |
+| --- | --- |
+| 启动报 `ConfigError: TELEGRAM_BOT_TOKEN is not set` 等 | `.env` 没加载或变量名为空。确认 `cp .env.example .env` 且填了值；确认在**仓库根目录**运行（`.env` 从当前工作目录读取）。 |
+| Bot 完全不回复 | 确认 `TELEGRAM_ALLOWED_USER_IDS` 里确实有**你的** id（@userinfobot 查）；确认你发的是普通消息或 `/` 命令；看日志是否有 `unauthorized telegram user attempted access`。 |
+| `模型请求超时，请稍后重试。` | LLM 请求超时或网络问题。查看服务端日志的 `llm request timed out` / `llm http error status=...`。可临时调大 `OPENAI_TIMEOUT`。 |
+| `模型服务暂时不可用。` | LLM 返回了 HTTP 错误 / 空回复 / 连接失败。看日志里的 HTTP status；检查 `OPENAI_BASE_URL` 是否写错（常见错误是填了完整 `.../v1/chat/completions`）。 |
+| 请求打到 `404` / 错误路径 | 几乎肯定是 `OPENAI_BASE_URL` 多写了 `/chat/completions`。应只填前缀（如 `.../v1`）。 |
+| 想确认持久化 | 见下面「如何验证 SQLite 持久化」。 |
+
+> 日志中**不会**出现 Telegram token、OpenAI API key、完整 Authorization header、服务器路径，也不默认记录完整消息内容（只记 conversation_id、message_id、长度、延迟）。
+
+---
+
+## 11. 手工验收测试
+
+按顺序做一次（都是真实交互，需要你已配好 `.env` 并启动）：
+
+1. **启动** → 发 `/start` → 应正常返回「Agent 已启动…」
+2. 发「你好，我叫 Alice。」→ 再发「我叫什么？」→ 应回答「Alice。」
+3. **重启** backend，再发「我叫什么？」→ 仍应回答「Alice。」（**最关键的一条：上下文跨重启恢复**）
+4. 发 `/reset` → 再发「我叫什么？」→ 应**不**再知道 Alice。
+5. 发一条超长消息 → 不会触发 Telegram API 错误（自动分块，内容完整）。
+6. 快速连发两条消息 → 同一 conversation 串行处理，不会互相覆盖 context。
+
+### 如何验证 SQLite 持久化（Test 3 的底层原理）
+
+```bash
+# 停止 backend 后：
+sqlite3 data/agent.db "select id, telegram_chat_id from conversations;"
+sqlite3 data/agent.db "select role, substr(content,1,40) from messages order by id;"
+# 再次启动 backend，发「我叫什么？」仍能答出名字，即证明 context 从磁盘恢复。
+```
+
+---
+
+## Future architecture
+
+Phase 1 明确**不实现**：MCP、SSH、Docker、Web search、RAG、向量库、Redis、PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/图像/TTS/STT。
+
+扩展方向（已在代码结构中留好接口，但尚未实现）：
+
+```
+Agent
+  ↓
+LLM（已支持 OpenAI-style tool calling 的模型）
+  ↓  ← 未来在这里插入 Tool / MCP loop
+Tool Calls
+  ↓
+MCP Client
+  ↓
+Tools（SSH / Docker / Filesystem / Pi / Camera / Home Assistant / Web Search …）
+```
+
+因为 `AgentService` 已经渠道无关、`OpenAIClient.complete()` 的 messages 已经是 OpenAI 结构、`messages.role` 也已允许 `tool`，所以加 tool 时：
+- 在 `AgentService.process_message` 里，拿到模型返回的 `tool_calls` 后循环执行工具、把 `tool` 结果回灌 messages，直到模型给出最终文本；
+- `OpenAIClient` 增加对 `tools=` 参数与 `tool_calls` 返回的透传；
+- 可再引入一个 `MCPClient` 统一管理外部工具。
+
+Telegram 层与 Agent Service 之间的边界保持不变，届时接新渠道也无需改动。

@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+
+# Secrets and local configuration — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Local runtime data (SQLite database, etc.) — keep the dir via .gitkeep
+data/*
+!data/.gitkeep
+
+# Local temporary notes / task specs — not part of the project
+TASK.md
+
+# OS / editor noise
+.DS_Store

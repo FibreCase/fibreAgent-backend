@@ -1,0 +1,33 @@
+[project]
+name = "fibrecase-agent-backend"
+version = "0.1.0"
+description = "Minimal personal AI agent backend: Telegram + OpenAI-compatible LLM + SQLite with persistent conversations"
+readme = "README.md"
+authors = [
+    { name = "FibreCase", email = "fibrecase@163.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "openai>=3.3.1",
+    "python-dotenv>=1.2.3",
+    "python-telegram-bot>=22.8",
+    "sqlalchemy[asyncio]>=2.0.52",
+]
+
+[project.scripts]
+fibrecase-agent-backend = "fibrecase_agent_backend.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
