@@ -1,6 +1,6 @@
 # Agent Backend — single-service deployment.
 #
-#   cp .env.docker.example .env.docker   # fill in tokens (never committed)
+#   cp .env.example .env               # same file the plain `uv run` uses
 #   docker compose up -d --build
 #   docker compose logs -f
 #
@@ -14,10 +14,11 @@ services:
     image: fibrecase-agent-backend
     container_name: fibrecase-agent-backend
 
-    # Config comes from a local env file, NOT baked into the image.
-    # `cp .env.docker.example .env.docker` first — it is git-ignored.
+    # Same .env as the local `uv run fibrecase-agent-backend` — one config
+    # file for both. It is passed at runtime (env_file) and is NOT baked into
+    # the image (.dockerignore excludes it).
     env_file:
-      - .env.docker
+      - .env
 
     # Persist the SQLite conversation store across restarts and image rebuilds.
     volumes:

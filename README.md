@@ -249,10 +249,10 @@ sqlite3 data/agent.db "select role, substr(content,1,40) from messages order by 
 ### 用 Docker Compose（推荐）
 
 ```bash
-cp .env.docker.example .env.docker   # 填入真实 token / 模型配置（.env.docker 已被 gitignore）
-docker compose up -d --build         # 构建并后台运行
-docker compose logs -f               # 看日志；出现 "agent backend initialised" 即就绪
-docker compose down                  # 停止（数据卷保留）
+cp .env.example .env                   # 与本地 uv run 共用同一个 .env（.env 已被 gitignore）
+docker compose up -d --build           # 构建并后台运行
+docker compose logs -f                 # 看日志；出现 "agent backend initialised" 即就绪
+docker compose down                    # 停止（数据卷保留）
 ```
 
 ### 用原生 docker
@@ -261,7 +261,7 @@ docker compose down                  # 停止（数据卷保留）
 docker build -t fibrecase-agent-backend .
 docker run --rm -d \
   --name fibrecase-agent-backend \
-  --env-file .env.docker \
+  --env-file .env \
   -v agent-data:/app/data \
   --restart unless-stopped \
   fibrecase-agent-backend
@@ -269,8 +269,9 @@ docker run --rm -d \
 
 ### 持久化与配置
 
+- **同一个 `.env`**：Docker 与本地 `uv run fibrecase-agent-backend` **共用同一个 `.env`**（均以 `.env.example` 为模板）。容器通过 compose 的 `env_file: .env`（或 `docker run --env-file .env`）在**运行时**读取它，`.env` **不会**被打进镜像（`.dockerignore` 已排除）。改配置只改这一处文件，两种启动方式一致。
+- **路径无需为容器单独改**：`.env` 里 `DATABASE_URL` 与 `SYSTEM_PROMPT_PATH` 都是**相对路径**，容器内 `WORKDIR=/app`，所以它们解析到 `/app/data/agent.db` 与 `/app/config/system_prompt.txt`，与本地运行的相对语义一致。
 - **数据持久化**：SQLite 库在容器内 `/app/data/agent.db`。用 `agent-data` 数据卷（compose）或 `-v agent-data:/app/data`（docker run）挂载，重启、`compose down`、甚至**重建镜像**都不会丢对话。
-- **配置来源**：容器内从**环境变量**读取（`env_file` / `--env-file`），`.env.docker` **不会**被打进镜像（`.dockerignore` 已排除）。`.env.docker.example` 是可提交的模板，`.env.docker` 是含密钥的本地文件，二者都**绝不提交**（`.gitignore` 处理）。
 - **系统提示词**：镜像里已内置 `config/system_prompt.txt`（`WORKDIR=/app`，与 `.env` 中 `SYSTEM_PROMPT_PATH` 的相对路径一致）。想临时改用别的文件而不重建镜像，可在 compose 里加一行挂载（文件内已注明）。
 - **优雅停机**：`docker stop` / `compose down` 发 SIGTERM，PTB 会捕获并触发 `post_shutdown`（关闭 LLM 客户端与数据库连接），不会丢正在写的 SQLite 数据。
 

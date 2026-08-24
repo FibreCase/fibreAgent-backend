@@ -3,15 +3,13 @@
 # Agent Backend — production image.
 #
 #   docker build -t fibrecase-agent-backend .
-#   docker run --rm --env-file .env.docker -v agent-data:/app/data fibrecase-agent-backend
+#   docker run --rm --env-file .env -v agent-data:/app/data fibrecase-agent-backend
 #
 # The app only makes *outbound* connections (Telegram long polling + the
 # OpenAI-compatible API). There is nothing to expose inbound, so no EXPOSE.
-# Config comes from the environment (or a .env in the working dir) — see
-# .env.docker.example. Secrets must never be baked into the image.
-#
-# Build & run are verified to be equivalent to `uv sync` + the console script;
-# `.dockerignore` keeps .venv/, data/, .env* and tests/ out of the build.
+# Config is the SAME `.env` the local `uv run fibrecase-agent-backend` uses
+# (see .env.example). It is passed at runtime and never baked into the image —
+# .dockerignore keeps .env, .venv/ and data/ out of the build.
 
 FROM python:3.14-slim
 
