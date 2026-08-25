@@ -22,6 +22,7 @@ data/*
 
 # Local temporary notes / task specs — not part of the project
 TASK.md
+ROADMAP.md
 
 # OS / editor noise
 .DS_Store
