@@ -20,6 +20,15 @@ services:
     env_file:
       - .env
 
+    # Match the host timezone so the app's local time is correct. The image
+    # defaults to UTC, otherwise `get_current_time` (datetime.now()) and the
+    # log timestamps would be a few hours off from your wall clock. Set TZ in
+    # .env to your zone (e.g. Asia/Shanghai). This is the portable way — the
+    # image already ships tzdata, and macOS has no /etc/localtime to bind-mount.
+    # (Explicit `environment` wins over env_file if TZ is also in .env.)
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+
     # Run the container as the *host* user so the bind-mounted ./data keeps
     # normal host permissions (owned by you, 755) AND is writable by the
     # container — no chown, and the DB stays readable from the host.
