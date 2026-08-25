@@ -28,6 +28,10 @@ cp .env.example .env
 | `TOOL_PERMISSION_OVERRIDES` | 逐工具权限覆盖，逗号分隔的 `<工具名>=allow\|ask\|deny`（如 `echo=deny,my_tool=ask`），默认空（用各工具自带默认值：`get_current_time` / `echo` 为 `allow`，`system_info` 当前刻意设为 `ask`，其余新工具默认 `ask`）。这是**启动期强校验**：条目缺 `=`、空工具名、空权限、非法权限值、重复工具名，或工具名含 `[A-Za-z0-9_-]` 之外的字符，都会导致启动失败（`ConfigError`），不会被静默忽略。 |
 | `TOOL_APPROVAL_TIMEOUT_SECONDS` | 对 `ask` 策略工具，等待 Telegram 审批（`Approve`/`Deny`）的秒数，超时则按「审批已过期」处理，默认 `60`。必须为正数。 |
 | `TOOL_TIMEOUT_SECONDS` | 单个工具调用的最长执行秒数；超时即取消该工具并回给模型「工具超时」，默认 `30`。必须为正数。 |
+| `MCP_SERVERS` | 可选：远程 MCP（Streamable HTTP）服务器列表，JSON **数组**。默认空 = 不建 MCP 客户端、永不发起任何 MCP 网络连接。每个对象 `{ "name", "url", "bearer_token_env"? }`：`name` 为 `[a-z][a-z0-9_-]{0,31}` 且唯一；`url` 为绝对 `https://`（含 host，**不含** userinfo/fragment/query）；`bearer_token_env` 是**环境变量名**（不是 token 本身），其值必须非空，启动时读作 `Authorization: Bearer` 头。发现的工具命名为 `mcp_<server>__<remote>`，默认 `ask`（可用 `TOOL_PERMISSION_OVERRIDES` 按命名空间名覆盖）。**启动期强校验**，任何违规都是 `ConfigError`。 |
+| `MCP_CONNECT_TIMEOUT_SECONDS` | 每个 MCP 服务器「连接 / initialize / tools-list」握手的超时秒数，超时即把该服务器标记为 unavailable（**其余服务器与内置工具照常启动**，bot 不会因一个可选 MCP 服务器宕机而启动失败）。默认 `10`，必须为正。 |
+| `MAX_MCP_TOOL_RESULT_CHARS` | 单个远程 MCP 工具结果回传给模型的**文本**字符硬上限。超大的结果按稳定码 `mcp_result_too_large` 拒绝（**不截断、不回显**）。默认 `10000`，必须 `>= 1`。 |
+| `MCP_ALLOW_INSECURE_HTTP` | 硬开关：允许 `http://`（明文）端点。默认 `false`（仅 `https`）；仅在你**控制**的本地/内网可信端点才设 `true`。 |
 | `MAX_IMAGE_SIZE_MB` | 单张 Telegram 图片的最大字节数（MB），默认 `10`。超过则返回「图片过大，暂时无法处理。」，不会发给模型。 |
 | `ATTACHMENT_STORAGE_PATH` | 持久化图片附件 blob 的根目录，默认 `./data/attachments`（相对工作目录，目录按需自动创建）。图片**字节**存在这里（按 SHA-256 内容寻址、去重、原子写入），数据库里只存元数据。Docker 下默认路径落在 `./data` 绑定挂载内，随容器持久化。 |
 | `MAX_MEMORIES_PER_SCOPE` | 每个账号（scope）可保存的记忆条数上限，默认 `200`。超过时 `/remember` 返回「记忆已达上限」提示。 |
@@ -53,6 +57,7 @@ cp .env.example .env
 - 上下文预算（`MAX_CONTEXT_ESTIMATED_TOKENS` / `CONTEXT_IMAGE_ESTIMATED_TOKENS`）与记忆预算（`MAX_MEMORIES_PER_SCOPE` / `MAX_MEMORY_CHARS` / `MAX_RETRIEVED_MEMORIES` / `MAX_MEMORY_ESTIMATED_TOKENS`）都按**正整数**（`>= 1`）校验，零/负数/非整数会抛 `ConfigError`。
 - 唯一的跨项不变量是 `MAX_MEMORY_ESTIMATED_TOKENS <= MAX_CONTEXT_ESTIMATED_TOKENS`，违反会抛 `ConfigError`。
 - `TOOL_APPROVAL_TIMEOUT_SECONDS` / `TOOL_TIMEOUT_SECONDS` 必须为正数，否则 `ConfigError`。
+- MCP 数值项：`MCP_CONNECT_TIMEOUT_SECONDS` 必须为正数、`MAX_MCP_TOOL_RESULT_CHARS` 必须 `>= 1`，否则 `ConfigError`。`MCP_SERVERS` 的**结构**在 `load_config` 里强校验（非法 JSON、非数组、非对象条目、未知字段、坏 name/url、重复 name、`bearer_token_env` 名非法或对应环境变量缺失/为空，都 `ConfigError`）——报错只点名服务器与字段，**从不**回显 token 值或完整 URL。
 
 ## System Prompt
 

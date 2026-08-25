@@ -47,6 +47,7 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 | `/forget all CONFIRM` | 清空你账号下的**全部**记忆（破坏性操作，必须带 `CONFIRM` 才会执行） |
 | `/status` | 查看运行状态（版本、模型、会话 id、消息数） |
 | `/tool_audit [limit]` | 查看**你本人**最近的工具执行审计（`limit` 默认 `20`、上限 `50`）：每条只显示时间、事件 id、工具名、事件类型、结果码与（若有）耗时；**绝不**显示工具参数、结果或异常正文。仅当前账号可见（按不可逆的 scope 哈希隔离），无数据时给出安全提示。 |
+| `/mcp_status` | 只读查看已配置的远程 MCP 服务器状态：每台的名称、`available`/`unavailable`、发现到的工具数，以及可用工具总数。**不**发起连接/刷新，也不调用 LLM 或 MCP；未配置（或 `ENABLE_TOOLS=false`）时显示「MCP: disabled」；**绝不**显示 URL/host/token/头/工具描述或服务器 instructions。 |
 | `/help` | 列出本帮助 |
 
 其它任何文字消息都会作为对话发给 Agent。

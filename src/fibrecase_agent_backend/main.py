@@ -24,6 +24,7 @@ from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
 from .llm.client import OpenAIClient
 from .logging_setup import configure_logging
+from .mcp import McpManager
 from .telegram.approval import TelegramApprovalBroker
 from .telegram.bot import build_application, compose_startup_hooks, register_command_menu
 from .tools import build_policy
@@ -74,6 +75,22 @@ class AgentBackend:
         auditor = RepositoryToolAuditor(self.repository) if registry else None
         broker = TelegramApprovalBroker(self.repository) if registry else None
         self.approval_broker = broker
+        # Phase 4: remote MCP tool provider. Built **only** when tools are
+        # enabled *and* at least one server is configured — with no servers
+        # there is nothing to connect, so the manager does not exist and no MCP
+        # network connection is ever made. The manager holds no reference to the
+        # registry here: the discovered tools are ``add``ed to the *same*
+        # registry inside ``_post_init`` (after discovery), so they ride the
+        # existing phase-3 gate exactly like a built-in.
+        self.mcp_manager = (
+            McpManager(
+                config.mcp_servers,
+                connect_timeout_seconds=config.mcp_connect_timeout_seconds,
+                max_result_chars=config.max_mcp_tool_result_chars,
+            )
+            if (config.enable_tools and config.mcp_servers)
+            else None
+        )
         self.service = AgentService(
             self.repository,
             self.llm,
@@ -95,7 +112,9 @@ class AgentBackend:
             tool_timeout_seconds=config.tool_timeout_seconds,
             tool_approval_timeout_seconds=config.tool_approval_timeout_seconds,
         )
-        application = build_application(config, self.service, self.repository, approval_broker=broker)
+        application = build_application(
+            config, self.service, self.repository, approval_broker=broker, mcp_manager=self.mcp_manager
+        )
         # Chain the Telegram adapter's command-menu registration with our own
         # DB init into a single post_init (both run inside the app's loop).
         application.post_init = compose_startup_hooks(register_command_menu, self._post_init)
@@ -105,6 +124,23 @@ class AgentBackend:
     # PTB lifecycle hooks (run inside the application's own event loop) ------
     async def _post_init(self, application) -> None:
         await init_db(self.engine)
+        # Phase 4: connect + discover the configured remote MCP servers, then
+        # register their tools into the *same* registry (after the built-ins).
+        # This is best-effort by construction — ``start`` never raises, and a
+        # failed server is simply marked unavailable — so an unreachable
+        # endpoint can never stop the bot from starting. The policy was already
+        # built; because the tool loop re-resolves every call and re-derives the
+        # advertised schema from ``registry.names()`` on each message, the newly
+        # added MCP tools are picked up automatically (they default to ``ask``,
+        # and any ``TOOL_PERMISSION_OVERRIDES`` entry for their namespaced name
+        # is honoured).
+        mcp_tool_count = 0
+        if self.mcp_manager is not None and self.registry is not None:
+            await self.mcp_manager.start(existing_names=self.registry.names())
+            discovered = self.mcp_manager.tools()
+            if discovered:
+                self.registry.add(*discovered)
+                mcp_tool_count = len(discovered)
         logger.info(
             "agent backend initialised",
             extra={
@@ -112,6 +148,7 @@ class AgentBackend:
                 "allowed_users": sorted(self.config.allowed_user_ids),
                 "tools_enabled": self.config.enable_tools,
                 "tools": self.registry.names() if self.registry else [],
+                "mcp_tools": mcp_tool_count,
             },
         )
 
@@ -121,6 +158,10 @@ class AgentBackend:
         # decision resolves (expired) instead of hanging the shutdown.
         if self.approval_broker is not None:
             await self.approval_broker.shutdown()
+        # Close the MCP sessions (and their HTTP transports/clients) before the
+        # LLM client and engine — ``close`` is idempotent and never raises.
+        if self.mcp_manager is not None:
+            await self.mcp_manager.close()
         try:
             await self.llm.aclose()
         finally:

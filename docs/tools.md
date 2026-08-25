@@ -99,7 +99,7 @@ class MyTool(Tool):
 - **不要**在任何地方写 `if name == "…"` 分支——registry 是唯一分发点。
 - 想给它自定义审批文案，可覆盖 `approval_summary(arguments)`（但**默认**不回显参数；只有你确信安全才展示）。
 
-**MCP / SSH / Docker / Pi** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。
+**MCP / SSH / Docker / Pi** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现远程 Streamable HTTP 服务器的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。SSH / Docker / Pi 仍是待建的同类 provider。
 
 ## 限制
 

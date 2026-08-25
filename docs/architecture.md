@@ -17,6 +17,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
    (long polling)       │  · 鉴权 (allow-list)                    │
                         │  · /start /new /context /help /status   │
                         │  · /remember /memories /forget /tool_audit│
+                        │  · /mcp_status                            │
                         │  · typing 保活                          │
                         │  · Markdown→HTML 渲染 + 分块发送          │
                         └───────────────┬─────────────────────────┘
@@ -42,7 +43,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - **Telegram 层从不直接调用 OpenAI SDK**，只调用 `AgentService.process_message()`。
 - **Agent Service 渠道无关**：未来接 Web UI / Discord / HTTP API 都复用同一个 `AgentService`。
 - **只有 `llm/client.py` 知道 OpenAI 协议**；只有 `database/` 知道 ORM/SQL。
-- `attachments/` 与 `memory/` 两个包**不含**任何 Telegram / OpenAI SDK / ORM 依赖（纯 Python + 文件系统）。
+- `attachments/` 与 `memory/` 两个包**不含**任何 Telegram / OpenAI SDK / ORM 依赖（纯 Python + 文件系统）；`mcp/` 同样不含 Telegram / OpenAI SDK / ORM（只依赖 MCP SDK + 其 HTTP client）。
 - 模块之间低耦合：Telegram / Agent / Tool / LLM / Database 各自单一职责。
 
 ## 模块地图
@@ -57,6 +58,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 | `agent/service.py` | 渠道无关核心：锁、持久化、记忆检索、驱动 tool loop | 调 LLM、DB、附件、记忆 |
 | `agent/tool_loop.py` | LLM ↔ 工具循环（渠道/协议无关） | 只依赖 LLM 协议 + `ToolRegistry` |
 | `tools/` | 工具：`Tool` 接口 / `ToolRegistry` / 三个只读内置 + 策略/校验/审批/审计 | 无 Telegram/DB（审计经注入） |
+| `mcp/` | 远程 MCP 工具 provider（Streamable HTTP）：启动发现 + 包装成标准 `Tool` | 无 Telegram/DB/OpenAI SDK（只依赖 MCP SDK + HTTP） |
 | `attachments/` | 内容寻址 blob 存储（SHA-256、原子写、去重、防路径穿越） | 纯文件系统 |
 | `memory/` | 记忆文本规范化 + 词法排序（纯 Python、无 I/O） | 无 Telegram/SDK/ORM |
 | `llm/client.py` | 唯一的 OpenAI SDK 知识来源 | 无 Telegram |
@@ -72,7 +74,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - 工具结果必须是**短**的、人/模型可读的字符串；失败时 `raise`（registry 会转成 `{"error": ...}` 给模型看）。
 - 新工具默认 `ask`（需要审批）；只有确认无害/只读的才声明 `allow`。详见 [工具与工具安全](tools.md)。
 
-未来的 **MCP / SSH / Docker / Pi** 都是同一个模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess/网络都封装在工具**内部**、绝不进 loop，并在有副作用时走审批。
+**MCP 已按此模式接入**（`mcp/` 包，Streamable HTTP）：启动时发现远程工具并包成标准 `Tool`（`mcp_<server>__<remote>`、默认 `ask`），注册进同一个 registry，从而完全复用执行边界——见 [远程 MCP 工具](mcp.md)。未来的 **SSH / Docker / Pi** 仍是同一个模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess/网络都封装在工具**内部**、绝不进 loop，并在有副作用时走审批。
 
 ### 加一种多模态输入
 

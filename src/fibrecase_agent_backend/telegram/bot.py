@@ -69,6 +69,7 @@ _COMMANDS: list[tuple[str, str]] = [
     ("forget", "Forget a memory or all"),
     ("status", "Show run status"),
     ("tool_audit", "Show tool audit log"),
+    ("mcp_status", "Show remote MCP tool status"),
     ("help", "Show this help"),
 ]
 
@@ -514,6 +515,42 @@ async def cmd_tool_audit(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_long(chat, "\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# remote MCP status command (phase 4)
+# ---------------------------------------------------------------------------
+async def cmd_mcp_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mcp_status — show which configured remote MCP servers are up and how many
+    tools each exposes.
+
+    Read-only and non-mutating: it reads the in-memory :class:`~..mcp.McpManager`
+    state set at startup. It does **not** connect, refresh, re-discover, or call
+    the LLM or any MCP server. The reply shows only each server's *name*, an
+    ``available``/``unavailable`` flag, and its discovered-tool count, plus the
+    total — it never exposes a URL, host, header, token, tool description or
+    schema, server instructions, or a failure detail. An unauthorised sender is
+    ignored silently, exactly like every other command.
+    """
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    config: Config = context.application.bot_data["config"]
+    manager = context.application.bot_data.get("mcp_manager")
+
+    # No manager (no servers configured, or tools disabled) → MCP is disabled.
+    if manager is None or not getattr(config, "enable_tools", True) or len(manager) == 0:
+        await _send_long(chat, "**MCP:** disabled")
+        return
+
+    lines = ["**Remote MCP servers:**", ""]
+    for entry in manager.status():
+        state = "available" if entry["available"] else "unavailable"
+        lines.append(f"**{entry['name']}** — {state} ({entry['tool_count']} tools)")
+    lines += ["", f"**Total MCP tools available:** {manager.total_tools}"]
+    # None of the above exposes a URL, host, header, token, description, schema,
+    # server instructions, or any failure detail.
+    await _send_long(chat, "\n".join(lines))
+
+
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, context):
         return
@@ -638,17 +675,25 @@ def build_application(
     service: AgentService,
     repository: ConversationRepository,
     approval_broker=None,
+    mcp_manager=None,
 ) -> Application:
     """Assemble the PTB :class:`Application` and register all handlers.
 
-    Startup work (command menu, DB init) is wired by the caller via
-    :func:`compose_startup_hooks`, not here — this only registers handlers.
+    Startup work (command menu, DB init, MCP discovery) is wired by the caller
+    via :func:`compose_startup_hooks`, not here — this only registers handlers.
 
     ``approval_broker`` (an in-memory :class:`~..telegram.approval
     .TelegramApprovalBroker`, optional) supplies the phase-3 Approve/Deny
     callback handler. When ``None`` (tools disabled, or a bare unit test) no
     callback handler is registered and no broker is bound — the approval path is
     simply absent.
+
+    ``mcp_manager`` (the phase-4 :class:`~..mcp.McpManager`, optional) is
+    exposed in ``bot_data`` so the read-only ``/mcp_status`` command can report
+    each server's availability and discovered-tool count. When ``None`` (no
+    servers configured, or tools disabled) ``/mcp_status`` reports MCP as
+    disabled. It is **never** used to connect or refresh — the manager is
+    started/closed by the composition root's lifecycle hooks only.
     """
     application = (
         ApplicationBuilder()
@@ -660,6 +705,7 @@ def build_application(
     application.bot_data["repository"] = repository
     application.bot_data["config"] = config
     application.bot_data["allowed_user_ids"] = set(config.allowed_user_ids)
+    application.bot_data["mcp_manager"] = mcp_manager
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("new", cmd_new))
@@ -670,6 +716,7 @@ def build_application(
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("tool_audit", cmd_tool_audit))
+    application.add_handler(CommandHandler("mcp_status", cmd_mcp_status))
     # Phase 3: the Approve/Deny inline-button callback (bound to the exact
     # (principal, chat) that requested the approval; all other clicks are no-ops).
     if approval_broker is not None:
