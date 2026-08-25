@@ -58,6 +58,7 @@ class Config:
     max_memory_estimated_tokens: int = 3000
 
     log_level: str = "INFO"
+    log_color: str = "auto"  # "auto" | "true" | "false" — see logging_setup
     system_prompt_override: str | None = field(default=None)
 
     def __post_init__(self) -> None:
@@ -141,6 +142,24 @@ def _parse_bool(raw: str, default: bool) -> bool:
     raise ConfigError(f"invalid boolean value: {raw!r}")
 
 
+def _normalize_log_color(raw: str, default: str = "auto") -> str:
+    """Normalise ``LOG_COLOR`` to ``"auto"``, ``"true"``, or ``"false"``.
+
+    ``auto`` (the default) means "colour only when stdout is a terminal"; the
+    other two force it on/off regardless. Unknown values are a config error.
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        return default
+    if value in ("auto", "tty"):
+        return "auto"
+    if value in ("true", "1", "yes", "on"):
+        return "true"
+    if value in ("false", "0", "no", "off"):
+        return "false"
+    raise ConfigError(f"invalid LOG_COLOR value: {raw!r} (expected auto/true/false)")
+
+
 def _parse_float(raw: str, default: float) -> float:
     raw = raw.strip()
     if not raw:
@@ -189,5 +208,6 @@ def load_config() -> Config:
         max_retrieved_memories=_parse_int(os.environ.get("MAX_RETRIEVED_MEMORIES", ""), 5),
         max_memory_estimated_tokens=_parse_int(os.environ.get("MAX_MEMORY_ESTIMATED_TOKENS", ""), 3000),
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
+        log_color=_normalize_log_color(os.environ.get("LOG_COLOR", "")),
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,
     )

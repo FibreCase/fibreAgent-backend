@@ -143,7 +143,7 @@ All four are validated as positive integers in `Config.__post_init__`; the cross
 
 ## Testing
 
-`tests/conftest.py` provides an in-memory `repo` fixture and `FakeLLM` / `RecordingLLM` fakes. **All 223 tests pass, all mocked** — nothing ever talks to the real LLM endpoint or Telegram (mock the SDK's `create`, the PTB handlers, `PhotoSize.get_file`, and the LLM for attachment/memory tests). Coverage:
+`tests/conftest.py` provides an in-memory `repo` fixture and `FakeLLM` / `RecordingLLM` fakes. **All 233 tests pass, all mocked** — nothing ever talks to the real LLM endpoint or Telegram (mock the SDK's `create`, the PTB handlers, `PhotoSize.get_file`, and the LLM for attachment/memory tests). Coverage:
 
 - Phase 1: db init, create conversation, save message, load history, reset, context builder, unauthorized user, LLM client (incl. `httpx2` error construction), `process_message`, concurrency lock, Telegram handlers — including `/context` (handler renders the window/budget/image-downgrade preview; no-conversation and unauthorised cases are safe no-ops) and `AgentService.context_status` (a read-only, metadata-only preview that issues **no** LLM call and **no** attachment-blob read).
 - **Markdown → Telegram HTML** (`tests/test_telegram_markdown.py`): bold/italic/strikethrough/inline-code/fenced-code/links/headings, entity escaping (`& < >`), code-spans kept verbatim (no emphasis injected), snake_case left literal, chunk tag-balance invariant, plus handler-level "reply sent with `parse_mode=HTML`" and "400 → plain-text fallback so a reply is never lost".

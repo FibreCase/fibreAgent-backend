@@ -126,6 +126,7 @@ cp .env.example .env
 | `MAX_RETRIEVED_MEMORIES` | 单次检索最多返回/注入的相关记忆条数，默认 `5`。 |
 | `MAX_MEMORY_ESTIMATED_TOKENS` | 注入记忆的**估算** token **子预算**（与 `MAX_CONTEXT_ESTIMATED_TOKENS` 同一套模型无关的估算单位，不是计费 token），默认 `3000`。放不进该子预算的记忆会被**跳过**（不截断），并继续尝试分数更低的记忆；必须 `<= MAX_CONTEXT_ESTIMATED_TOKENS`。 |
 | `LOG_LEVEL` | 日志级别，默认 `INFO`。 |
+| `LOG_COLOR` | 日志级别标签是否上色（`INFO` 绿 / `WARNING` 黄 / `ERROR` 红）。`auto`（默认）= 仅当 stdout 是终端时才上色，管道/重定向（如 `docker logs`、写文件）保持纯文本；`true` 恒上色；`false` 恒不上色。 |
 
 > ⚠️ `OPENAI_BASE_URL` 是最容易踩坑的一项。已经用本地 HTTP server 实测验证：填 `.../v1` 时，SDK 实际请求的就是 `.../v1/chat/completions`，与你的 endpoint 完全一致。
 

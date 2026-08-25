@@ -120,7 +120,7 @@ def main() -> None:
         print("Hint: cp .env.example .env and fill in the values, then re-run.", file=sys.stderr)
         sys.exit(2)
 
-    configure_logging(config.log_level)
+    configure_logging(config.log_level, color=config.log_color)
     backend = AgentBackend(config)
     try:
         backend.run()
