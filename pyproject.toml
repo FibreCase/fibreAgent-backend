@@ -1,6 +1,6 @@
 [project]
 name = "fibrecase-agent-backend"
-version = "1.3.0"
+version = "1.4.0"
 description = "Minimal personal AI agent backend: Telegram + OpenAI-compatible LLM + SQLite with persistent conversations"
 readme = "README.md"
 authors = [
