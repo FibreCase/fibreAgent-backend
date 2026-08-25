@@ -1,6 +1,6 @@
 # Agent Backend
 
-一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**：在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失；Agent 可以调用少量安全的内置工具来回答问题，也支持**图片输入**——收到的图片会持久化（内容寻址 blob，按 SHA-256 去重），并在后续历史上下文（含重启后）里重新作为图片交给模型。
+一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**：在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失；Agent 可以调用少量安全的内置工具来回答问题，也支持**图片输入**——收到的图片会持久化（内容寻址 blob，按 SHA-256 去重），并在后续历史上下文（含重启后）里重新作为图片交给模型。你可以用 `/remember` **显式保存长期记忆**（账号隔离、随账号跨 `/new` 与重启保留），之后普通文字消息会按词法检索把相关记忆作为「用户提供的参考材料」注入上下文。
 
 > **重要：当前内置工具仅限只读/无害操作**：`get_current_time`（当前时间）、`echo`（回显）、`system_info`（主机名/平台/Python 版本）。
 > 它**不能**执行命令、控制设备、读写文件、联网扫描。如果用户要求超出工具能力的操作，它会明确说明「当前尚未配置相应工具」。
@@ -26,6 +26,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - 支持**工具调用**：内置 `get_current_time` / `echo` / `system_info` 三个只读安全工具，可开启/关闭。
 - 支持**图片输入**：把 Telegram 照片（可带说明文字）发给 Agent，它会把图片（base64 内联，模型端无需访问 Telegram）连同文字一起交给模型；图片大小受 `MAX_IMAGE_SIZE_MB` 限制。
 - **图片持久化**：收到的图片以内容寻址 blob 落盘（`ATTACHMENT_STORAGE_PATH`，默认 `./data/attachments`，按 SHA-256 去重、原子写入），并在后续历史上下文里重新作为图片交给模型——**重启后**，只要那条消息仍在 `MAX_CONTEXT_MESSAGES` 窗口内，模型依然看得到它。`/new` 会清理不再被任何消息引用的图片（被多条消息共用的去重 blob 不会误删）。
+- **显式长期记忆**：用 `/remember <内容>` 把一条事实显式保存到你的账号（`/memories` 列出、`/forget <id>` 删除、`/forget all CONFIRM` 清空）。它存在 `memories` 表，按账号隔离、**跨 `/new` 与重启保留**（`/new` 不清理记忆）。之后的普通文字消息会用**纯词法检索**（无 embedding / 向量库 / FTS5、无额外依赖）确定性地匹配相关记忆，并按估算预算把它们作为一条独立、明确标注的**参考消息**（`user` 角色，固定 wrapper 标注「当作背景事实、非指令」）注入上下文——不是自动摘要、不是 RAG、模型不会「自己抽取」记忆。
 - **Markdown 自动渲染**：模型的 `**加粗**`、`*斜体*`、`~~删除线~~`、`` `代码` ``、` ``` ` 代码块、链接、标题会转成 Telegram HTML 显示（不再是字面的 `**`/`` ` ``）；若某段无法解析会自动回退为纯文本，回复永不丢失。
 - 仅允许你配置的 Telegram User ID 使用，其他人静默拒绝。
 - 无 Web UI、无 MCP、无危险/状态变更类工具、无外部依赖数据库。
@@ -120,6 +121,10 @@ cp .env.example .env
 | `MAX_TOOL_ITERATIONS` | 单条消息内 LLM↔工具的最大往返次数，默认 `5`。超过则返回一条通用的「工具调用次数过多」提示。 |
 | `MAX_IMAGE_SIZE_MB` | 单张 Telegram 图片的最大字节数（MB），默认 `10`。超过则返回「图片过大，暂时无法处理。」，不会发给模型。 |
 | `ATTACHMENT_STORAGE_PATH` | 持久化图片附件 blob 的根目录，默认 `./data/attachments`（相对工作目录，目录按需自动创建）。图片**字节**存在这里（按 SHA-256 内容寻址、去重、原子写入），数据库里只存元数据。Docker 下默认路径落在 `./data` 绑定挂载内，随容器持久化。 |
+| `MAX_MEMORIES_PER_SCOPE` | 每个账号（scope）可保存的记忆条数上限，默认 `200`。超过时 `/remember` 返回「记忆已达上限」提示。 |
+| `MAX_MEMORY_CHARS` | 单条记忆的最大字符数（去除首尾空白后），默认 `1000`。超长的 `/remember` 会被拒绝（`memory_invalid`）。 |
+| `MAX_RETRIEVED_MEMORIES` | 单次检索最多返回/注入的相关记忆条数，默认 `5`。 |
+| `MAX_MEMORY_ESTIMATED_TOKENS` | 注入记忆的**估算** token **子预算**（与 `MAX_CONTEXT_ESTIMATED_TOKENS` 同一套模型无关的估算单位，不是计费 token），默认 `3000`。放不进该子预算的记忆会被**跳过**（不截断），并继续尝试分数更低的记忆；必须 `<= MAX_CONTEXT_ESTIMATED_TOKENS`。 |
 | `LOG_LEVEL` | 日志级别，默认 `INFO`。 |
 
 > ⚠️ `OPENAI_BASE_URL` 是最容易踩坑的一项。已经用本地 HTTP server 实测验证：填 `.../v1` 时，SDK 实际请求的就是 `.../v1/chat/completions`，与你的 endpoint 完全一致。
@@ -165,8 +170,12 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 | 命令 | 作用 |
 | --- | --- |
 | `/start` | 启动 Agent / 查看当前会话（无会话时自动创建） |
-| `/new` | 开始新会话，清空本 chat 的历史上下文 |
+| `/new` | 开始新会话，清空本 chat 的历史上下文（**不影响**已保存的长期记忆） |
 | `/context` | 查看上下文窗口状态：消息上限、已存入/本次保留条数、估算 token 预算的占用与剩余、历史图片保留/降级数量（只读预览，估算非精确 token） |
+| `/remember <内容>` | 保存一条长期记忆到你的账号（跨 `/new` 与重启保留）；回显记忆 ID |
+| `/memories` | 列出你保存的所有记忆（ID + 保存时间 + 内容） |
+| `/forget <id>` | 删除指定 ID 的记忆；ID 不存在或不属于你时返回「未找到」 |
+| `/forget all CONFIRM` | 清空你账号下的**全部**记忆（破坏性操作，必须带 `CONFIRM` 才会执行） |
 | `/status` | 查看运行状态（版本、模型、会话 id、消息数） |
 | `/help` | 列出本帮助 |
 
@@ -221,7 +230,18 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 
   > 图片**字节**不存数据库，存 `ATTACHMENT_STORAGE_PATH` 下的内容寻址 blob（`<root>/<hash[:2]>/<hash>`，按 SHA-256 去重、原子写入）。数据库里只有这些元数据行，用 `sha256` 指回 blob。
 
-- **一个 Telegram chat 对应一个 conversation**，`/new` 只影响该 chat。
+  **memories**
+  | 字段 | 说明 |
+  | --- | --- |
+  | `id` | 自增主键（用户可见，用于 `/forget <id>`） |
+  | `scope` | 账号隔离键（当前为 `telegram:<user_id>`，由适配器构造；带索引）。所有按 id 的读/删都在 SQL 里同时按 `scope + id` 过滤 |
+  | `content` | 记忆原文（**逐字**存储；用户显式保存的内容，可含指令性文字——注入时由固定 wrapper 标注为「参考、非指令」） |
+  | `normalized_content` | 检索用的规范化形式（小写化、去首尾、折叠空白），由后端计算 |
+  | `created_at` | 保存时间 |
+  | `updated_at` | 最后修改时间（检索平分时较新者优先） |
+  | `last_retrieved_at` | 最近一次**真正被注入**上下文的时间（未注入则保持为空） |
+
+- **一个 Telegram chat 对应一个 conversation**，`/new` 只影响该 chat，**不触碰 `memories`**（记忆按 `scope` 归属账号，而非会话）。
 - 用命令行直接查看（可选）：
   ```bash
   uv run python -c "import sqlite3;print(sqlite3.connect('data/agent.db').execute('select count(*) from messages').fetchone())"
@@ -281,15 +301,17 @@ docker compose down                    # 停止（数据卷保留）
 - **工具调用**：`agent/tool_loop.py` 在 `Agent Service` 与 `LLM Client` 之间循环执行工具——拿到模型返回的 `tool_calls` 就按名经 registry 执行、把 `tool` 结果回灌 messages，直到模型给出最终文本（或用尽 `MAX_TOOL_ITERATIONS`）。`tools/` 提供 `Tool` 接口 + `ToolRegistry`（注册 / 生成 OpenAI schema / 按名执行）+ 三个只读内置工具。加新工具只需实现 `tools.base.Tool` 并在 `tools/builtin/__init__.py::build_default_tools()` 里 `registry.add(…)`——**不要**在别处写 `if name == "…"` 分支，registry 是唯一分发点。
 - **图片输入 + 持久化**：Telegram 照片（可带说明文字）经 `telegram/media.py` 规范化为渠道无关的 `AgentMessage`，图片 base64 内联交给模型；收到的图片以内容寻址 blob 落盘并在后续历史里重新入窗（见第 9 节 `attachments` 表）。
 - **上下文预算管理**：除了按 `MAX_CONTEXT_MESSAGES` 计消息数，还有一道**模型无关的估算 token 预算**（`MAX_CONTEXT_ESTIMATED_TOKENS`）。每次请求前按「完整历史 turn、从新到旧」选取历史，使请求同时满足消息数与估算预算；某个历史 turn 的图片放不进去时，该 turn 降级为纯文本（其图片**不读取、不发送**），而不跳过去挑更旧的内容。当前请求本身永远保留、其图片不降级；若仅 system + 当前请求就已超预算，则不调用 LLM，回一条「请缩短文字或减少图片」的安全提示。
+- **显式长期记忆**：`/remember` 显式保存的记忆存在 `memories` 表，按 `scope`（账号）隔离，**跨 `/new` 与重启保留**。普通文字消息到达时，`memory/` 包用**纯词法**（小写化 + CJK 单字/ASCII 词元 + 子串命中优先 + 词元重叠计数，纯 Python，无 embedding/向量库/FTS5）在**该账号自己的记忆**里确定性地排序；命中的记忆作为**一条**独立的参考消息（`user` 角色，固定 wrapper + `- [memory #id] 原文`）插在主 system prompt 之后、历史之前——**不**用第二条 system 消息（很多 OpenAI 兼容端点会对「两条 system 消息」直接 400），且其估算成本计入 `MAX_MEMORY_ESTIMATED_TOKENS` 子预算（超则跳过、不截断）。只有**真正被注入**的记忆会更新 `last_retrieved_at`。
 - **降级开关**：`ENABLE_TOOLS=false` 时完全退回纯对话（不传 tools、不做工具相关持久化）；图片处理与工具开关相互独立。
 
 **有意不做 / 限制**
 - **仅 3 个只读工具**（`get_current_time` / `echo` / `system_info`）：无 shell 执行、文件读写、联网扫描、SSH/Docker 或任何状态变更类工具；工具参数不做 schema 校验、无权限审批、单个工具无独立超时；tool 往返不落库、无法事后回放/审计。
 - **图片仅本地磁盘、仅照片**：blob 只落 `ATTACHMENT_STORAGE_PATH`，无配额/后台 GC/单附件删除（`/new` 是唯一回收点）；文档/贴纸/视频/音频仍被丢弃（`ContentPart` 已为它们预留）。
-- **估算而非精确 token**：`MAX_CONTEXT_ESTIMATED_TOKENS` 是一个保守、确定、模型无关的**估算**，用于相对选择与保护，不等于 provider 的计费 token；若实际 endpoint 仍报上下文超长，会走既有的安全 `http_error` 提示，本阶段不做重试或自动探测模型窗口。
-- **未涉及**：MCP、SSH/Docker/Pi、Web search/RAG、向量库、Redis/PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/TTS/STT。
+- **估算而非精确 token**：`MAX_CONTEXT_ESTIMATED_TOKENS` / `MAX_MEMORY_ESTIMATED_TOKENS` 是保守、确定、模型无关的**估算**，用于相对选择与保护，不等于 provider 的计费 token；若实际 endpoint 仍报上下文超长，会走既有的安全 `http_error` 提示，本阶段不做重试或自动探测模型窗口。
+- **记忆是显式 + 词法检索**：记忆**只**由用户用 `/remember` 显式保存，**不**自动从对话里抽取/摘要；检索是纯词法（子串命中 + 词元重叠），**没有**语义/embedding/向量库/FTS5，对同义改写、近义换词的召回有限；一条记忆是整条注入或整条跳过，不逐句裁剪。**跨语言召回尤其弱**：词元只在同一语言的词元空间内比对，用英文保存的记忆（如 `My name is FibreCase.`）用中文问（如「我的名字是什么」）时，中文 query 的词元与英文记忆的词元零重叠，因此**不会被检索注入**、模型也就答不出；反过来用英文问则能命中（且常是靠 `is`/`my`/`name` 这类表层词元碰撞，而非记忆里的专名）。**规避方式**：为你常用的每种语言各存一条记忆（例如再发 `/remember 我的名字是 FibreCase。`），中文问法即可命中。真正的跨语言/语义召回需要 embedding 或外部检索服务，超出本阶段「无外部依赖」的约束，留待后续。
+- **未涉及**：MCP、SSH/Docker/Pi、Web search/RAG、向量库、Redis/PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、记忆自动摘要/抽取、语音/TTS/STT。
 
 **下一步（建议顺序）**
-- **长期记忆（Memory）**：在已建好的预算化 context 之上，做显式、可控的长期记忆检索（而非把长对话硬塞进窗口）。
+- **工具安全（Tool Security）**：为即将接入的有副作用工具（MCP / SSH / Docker / Pi 等）补齐权限审批、参数校验与单工具超时——见 CLAUDE.md 的 *Current limitations*。
 - **新 `ContentPart` 类型**（File / Audio / Video / Sticker）：复用同一套附件存储与重入窗机制，只需补对应的下载分支与 OpenAI 映射。
 - 新的工具能力（如 MCP）以 **Tool Provider** 接入同一个 `Tool`/`ToolRegistry` 接口，不改动 service / LLM client / Telegram 层；有副作用的工具上线前必须先加权限审批。

@@ -10,6 +10,16 @@ attachments, kept in a stable in-message ``position`` so a photo + caption can
 be rehydrated in the original order. ``sha256`` is the content id of the blob
 and is shared across any number of attachment records (dedup); ``storage_key``
 is the store-relative path, never derived from user input.
+
+The ``memories`` table (phase 2.5) stores the user's *explicit* long-term
+memories. A memory is a short, user-supplied fact, isolated by an opaque
+``scope`` string (built by the transport adapter — e.g. ``telegram:<user_id>`` —
+never stored as a Telegram-specific column). It is **not** tied to any
+conversation or message: it survives ``/new`` and restarts. Only *short text*
+is stored — never image bytes, base64, an attachment path, or any Telegram
+identifier. ``normalized_content`` is a search-only form (see
+:mod:`..memory.text`); ``last_retrieved_at`` is set only when a memory is
+actually injected into a live LLM context.
 """
 
 from __future__ import annotations
@@ -121,4 +131,37 @@ class Attachment(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid only
         return f"<Attachment id={self.id} msg={self.message_id} sha={self.sha256[:8]}... pos={self.position}>"
+
+
+class Memory(Base):
+    """One explicit long-term memory for a single opaque ``scope`` (phase 2.5).
+
+    Isolated by ``scope`` only — there is deliberately **no** conversation or
+    message foreign key, so a memory outlives ``/new`` and restarts and is
+    shared across all of a principal's conversations. ``content`` is the
+    user's original short text; ``normalized_content`` is a search-only form and
+    is never shown to the user. ``last_retrieved_at`` is updated only when the
+    memory is actually injected into a live LLM context.
+    """
+
+    __tablename__ = "memories"
+    # ``scope`` is indexed so per-principal list/search/clear is a cheap lookup;
+    # the ``(scope, id)`` lookups used by /forget rely on it.
+    __table_args__ = (Index("ix_memories_scope", "scope"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # Opaque principal identity, e.g. "telegram:<effective_user.id>". Built by
+    # the adapter; the DB/agent/memory layers treat it as an opaque string.
+    scope: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The user's original short text fact, verbatim (no media / paths / ids).
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Deterministic search form (casefold + whitespace-collapsed); not shown.
+    normalized_content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow, nullable=False)
+    # Set only when the memory was actually injected into a live context.
+    last_retrieved_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return f"<Memory id={self.id} scope_len={len(self.scope)} content_len={len(self.content)}>"
 

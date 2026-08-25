@@ -22,8 +22,11 @@ from fibrecase_agent_backend.telegram.bot import (
     CHUNK_SIZE,
     _is_authorized,
     cmd_context,
+    cmd_forget,
     cmd_help,
+    cmd_memories,
     cmd_new,
+    cmd_remember,
     cmd_start,
     cmd_status,
     compose_startup_hooks,
@@ -86,8 +89,15 @@ class _FakeService:
         self.delay = delay
         self.calls = []
         self.reset_calls = []
+        # Phase 2.5 memory command state (mutable, in-memory).
+        self._memories = {}
+        self._mem_seq = 0
+        self.remember_calls = []
+        self.list_calls = []
+        self.forget_calls = []
+        self.forget_all_calls = []
 
-    async def process_message(self, conv_id, text):
+    async def process_message(self, conv_id, text, *, memory_scope=None):
         self.calls.append((conv_id, text))
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -113,6 +123,57 @@ class _FakeService:
     async def reset(self, chat_id, user_id):
         self.reset_calls.append((chat_id, user_id))
         return 99
+
+    # ---- memory command methods (mirrors AgentService) ----
+    async def remember_memory(self, scope, content):
+        self.remember_calls.append((scope, content))
+        content = content.strip()
+        if not content:
+            from fibrecase_agent_backend.agent.service import AgentError, _user_safe_for
+
+            raise AgentError(_user_safe_for("memory_invalid"), "memory_invalid")
+        self._mem_seq += 1
+        rec = _FakeMemoryRecord(self._mem_seq, content)
+        self._memories[rec.id] = rec
+        return rec
+
+    async def list_memories(self, scope):
+        self.list_calls.append(scope)
+        return sorted(self._memories.values(), key=lambda r: r.id)
+
+    async def forget_memory(self, scope, memory_id):
+        self.forget_calls.append((scope, memory_id))
+        if memory_id not in self._memories:
+            from fibrecase_agent_backend.agent.service import AgentError, _user_safe_for
+
+            raise AgentError(_user_safe_for("memory_not_found"), "memory_not_found")
+        del self._memories[memory_id]
+
+    async def forget_all_memories(self, scope):
+        self.forget_all_calls.append(scope)
+        n = len(self._memories)
+        self._memories.clear()
+        return n
+
+
+class _FakeMemoryRecord:
+    def __init__(self, id, content):
+        from datetime import datetime, timezone
+
+        self.id = id
+        self.content = content
+        self.created_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        self.updated_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, _FakeMemoryRecord)
+            and self.id == other.id
+            and self.content == other.content
+        )
+
+    def __hash__(self):
+        return hash((self.id, self.content))
 
 
 class _FakeConfig:
@@ -187,7 +248,7 @@ async def test_handle_message_surfaces_user_safe_llm_error():
     from fibrecase_agent_backend.agent.service import AgentError
 
     class _ErrorService(_FakeService):
-        async def process_message(self, conv_id, text):
+        async def process_message(self, conv_id, text, *, memory_scope=None):
             raise AgentError("模型请求超时，请稍后重试。", "timeout")
 
     update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
@@ -274,8 +335,174 @@ async def test_cmd_help_lists_commands():
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await cmd_help(update, context)
     sent = send.await_args.kwargs["text"]
-    for cmd in ("/start", "/new", "/status", "/help"):
+    for cmd in ("/start", "/new", "/status", "/help", "/remember", "/memories", "/forget"):
         assert cmd in sent
+
+
+# ---------------------------------------------------------------------------
+# long-term memory commands (phase 2.5)
+# ---------------------------------------------------------------------------
+async def test_cmd_remember_saves_and_reports_id():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/remember 我偏好中文回答。", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_remember(update, context)
+    # Authenticated + calls the right service method with the opaque scope.
+    assert service.remember_calls == [("telegram:1", "我偏好中文回答。")]
+    send.assert_awaited_once()
+    text = send.await_args.kwargs["text"]
+    assert "Memory saved" in text and "我偏好中文回答。" in text
+    # No LLM was involved in a command.
+    assert service.calls == []
+
+
+async def test_cmd_remember_empty_is_invalid_and_no_write():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/remember", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_remember(update, context)
+    # Empty content → service rejects, nothing stored.
+    assert service._memories == {}
+    assert "empty or too long" in send.await_args.kwargs["text"].lower()
+
+
+async def test_cmd_remember_unauthorized_noop():
+    update, chat, context, app, bot = _make(user_id=999, chat_id=1, text="/remember x", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_remember(update, context)
+    send.assert_not_awaited()
+    assert service.remember_calls == []
+
+
+async def test_cmd_memories_lists_own_memories():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/memories", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    service._mem_seq = 3
+    service._memories = {1: _FakeMemoryRecord(1, "fact one"), 3: _FakeMemoryRecord(3, "fact three")}
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_memories(update, context)
+    # Scoped to this user.
+    assert service.list_calls == ["telegram:1"]
+    text = send.await_args.kwargs["text"]
+    assert "2 total" in text
+    assert "fact one" in text and "fact three" in text
+    assert "#1" in text and "#3" in text
+
+
+async def test_cmd_memories_empty_state():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/memories", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_memories(update, context)
+    assert "No memories saved yet" in send.await_args.kwargs["text"]
+
+
+async def test_cmd_forget_id_deletes():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/forget 2", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    service._memories = {2: _FakeMemoryRecord(2, "to forget")}
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_forget(update, context)
+    assert service.forget_calls == [("telegram:1", 2)]
+    assert service._memories == {}
+    assert "Memory deleted" in send.await_args.kwargs["text"]
+
+
+async def test_cmd_forget_missing_id_safe_not_found():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/forget 999", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_forget(update, context)
+    assert "Memory not found" in send.await_args.kwargs["text"]
+
+
+async def test_cmd_forget_all_requires_confirmation():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/forget all", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    service._memories = {1: _FakeMemoryRecord(1, "x")}
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_forget(update, context)
+    # No CONFIRM → nothing deleted, only the confirmation format is shown.
+    assert service._memories == {1: _FakeMemoryRecord(1, "x")}
+    assert service.forget_all_calls == []
+    assert "CONFIRM" in send.await_args.kwargs["text"]
+
+
+async def test_cmd_forget_all_confirm_deletes_all():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/forget all CONFIRM", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    service._memories = {1: _FakeMemoryRecord(1, "a"), 2: _FakeMemoryRecord(2, "b")}
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_forget(update, context)
+    assert service.forget_all_calls == ["telegram:1"]
+    assert service._memories == {}
+    assert "2 deleted" in send.await_args.kwargs["text"]
+
+
+async def test_cmd_forget_unauthorized_noop():
+    update, chat, context, app, bot = _make(user_id=999, chat_id=1, text="/forget 1", allowed=(1,))
+    service = _FakeService()
+    app.bot_data["agent_service"] = service
+    service._memories = {1: _FakeMemoryRecord(1, "x")}
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_forget(update, context)
+    send.assert_not_awaited()
+    assert service.forget_calls == [] and service._memories != {}
+
+
+async def test_memory_command_logs_no_sensitive_data(repo, caplog):
+    # Use the *real* repository so the safe scope-hash log line is produced.
+    from fibrecase_agent_backend.agent.service import AgentService
+
+    conv = await repo.get_or_create_conversation(1, 1)
+    service = AgentService(
+        repo,
+        None,  # llm is unused by the /remember command path
+        system_prompt="p",
+    )
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/remember 我偏好中文回答。", allowed=(1,))
+    app.bot_data["agent_service"] = service
+
+    with caplog.at_level("INFO"):
+        with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+            await cmd_remember(update, context)
+
+    record = await repo.list_memories("telegram:1")
+    assert len(record) == 1
+
+    # Collect every structured log field (the `extra` dict) plus the message.
+    def all_fields(rec):
+        fields = {}
+        for key in rec.__dict__:
+            fields[key] = rec.__dict__[key]
+        fields["message"] = rec.getMessage()
+        return fields
+
+    # None of the raw scope, the user id, or the memory content may appear in
+    # any logged field.
+    for rec in caplog.records:
+        fields = all_fields(rec)
+        for value in fields.values():
+            if isinstance(value, str):
+                assert "telegram:1" not in value
+                assert "我偏好中文回答" not in value
+        # The safe fields are present: a scope hash (not the raw scope), the
+        # memory id, and the content length (not the content).
+        extra = fields
+        assert "scope_hash" in extra
+        assert extra["scope_hash"] != "telegram:1"
+        assert extra.get("memory_id") == record[0].id
+        assert extra.get("content_length") == len("我偏好中文回答。")
 
 
 # ---------------------------------------------------------------------------

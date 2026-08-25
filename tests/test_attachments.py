@@ -739,7 +739,7 @@ def test_config_budget_defaults_and_validation():
     assert cfg.max_context_estimated_tokens == 24000
     assert cfg.context_image_estimated_tokens == 2000
     # The minimum valid value is 1.
-    assert Config(**_config_kwargs(max_context_estimated_tokens=1, context_image_estimated_tokens=1)).max_context_estimated_tokens == 1
+    assert Config(**_config_kwargs(max_context_estimated_tokens=1, context_image_estimated_tokens=1, max_memory_estimated_tokens=1)).max_context_estimated_tokens == 1
     # Zero is invalid for both knobs.
     for field_name in ("max_context_estimated_tokens", "context_image_estimated_tokens"):
         with pytest.raises(ConfigError):

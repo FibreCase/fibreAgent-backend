@@ -17,7 +17,8 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
-from .models import Attachment, Conversation, Message
+from ..memory import hash_scope
+from .models import Attachment, Conversation, Memory, Message, utcnow
 
 logger = logging.getLogger("database")
 
@@ -65,6 +66,24 @@ class MessageWithAttachments:
 
     def has_attachments(self) -> bool:
         return bool(self.attachments)
+
+
+@dataclass(frozen=True)
+class MemoryRecord:
+    """A detached view of one long-term memory (safe after session close).
+
+    ``content`` is the user's original text; ``normalized_content`` is the
+    search-only form. Only *short text* is carried — never media, paths, or any
+    Telegram identifier.
+    """
+
+    id: int
+    scope: str
+    content: str
+    normalized_content: str
+    created_at: object
+    updated_at: object
+    last_retrieved_at: object | None
 
 
 class ConversationRepository:
@@ -252,4 +271,141 @@ class ConversationRepository:
             await session.commit()
             await session.refresh(fresh)
             return fresh
+
+    # ------------------------------------------------------------- memories
+    # Phase 2.5: explicit long-term memory. Every read/delete is filtered by
+    # (scope, id) in the SQL itself — never "query by id, then compare scope" —
+    # so one principal can neither see nor delete another principal's memory.
+    # Only short text is written (the caller has already enforced the length and
+    # count caps); the repository stores exactly what it is handed.
+
+    def _memory_record(self, row: Memory) -> MemoryRecord:
+        return MemoryRecord(
+            id=row.id,
+            scope=row.scope,
+            content=row.content,
+            normalized_content=row.normalized_content,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            last_retrieved_at=row.last_retrieved_at,
+        )
+
+    async def add_memory(self, scope: str, content: str, normalized_content: str) -> MemoryRecord:
+        """Insert one memory for ``scope``. Returns the detached record.
+
+        ``content`` is the user's original text; ``normalized_content`` is the
+        search-only form the caller already computed (see :mod:`..memory.text`).
+        """
+        async with self._session() as session:
+            row = Memory(scope=scope, content=content, normalized_content=normalized_content)
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            record = self._memory_record(row)
+            logger.info(
+                "memory added",
+                extra={"scope_hash": _scope_hash(scope), "memory_id": row.id, "content_length": len(content)},
+            )
+            return record
+
+    async def list_memories(self, scope: str) -> list[MemoryRecord]:
+        """All of ``scope``'s memories, oldest first (id ascending)."""
+        async with self._session() as session:
+            result = await session.execute(
+                select(Memory).where(Memory.scope == scope).order_by(Memory.id.asc())
+            )
+            return [self._memory_record(row) for row in result.scalars().all()]
+
+    async def get_memory(self, scope: str, memory_id: int) -> MemoryRecord | None:
+        """One memory *if it belongs to ``scope``*; ``None`` otherwise.
+
+        The ``scope`` filter is in the query, so a foreign id is indistinguishable
+        from a missing one (no existence leak).
+        """
+        async with self._session() as session:
+            result = await session.execute(
+                select(Memory).where(Memory.scope == scope, Memory.id == memory_id)
+            )
+            row = result.scalar_one_or_none()
+            return self._memory_record(row) if row is not None else None
+
+    async def delete_memory(self, scope: str, memory_id: int) -> bool:
+        """Delete ``memory_id`` *within* ``scope``. Returns True if one was removed."""
+        async with self._session() as session:
+            result = await session.execute(
+                delete(Memory).where(Memory.scope == scope, Memory.id == memory_id)
+            )
+            removed = result.rowcount > 0
+            await session.commit()
+            if removed:
+                logger.info(
+                    "memory deleted",
+                    extra={"scope_hash": _scope_hash(scope), "memory_id": memory_id},
+                )
+            return removed
+
+    async def clear_memories(self, scope: str) -> int:
+        """Delete **all** of ``scope``'s memories. Returns the number removed."""
+        async with self._session() as session:
+            result = await session.execute(delete(Memory).where(Memory.scope == scope))
+            removed = result.rowcount or 0
+            await session.commit()
+            if removed:
+                logger.info(
+                    "memories cleared",
+                    extra={"scope_hash": _scope_hash(scope), "count": removed},
+                )
+            return removed
+
+    async def count_memories(self, scope: str) -> int:
+        async with self._session() as session:
+            result = await session.execute(
+                select(func.count()).select_from(Memory).where(Memory.scope == scope)
+            )
+            return int(result.scalar_one())
+
+    async def list_memories_for_search(self, scope: str) -> list[MemoryRecord]:
+        """All of ``scope``'s memories, as detached records, for pure-function ranking.
+
+        This hands back the *whole* scope so :func:`..memory.text.rank_memories`
+        can score them in memory (no FTS5 / no SQL text matching). Only short
+        text is returned; the caller must restrict the scope before ranking.
+        """
+        async with self._session() as session:
+            result = await session.execute(
+                select(Memory).where(Memory.scope == scope).order_by(Memory.id.asc())
+            )
+            return [self._memory_record(row) for row in result.scalars().all()]
+
+    async def mark_memories_retrieved(
+        self, scope: str, memory_ids: Sequence[int]
+    ) -> None:
+        """Set ``last_retrieved_at`` (now, UTC) on the memories *actually injected*.
+
+        Only called for memories that made it into a live LLM context. Scoped to
+        ``scope`` and the given ids; a no-op for an empty list.
+        """
+        if not memory_ids:
+            return
+        async with self._session() as session:
+            await session.execute(
+                Memory.__table__.update()
+                .where(Memory.scope == scope, Memory.id.in_(memory_ids))
+                .values(last_retrieved_at=utcnow())
+            )
+            await session.commit()
+            logger.info(
+                "memories marked retrieved",
+                extra={"scope_hash": _scope_hash(scope), "count": len(memory_ids)},
+            )
+
+
+def _scope_hash(scope: str) -> str:
+    """A short, irreversible fingerprint of a scope, for safe logging.
+
+    The raw scope (and thus the raw Telegram user id it encodes) is never logged.
+    Delegates to the pure :func:`..memory.hash_scope` so every layer hashes the
+    same way.
+    """
+    return hash_scope(scope)
 

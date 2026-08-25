@@ -29,6 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..memory.text import MemoryCandidate, build_memory_reference_text
+
 # Fixed cost attributed to the per-message scaffolding (role, delimiters, …).
 MESSAGE_ENVELOPE_UNITS = 4
 
@@ -196,6 +198,14 @@ class ContextPlan:
     current_cost: int
     budget: int
     cap: int
+    # Phase 2.5: the reference memories selected for injection, in ranked
+    # order, plus the estimated cost of the single reference message that carries
+    # them (a user-role message — see the service for why not a second system
+    # message). ``selected_memories`` is empty (and ``memory_cost`` is 0) whenever
+    # no memory is injected — e.g. no scope, empty query, or no matches — in
+    # which case the rest of the plan is byte-for-byte the phase-2.4 plan.
+    selected_memories: tuple[MemoryCandidate, ...] = ()
+    memory_cost: int = 0
 
 
 @dataclass(frozen=True)
@@ -242,15 +252,28 @@ def plan_context(
     max_messages: int,
     max_estimated_tokens: int,
     image_cost: int,
+    memories: list[MemoryCandidate] | None = None,
+    max_memory_estimated_tokens: int = 0,
 ) -> ContextPlan:
     """Choose the history to send so the request fits *both* budgets.
 
     Priority (fixed): (1) system prompt always kept; (2) the current user
-    request always kept — its images are **never** downgraded; (3) history as
-    complete turns, newest first; (4) a turn whose full (image-bearing) form does
-    not fit in the remaining budget is downgraded to text-only (all its images
-    skipped, no blob read); (5) if the text-only form also does not fit, stop —
-    never reach past a newer turn to include an older one.
+    request always kept — its images are **never** downgraded; (3) **phase 2.5**
+    reference memories, from the already-ranked ``memories``, selected within the
+    ``max_memory_estimated_tokens`` sub-budget (a memory that won't fit is skipped,
+    lower-scored ones still tried; content is never truncated or reworded);
+    (4) history as complete turns, newest first; (5) a turn whose full
+    (image-bearing) form does not fit in the remaining budget is downgraded to
+    text-only (all its images skipped, no blob read); (6) if the text-only form
+    also does not fit, stop — never reach past a newer turn to include an older
+    one.
+
+    The memory reference is a *single* reference message (rendered by the
+    service as a user-role message), so it does not consume the message cap; its
+    estimated cost is committed to the token budget before the history is
+    selected, so memory can never push the total over budget. When
+    ``memories`` is empty/absent (no scope, no valid query, no matches) the plan
+    is byte-for-byte the phase-2.4 plan.
 
     ``history`` must be oldest-first; the returned ``selected`` is chronological
     (system stays first when the caller assembles the wire messages). ``budget``
@@ -263,7 +286,7 @@ def plan_context(
     # The two mandatory pieces. The current user request is exactly one message
     # (fits any cap >= 1), but if system + current user's *estimate* already
     # exceeds the token budget, do not call the LLM — the caller turns this into
-    # a user-safe context_limit error.
+    # a user-safe context_limit error. No memory is selected in this case.
     if system_cost + current_cost > max_estimated_tokens or max_messages < 1:
         return ContextPlan(
             status="current_over_budget",
@@ -275,8 +298,32 @@ def plan_context(
             cap=max_messages,
         )
 
+    # Phase 2.5: pick reference memories from the already-ranked candidates. The
+    # injected reference is one message whose content is the fixed wrapper plus
+    # one bullet per selected memory, so we measure the *whole* message cost each
+    # time (it carries a single per-message envelope, shared by all bullets).
+    # A candidate that would exceed the memory sub-budget — or the total budget —
+    # is skipped (never truncated), and lower-scored candidates are still tried.
+    mandatory = system_cost + current_cost
+    selected_memories: list[MemoryCandidate] = []
+    memory_cost = 0
+    for cand in (memories or []):
+        trial = selected_memories + [cand]
+        candidate_cost = message_cost(build_memory_reference_text(trial), image_cost)
+        if candidate_cost > max_memory_estimated_tokens:
+            continue  # over the memory sub-budget; skip, keep trying lower-scored
+        if mandatory + candidate_cost > max_estimated_tokens:
+            continue  # would overflow the total budget; skip
+        selected_memories = trial
+        memory_cost = candidate_cost
+
+    # The memory reference (when present) is committed to the token budget; history
+    # is then planned against whatever is left. It is one injected scaffold
+    # message, not conversation history, so it does not consume the message cap
+    # (``remaining_messages`` only bounds history turns). With no memory selected
+    # this is exactly the phase-2.4 arithmetic.
     remaining_messages = max_messages - 1  # minus the current user message
-    remaining_tokens = max_estimated_tokens - system_cost - current_cost
+    remaining_tokens = max_estimated_tokens - mandatory - memory_cost
 
     selected: list[_PlannedTurn] = []
     selected_cost = 0
@@ -315,9 +362,11 @@ def plan_context(
             for turn in selected
             for m in turn.messages
         ),
-        estimated_cost=system_cost + current_cost + selected_cost,
+        estimated_cost=system_cost + current_cost + memory_cost + selected_cost,
         system_cost=system_cost,
         current_cost=current_cost,
         budget=max_estimated_tokens,
         cap=max_messages,
+        selected_memories=tuple(selected_memories),
+        memory_cost=memory_cost,
     )

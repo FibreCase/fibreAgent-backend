@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timezone
 from typing import Callable
 
 from telegram import BotCommand, Chat
@@ -39,7 +40,7 @@ from telegram.ext import (
     filters,
 )
 
-from ..agent.service import AgentError, AgentService
+from ..agent.service import AgentError, AgentService, _user_safe_for
 from ..config import Config
 from ..database.repository import ConversationRepository
 from .markdown import to_telegram_html_chunks
@@ -59,9 +60,12 @@ TYPING_REFRESH_SECONDS = 4.0
 # Single source of truth for the command list: rendered by ``cmd_help`` and
 # advertised to Telegram's native "/" menu. ``(command, short_description)``.
 _COMMANDS: list[tuple[str, str]] = [
-    ("start", "Start / view the agent"),
+    ("start", "Start or view the agent"),
     ("new", "Start a new conversation"),
     ("context", "Show context budget"),
+    ("remember", "Save a long-term memory"),
+    ("memories", "List your memories"),
+    ("forget", "Forget a memory or all"),
     ("status", "Show run status"),
     ("help", "Show this help"),
 ]
@@ -325,6 +329,128 @@ async def cmd_context(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_long(chat, "\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# long-term memory commands (phase 2.5)
+# ---------------------------------------------------------------------------
+def _memory_scope(update) -> str:
+    """The opaque, channel-agnostic principal scope for long-term memory.
+
+    Built here — and *only* here — from the Telegram identity. The agent
+    service, memory package, and database treat it as an opaque string and never
+    see a Telegram ``User`` / ``chat_id`` / ``file_id``.
+    """
+    return f"telegram:{update.effective_user.id}"
+
+
+def _command_body(text: str | None) -> str:
+    """The argument text after a ``/command`` (its leading token removed)."""
+    if not text:
+        return ""
+    parts = text.strip().split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+async def cmd_remember(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/remember <content> — save one explicit long-term memory."""
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    service: AgentService = context.application.bot_data["agent_service"]
+    scope = _memory_scope(update)
+    content = _command_body(update.effective_message.text)
+
+    try:
+        record = await service.remember_memory(scope, content)
+    except AgentError as exc:
+        await _safe_reply(chat, exc.user_safe)
+        return
+    except Exception:  # never crash on an unexpected handler error
+        logger.error("remember command failed", exc_info=True)
+        await _safe_reply(chat, _user_safe_for("memory_error"))
+        return
+    await _send_long(chat, f"**Memory saved.**\n**ID:** {record.id}\n\n{record.content}")
+
+
+async def cmd_memories(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/memories — list the caller's own memories (chunked for long lists)."""
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    service: AgentService = context.application.bot_data["agent_service"]
+    scope = _memory_scope(update)
+
+    try:
+        records = await service.list_memories(scope)
+    except AgentError as exc:
+        await _safe_reply(chat, exc.user_safe)
+        return
+    except Exception:
+        logger.error("memories command failed", exc_info=True)
+        await _safe_reply(chat, _user_safe_for("memory_error"))
+        return
+
+    if not records:
+        await _send_long(chat, "**No memories saved yet.** Use /remember <text> to save one.")
+        return
+
+    lines = [f"**Your memories:** ({len(records)} total)", ""]
+    for r in records:
+        lines.append(f"**#{r.id}** (saved {_utc_stamp(r.created_at)})")
+        lines.append(r.content)
+        lines.append("")
+    await _send_long(chat, "\n".join(lines).rstrip())
+
+
+async def cmd_forget(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/forget <id> — delete one memory; /forget all CONFIRM — delete all.
+
+    ``/forget all`` without the exact ``CONFIRM`` token only shows the
+    confirmation format and changes nothing. A foreign/missing id is reported
+    exactly as a missing one (no existence leak).
+    """
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    service: AgentService = context.application.bot_data["agent_service"]
+    scope = _memory_scope(update)
+    tokens = _command_body(update.effective_message.text).split()
+
+    if not tokens:
+        await _safe_reply(chat, "Usage: /forget <id> or /forget all CONFIRM")
+        return
+
+    try:
+        if tokens[0].lower() == "all":
+            if len(tokens) >= 2 and tokens[1] == "CONFIRM":
+                removed = await service.forget_all_memories(scope)
+                await _send_long(chat, f"**All memories cleared.** ({removed} deleted)")
+            else:
+                await _safe_reply(chat, _user_safe_for("memory_clear_confirmation"))
+            return
+
+        try:
+            memory_id = int(tokens[0])
+        except ValueError:
+            raise AgentError("Usage: /forget <id> or /forget all CONFIRM", "memory_invalid")
+        await service.forget_memory(scope, memory_id)
+        await _send_long(chat, f"**Memory deleted.** (ID: {memory_id})")
+    except AgentError as exc:
+        await _safe_reply(chat, exc.user_safe)
+        return
+    except Exception:
+        logger.error("forget command failed", exc_info=True)
+        await _safe_reply(chat, _user_safe_for("memory_error"))
+        return
+
+
+def _utc_stamp(dt) -> str:
+    """A short UTC timestamp for display (time only — never memory content)."""
+    try:
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:  # pragma: no cover - defensive (dt is always tz-aware)
+        return str(dt)
+
+
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, context):
         return
@@ -369,7 +495,11 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     try:
-        reply = await _with_typing(context.bot, chat.id, service.process_message(conversation_id, agent_message))
+        reply = await _with_typing(
+            context.bot,
+            chat.id,
+            service.process_message(conversation_id, agent_message, memory_scope=_memory_scope(update)),
+        )
     except AgentError as exc:
         logger.info(
             "llm error surfaced to user",
@@ -464,6 +594,9 @@ def build_application(
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("new", cmd_new))
     application.add_handler(CommandHandler("context", cmd_context))
+    application.add_handler(CommandHandler("remember", cmd_remember))
+    application.add_handler(CommandHandler("memories", cmd_memories))
+    application.add_handler(CommandHandler("forget", cmd_forget))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("status", cmd_status))
     # Plain text messages *and* photos (with or without a caption). Commands are

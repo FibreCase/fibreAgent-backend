@@ -69,6 +69,10 @@ class AgentBackend:
             enable_tools=config.enable_tools,
             max_tool_iterations=config.max_tool_iterations,
             attachment_store=self.attachment_store,
+            max_memories_per_scope=config.max_memories_per_scope,
+            max_memory_chars=config.max_memory_chars,
+            max_retrieved_memories=config.max_retrieved_memories,
+            max_memory_estimated_tokens=config.max_memory_estimated_tokens,
         )
         application = build_application(config, self.service, self.repository)
         # Chain the Telegram adapter's command-menu registration with our own

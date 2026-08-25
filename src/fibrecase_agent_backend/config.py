@@ -49,6 +49,14 @@ class Config:
 
     attachment_storage_path: Path
 
+    # Phase 2.5: explicit long-term memory. All positive integers; the memory
+    # estimated-token sub-budget must not exceed the total context budget.
+    # Defaults keep an existing .env (without these keys) working.
+    max_memories_per_scope: int = 200
+    max_memory_chars: int = 1000
+    max_retrieved_memories: int = 5
+    max_memory_estimated_tokens: int = 3000
+
     log_level: str = "INFO"
     system_prompt_override: str | None = field(default=None)
 
@@ -76,6 +84,19 @@ class Config:
             raise ConfigError("MAX_TOOL_ITERATIONS must be >= 1")
         if self.max_image_size_mb < 1:
             raise ConfigError("MAX_IMAGE_SIZE_MB must be >= 1")
+        if self.max_memories_per_scope < 1:
+            raise ConfigError("MAX_MEMORIES_PER_SCOPE must be >= 1")
+        if self.max_memory_chars < 1:
+            raise ConfigError("MAX_MEMORY_CHARS must be >= 1")
+        if self.max_retrieved_memories < 1:
+            raise ConfigError("MAX_RETRIEVED_MEMORIES must be >= 1")
+        if self.max_memory_estimated_tokens < 1:
+            raise ConfigError("MAX_MEMORY_ESTIMATED_TOKENS must be >= 1")
+        if self.max_memory_estimated_tokens > self.max_context_estimated_tokens:
+            raise ConfigError(
+                "MAX_MEMORY_ESTIMATED_TOKENS must be <= MAX_CONTEXT_ESTIMATED_TOKENS "
+                "(the memory sub-budget cannot exceed the total context budget)"
+            )
 
     @property
     def max_image_size_bytes(self) -> int:
@@ -163,6 +184,10 @@ def load_config() -> Config:
         max_tool_iterations=_parse_int(os.environ.get("MAX_TOOL_ITERATIONS", ""), 5),
         max_image_size_mb=_parse_float(os.environ.get("MAX_IMAGE_SIZE_MB", ""), 10.0),
         attachment_storage_path=Path(os.environ.get("ATTACHMENT_STORAGE_PATH", "./data/attachments")),
+        max_memories_per_scope=_parse_int(os.environ.get("MAX_MEMORIES_PER_SCOPE", ""), 200),
+        max_memory_chars=_parse_int(os.environ.get("MAX_MEMORY_CHARS", ""), 1000),
+        max_retrieved_memories=_parse_int(os.environ.get("MAX_RETRIEVED_MEMORIES", ""), 5),
+        max_memory_estimated_tokens=_parse_int(os.environ.get("MAX_MEMORY_ESTIMATED_TOKENS", ""), 3000),
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,
     )

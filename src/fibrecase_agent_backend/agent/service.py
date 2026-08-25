@@ -46,10 +46,12 @@ from contextlib import asynccontextmanager
 from ..attachments import AttachmentStore, AttachmentStoreError
 from ..database.repository import (
     ConversationRepository,
+    MemoryRecord,
     MessageWithAttachments,
 )
 from ..llm.client import LLMError, OpenAIClient
 from ..llm.message_converter import agent_message_to_openai_content
+from ..memory import MemoryCandidate, build_memory_reference_text, hash_scope, normalize_text, rank_memories
 from ..tools.registry import ToolRegistry
 from .context import (
     ChatMessage,
@@ -72,6 +74,12 @@ _USER_SAFE: dict[str, str] = {
     "tool_limit": "处理该请求时工具调用次数过多，请重新尝试。",
     "attachment_error": "图片附件保存失败，请重新发送。",
     "context_limit": "当前消息超出可处理的上下文限制，请缩短文字或减少图片后重试。",
+    # Phase 2.5 memory commands are English (consistent with /help, /status, …).
+    "memory_invalid": "Memory content is empty or too long.",
+    "memory_limit": "Memory limit reached for your account. Forget a memory first.",
+    "memory_error": "Memory operation failed. Please try again.",
+    "memory_not_found": "Memory not found.",
+    "memory_clear_confirmation": "Confirm clearing all memories with: /forget all CONFIRM",
     "error": "模型服务暂时不可用。",
 }
 _DEFAULT_USER_SAFE = "模型服务暂时不可用。"
@@ -104,6 +112,10 @@ class AgentService:
         enable_tools: bool = False,
         max_tool_iterations: int = 5,
         attachment_store: AttachmentStore | None = None,
+        max_memories_per_scope: int = 200,
+        max_memory_chars: int = 1000,
+        max_retrieved_memories: int = 5,
+        max_memory_estimated_tokens: int = 3000,
     ) -> None:
         self._repo = repository
         self._llm = llm
@@ -125,6 +137,13 @@ class AgentService:
         # are still sent in the current turn but are not persisted — the exact
         # phase-2.1.x behaviour.
         self._attachment_store = attachment_store
+        # Phase 2.5: explicit long-term memory. Written only via the /remember,
+        # /memories, /forget commands; retrieved (no LLM) and injected as a
+        # separate reference user message on normal text messages.
+        self._max_memories_per_scope = max_memories_per_scope
+        self._max_memory_chars = max_memory_chars
+        self._max_retrieved_memories = max_retrieved_memories
+        self._max_memory_estimated_tokens = max_memory_estimated_tokens
         self._locks: dict[int, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ locks
@@ -199,6 +218,129 @@ class AgentService:
             "images_kept": images_kept,
             "images_in_store": images_in_store,
         }
+
+    # --------------------------------------------------------- long-term memory
+    # Phase 2.5. These are the *only* way a user changes their memories — all
+    # through explicit commands. They are scope-isolated (every by-id read/delete
+    # is filtered by ``scope + id`` in the repository), never call the LLM, and
+    # fail safe into a stable :class:`AgentError` category the adapter renders.
+    # Logging records only a short, irreversible scope hash — never the raw
+    # scope, the memory text, or the user id.
+
+    async def remember_memory(self, scope: str, content: str) -> MemoryRecord:
+        """Save one explicit memory for ``scope``. Returns the stored record.
+
+        Raises :class:`AgentError` (``memory_invalid`` / ``memory_limit`` /
+        ``memory_error``) — never writes to the DB in the invalid/over-limit
+        cases. The raw ``content`` is stored verbatim; only its normalized form
+        is used for later retrieval.
+        """
+        trimmed = content.strip()
+        if not trimmed:
+            raise AgentError(_user_safe_for("memory_invalid"), "memory_invalid")
+        if len(trimmed) > self._max_memory_chars:
+            raise AgentError(_user_safe_for("memory_invalid"), "memory_invalid")
+        try:
+            count = await self._repo.count_memories(scope)
+        except Exception:
+            logger.error(
+                "memory read failed",
+                extra={"scope_hash": hash_scope(scope), "category": "memory_error"},
+                exc_info=True,
+            )
+            raise AgentError(_user_safe_for("memory_error"), "memory_error")
+        if count >= self._max_memories_per_scope:
+            logger.info("memory limit reached", extra={"scope_hash": hash_scope(scope), "count": count})
+            raise AgentError(_user_safe_for("memory_limit"), "memory_limit")
+        try:
+            record = await self._repo.add_memory(scope, trimmed, normalize_text(trimmed))
+        except Exception:
+            logger.error(
+                "memory write failed",
+                extra={"scope_hash": hash_scope(scope), "category": "memory_error"},
+                exc_info=True,
+            )
+            raise AgentError(_user_safe_for("memory_error"), "memory_error")
+        return record
+
+    async def list_memories(self, scope: str) -> list[MemoryRecord]:
+        """All of ``scope``'s memories (oldest first), or a safe error on failure."""
+        try:
+            return await self._repo.list_memories(scope)
+        except Exception:
+            logger.error(
+                "memory read failed",
+                extra={"scope_hash": hash_scope(scope), "category": "memory_error"},
+                exc_info=True,
+            )
+            raise AgentError(_user_safe_for("memory_error"), "memory_error")
+
+    async def forget_memory(self, scope: str, memory_id: int) -> None:
+        """Delete one memory in ``scope``. A foreign/missing id → ``memory_not_found``.
+
+        The repository filters by ``scope + id`` so a foreign id is indistinguishable
+        from a missing one — no existence leak across principals.
+        """
+        try:
+            removed = await self._repo.delete_memory(scope, memory_id)
+        except Exception:
+            logger.error(
+                "memory delete failed",
+                extra={"scope_hash": hash_scope(scope), "category": "memory_error"},
+                exc_info=True,
+            )
+            raise AgentError(_user_safe_for("memory_error"), "memory_error")
+        if not removed:
+            raise AgentError(_user_safe_for("memory_not_found"), "memory_not_found")
+
+    async def forget_all_memories(self, scope: str) -> int:
+        """Delete *all* of ``scope``'s memories. Returns the count removed."""
+        try:
+            removed = await self._repo.clear_memories(scope)
+        except Exception:
+            logger.error(
+                "memory clear failed",
+                extra={"scope_hash": hash_scope(scope), "category": "memory_error"},
+                exc_info=True,
+            )
+            raise AgentError(_user_safe_for("memory_error"), "memory_error")
+        return removed
+
+    async def _retrieve_memories_for(self, scope: str, query: str) -> list[MemoryCandidate]:
+        """Fetch and rank the memories relevant to ``query`` for ``scope``.
+
+        No LLM, no embeddings — pure deterministic lexical scoring over the
+        scope's own memories. An empty / no-term query yields ``[]`` (no search).
+        Any repository failure raises :class:`AgentError`` (``memory_error``) so
+        normal chat fails safe and never calls the LLM with unknown context.
+        """
+        try:
+            records = await self._repo.list_memories_for_search(scope)
+        except Exception:
+            logger.error(
+                "memory retrieval failed; chat will not use memory",
+                extra={"scope_hash": hash_scope(scope), "category": "memory_error"},
+                exc_info=True,
+            )
+            raise AgentError(_user_safe_for("memory_error"), "memory_error")
+        if not records:
+            return []
+        candidates = [
+            MemoryCandidate(
+                id=r.id,
+                content=r.content,
+                normalized_content=r.normalized_content,
+                updated_at=r.updated_at,
+            )
+            for r in records
+        ]
+        ranked = rank_memories(query, candidates, self._max_retrieved_memories)
+        if ranked:
+            logger.info(
+                "memory retrieved",
+                extra={"scope_hash": hash_scope(scope), "hits": len(ranked), "ids": [c.id for c in ranked]},
+            )
+        return ranked
 
     async def reset(self, telegram_chat_id: int, telegram_user_id: int) -> int:
         """Reset a chat's conversation, returning the new conversation id.
@@ -360,7 +502,13 @@ class AgentService:
         return agent_message_to_openai_content(AgentMessage(contents=parts))
 
     # ------------------------------------------------------------ process
-    async def process_message(self, conversation_id: int, user_message: str | AgentMessage) -> str:
+    async def process_message(
+        self,
+        conversation_id: int,
+        user_message: str | AgentMessage,
+        *,
+        memory_scope: str | None = None,
+    ) -> str:
         """Process one inbound message and return the assistant reply text.
 
         ``user_message`` is either a plain ``str`` (phase-one callers, and
@@ -372,6 +520,15 @@ class AgentService:
         are additionally persisted as content-addressed blobs (phase 2.2) so
         they can be re-attached to history on later turns and after a restart.
         The assistant reply is always a ``str``.
+
+        ``memory_scope`` (phase 2.5, optional) is an opaque principal identity
+        (e.g. ``telegram:<user_id>``) supplied by the adapter. When present and
+        the message has a non-empty text query, the service deterministically
+        retrieves relevant long-term memories (no LLM) and, if they fit the
+        memory sub-budget, injects them as a single reference *user* message
+        after the main prompt and before history. Without ``memory_scope`` the
+        path is byte-for-byte the phase-2.4 behaviour. Memory retrieval never
+        touches the tool loop or the attachment store.
         """
         # Normalise a plain string to a single-part text message so both entry
         # points share one code path; a string with no text short-circuits.
@@ -395,11 +552,21 @@ class AgentService:
             user_message_obj = await self._repo.add_message(conversation_id, "user", text)
             await self._persist_attachments(user_message_obj.id, message)
 
+            # Phase 2.5: deterministically retrieve relevant long-term memories
+            # for this principal. Only a normal *text* message with a scope
+            # triggers a search; image-only / empty / command-free-of-scope paths
+            # skip it entirely (→ byte-for-byte phase-2.4 context). A retrieval
+            # DB failure raises memory_error and aborts before the LLM is called.
+            memory_candidates: list[MemoryCandidate] = []
+            if memory_scope is not None and text:
+                memory_candidates = await self._retrieve_memories_for(memory_scope, text)
+
             # Phase 2.4: before reading any attachment blob, plan which complete
             # history turns fit *both* the message cap and the estimated-token
             # budget. History is candidate metadata only (no bytes); the current
             # turn is a separate, always-kept candidate whose images are never
-            # downgraded.
+            # downgraded. Phase 2.5: the ranked memories are selected here too,
+            # within the memory sub-budget.
             history_candidates = [
                 TurnCandidate(
                     role=m.role,
@@ -426,6 +593,8 @@ class AgentService:
                 max_messages=self._max_context_messages,
                 max_estimated_tokens=self._max_context_estimated_tokens,
                 image_cost=self._context_image_estimated_tokens,
+                memories=memory_candidates or None,
+                max_memory_estimated_tokens=self._max_memory_estimated_tokens,
             )
 
             # system + the current user request alone already exceed the budget:
@@ -459,8 +628,27 @@ class AgentService:
             # The current turn rides its in-memory bytes (text and/or a list of
             # OpenAI parts) and is always kept, images and all.
             current_content = agent_message_to_openai_content(message)
+
+            # Phase 2.5: the injected reference memories become ONE separate
+            # message placed right after the main prompt and before history. It
+            # is a ``user``-role message (the canonical place for retrieved
+            # reference material), NOT a second ``system`` message: many
+            # OpenAI-compatible endpoints reject a request that carries more than
+            # one system message (or a system message that is not first) with a
+            # 400, which is what broke memory-bearing turns. The raw memory text
+            # is shown verbatim inside a fixed, non-instructional wrapper; a
+            # user-role message can never alter the main prompt's role, tools, or
+            # permissions. With no selected memories this list is empty and the
+            # context is byte-for-byte the phase-2.4 shape.
+            memory_messages: list[ChatMessage] = []
+            if plan.selected_memories:
+                memory_messages = [
+                    ChatMessage(role="user", content=build_memory_reference_text(list(plan.selected_memories)))
+                ]
+
             context = [
                 ChatMessage(role="system", content=self._system_prompt),
+                *memory_messages,
                 *history,
                 ChatMessage(role="user", content=current_content),
             ]
@@ -480,8 +668,29 @@ class AgentService:
                     "cap": self._max_context_messages,
                     "images_kept": images_kept,
                     "images_downgraded": images_downgraded,
+                    "memories_selected": len(plan.selected_memories),
+                    "memory_cost": plan.memory_cost,
                 },
             )
+
+            # Phase 2.5: only the memories that actually made it into the context
+            # are stamped ``last_retrieved_at``, batched before the LLM call. A
+            # memory that failed the sub-budget (not in ``selected_memories``) is
+            # not touched. Documented semantics: if the LLM call then fails, the
+            # retrieval still counts as having happened. This is a best-effort
+            # timestamp write — if it fails we log (safely) and still send the
+            # context, rather than dropping a turn that is otherwise ready.
+            if plan.selected_memories and memory_scope is not None:
+                try:
+                    await self._repo.mark_memories_retrieved(
+                        memory_scope, [m.id for m in plan.selected_memories]
+                    )
+                except Exception:
+                    logger.warning(
+                        "failed to mark memories retrieved",
+                        extra={"scope_hash": hash_scope(memory_scope), "count": len(plan.selected_memories)},
+                        exc_info=True,
+                    )
 
             try:
                 if self._enable_tools:
