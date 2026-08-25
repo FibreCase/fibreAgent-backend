@@ -13,6 +13,8 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 from telegram import Chat, Message, Update, User
+from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import CallbackContext
 
 from fibrecase_agent_backend.telegram.bot import (
@@ -237,6 +239,40 @@ async def test_compose_startup_hooks_with_none_is_noop():
     chained = compose_startup_hooks()
     await chained(object())  # should not raise
 
+
+# ---------------------------------------------------------------------------
+# markdown rendering of model replies (parse_mode=HTML + plain fallback)
+# ---------------------------------------------------------------------------
+async def test_handle_message_renders_reply_as_html():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hi", allowed=(1,))
+    service = _FakeService(reply="这是 **加粗** 与 `代码`")
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await handle_message(update, context)
+    send.assert_awaited_once()
+    assert send.await_args.kwargs["parse_mode"] == ParseMode.HTML
+    assert send.await_args.kwargs["text"] == "这是 <b>加粗</b> 与 <code>代码</code>"
+
+
+async def test_handle_message_falls_back_to_plain_on_bad_request():
+    # Telegram rejects the HTML (400 "can't parse entities"); the chunk must be
+    # re-sent as plain text so the reply is never lost.
+    def _side_effect(text, **kwargs):
+        if kwargs.get("parse_mode") == ParseMode.HTML:
+            raise BadRequest("Can't parse entities")
+        return "sent"
+
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hi", allowed=(1,))
+    service = _FakeService(reply="**bold** `code`")
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = service
+    with patch.object(Chat, "send_message", new_callable=AsyncMock, side_effect=_side_effect) as send:
+        await handle_message(update, context)
+    assert send.await_count == 2  # HTML attempt, then plain fallback
+    second = send.await_args_list[1].kwargs
+    assert second.get("parse_mode") in (None, "Text")  # not HTML
+    assert second["text"] == "**bold** `code`"  # original markdown, verbatim
 
 
 # ---------------------------------------------------------------------------

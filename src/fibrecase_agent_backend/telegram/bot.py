@@ -28,8 +28,8 @@ import logging
 from typing import Callable
 
 from telegram import BotCommand, Chat
-from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -42,6 +42,7 @@ from telegram.ext import (
 from ..agent.service import AgentError, AgentService
 from ..config import Config
 from ..database.repository import ConversationRepository
+from .markdown import to_telegram_html_chunks
 
 logger = logging.getLogger("telegram")
 
@@ -103,10 +104,30 @@ def split_into_chunks(text: str, limit: int = CHUNK_SIZE) -> list[str]:
 
 
 async def _send_long(chat: Chat, text: str) -> None:
-    """Send ``text`` to ``chat``, chunking if needed. May raise TelegramError."""
-    for chunk in split_into_chunks(text):
-        if chunk:
-            await chat.send_message(text=chunk)
+    """Send the model reply to ``chat``, rendering its Markdown to HTML.
+
+    The reply is split into tag-balanced chunks (a code block never dangles
+    across a 4096 split) and each is sent with ``parse_mode=HTML``. If Telegram
+    rejects a chunk's HTML — the "can't parse entities" 400, which happens when
+    the model emits something outside our supported subset — that one chunk is
+    re-sent as **plain text** so the user still gets the content. Other chunks
+    keep their formatting.
+    """
+    for chunk in to_telegram_html_chunks(text, limit=CHUNK_SIZE):
+        if not chunk.html:
+            continue
+        try:
+            await chat.send_message(text=chunk.html, parse_mode=ParseMode.HTML)
+        except BadRequest:
+            # Unparseable HTML for this chunk: deliver it verbatim instead.
+            logger.warning("html parse failed for a chunk; falling back to plain text")
+            for plain in split_into_chunks(chunk.text, limit=CHUNK_SIZE):
+                if plain:
+                    await chat.send_message(text=plain)
+        except TelegramError:
+            # Non-parse errors (FloodWait, timeouts): let the caller's
+            # TelegramError handling / on_error log it, as before.
+            raise
 
 
 async def _safe_reply(chat: Chat, text: str) -> None:

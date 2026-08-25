@@ -26,6 +26,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - 使用远程 **OpenAI 兼容**（Chat Completions API）的 LLM 生成回复。
 - 对话历史持久化到 **SQLite**，重启后可完整恢复 conversation context。
 - 支持 **工具调用**（Phase 2.1）：内置 `get_current_time` / `echo` / `system_info` 三个只读安全工具，可开启/关闭。
+- **Markdown 自动渲染**：模型的 `**加粗**`、`*斜体*`、`~~删除线~~`、`` `代码` ``、` ``` ` 代码块、链接、标题会转成 Telegram HTML 显示（不再是字面的 `**`/`` ` ``）；若某段无法解析会自动回退为纯文本，回复永不丢失。
 - 仅允许你配置的 Telegram User ID 使用，其他人静默拒绝。
 - 无 Web UI、无 MCP（Phase 2.2+）、无危险/状态变更类工具、无外部依赖数据库。
 
@@ -39,7 +40,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
    (long polling)       │  · 鉴权 (allow-list)                    │
                         │  · /start /new /help /status           │
                         │  · typing 保活                          │
-                        │  · 长消息分块发送                        │
+                        │  · Markdown→HTML 渲染 + 分块发送          │
                         └───────────────┬─────────────────────────┘
                                         │  只调用 AgentService
                                         ▼
@@ -231,8 +232,9 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 3. **重启** backend，再发「我叫什么？」→ 仍应回答「Alice。」（**最关键的一条：上下文跨重启恢复**）
 4. 发 `/new` → 再发「我叫什么？」→ 应**不**再知道 Alice。（新会话，历史已清空）
 5. 发 `/help` → 应列出 `/start` `/new` `/status` `/help`。
-6. 发一条超长消息 → 不会触发 Telegram API 错误（自动分块，内容完整）。
-7. 快速连发两条消息 → 同一 conversation 串行处理，不会互相覆盖 context。
+6. 发一条**包含 Markdown** 的消息（让 Agent 用 `**加粗**`、`` `代码` `` 或代码块回答）→ 加粗/代码应以**样式**显示，而不是字面的 `**`/`` ` ``；代码块应成块显示。
+7. 发一条超长消息 → 不会触发 Telegram API 错误（自动分块，内容完整）。
+8. 快速连发两条消息 → 同一 conversation 串行处理，不会互相覆盖 context。
 
 ### 如何验证 SQLite 持久化（Test 3 的底层原理）
 
