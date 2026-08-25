@@ -17,6 +17,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import CallbackContext
 
+from fibrecase_agent_backend import __version__
 from fibrecase_agent_backend.telegram.bot import (
     CHUNK_SIZE,
     _is_authorized,
@@ -193,6 +194,8 @@ async def test_cmd_status_reports_conversation():
         await cmd_status(update, context)
     sent = send.await_args.kwargs["text"]
     assert "Status: OK" in sent and "test-model" in sent
+    # /status reports the backend version.
+    assert f"Version:\n{__version__}" in sent
 
 
 async def test_cmd_new_resets_and_confirms():

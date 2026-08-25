@@ -44,6 +44,7 @@ from ..config import Config
 from ..database.repository import ConversationRepository
 from .markdown import to_telegram_html_chunks
 from .media import MediaError, normalize_message
+from .. import __version__
 
 logger = logging.getLogger("telegram")
 
@@ -257,6 +258,8 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Agent Backend",
             "Status: OK",
             "",
+            f"Version:\n{__version__}",
+            "",
             f"Model:\n{config.openai_model}",
             "",
             "Conversation:\n(none yet — 发送 /start 开始)",
@@ -268,6 +271,8 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines = [
             "Agent Backend",
             "Status: OK",
+            "",
+            f"Version:\n{__version__}",
             "",
             f"Model:\n{config.openai_model}",
             "",

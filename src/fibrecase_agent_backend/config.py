@@ -45,6 +45,8 @@ class Config:
 
     max_image_size_mb: float
 
+    attachment_storage_path: Path
+
     log_level: str = "INFO"
     system_prompt_override: str | None = field(default=None)
 
@@ -152,6 +154,7 @@ def load_config() -> Config:
         enable_tools=_parse_bool(os.environ.get("ENABLE_TOOLS", ""), True),
         max_tool_iterations=_parse_int(os.environ.get("MAX_TOOL_ITERATIONS", ""), 5),
         max_image_size_mb=_parse_float(os.environ.get("MAX_IMAGE_SIZE_MB", ""), 10.0),
+        attachment_storage_path=Path(os.environ.get("ATTACHMENT_STORAGE_PATH", "./data/attachments")),
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,
     )

@@ -2,7 +2,7 @@
 
 一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**。
 
-当前阶段（Phase 1 + Phase 2.1 + Phase 2.1.x）让你在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失。Phase 2.1 在此之上加入了**工具调用**：Agent 可以调用少量安全的内置工具来回答问题。Phase 2.1.x 进一步支持**图片输入**：你可以把 Telegram 照片（可带说明文字）发给 Agent，它会用多模态请求交给模型，并能与工具调用同时工作。
+当前阶段（Phase 1 + Phase 2.1 + Phase 2.1.x + Phase 2.2）让你在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失。Phase 2.1 在此之上加入了**工具调用**：Agent 可以调用少量安全的内置工具来回答问题。Phase 2.1.x 进一步支持**图片输入**：你可以把 Telegram 照片（可带说明文字）发给 Agent，它会用多模态请求交给模型，并能与工具调用同时工作。Phase 2.2 让**图片持久化**：收到的图片会以内容寻址 blob 的形式落盘（按 SHA-256 去重），并在后续历史上下文（含重启后）里重新作为图片交给模型；`/new` 时清理不再被引用的图片。
 
 > **重要：当前内置工具仅限只读/无害操作**：`get_current_time`（当前时间）、`echo`（回显）、`system_info`（主机名/平台/Python 版本）。
 > 它**不能**执行命令、控制设备、读写文件、联网扫描。如果用户要求超出工具能力的操作，它会明确说明「当前尚未配置相应工具」。
@@ -26,7 +26,8 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - 使用远程 **OpenAI 兼容**（Chat Completions API）的 LLM 生成回复。
 - 对话历史持久化到 **SQLite**，重启后可完整恢复 conversation context。
 - 支持 **工具调用**（Phase 2.1）：内置 `get_current_time` / `echo` / `system_info` 三个只读安全工具，可开启/关闭。
-- 支持 **图片输入**（Phase 2.1.x）：把 Telegram 照片（可带说明文字）发给 Agent，它会把图片（base64 内联，模型端无需访问 Telegram）连同文字一起交给模型；图片大小受 `MAX_IMAGE_SIZE_MB` 限制，仅在内存中使用、**不持久化**（重启后模型看不到更早的图片）。
+- 支持 **图片输入**（Phase 2.1.x）：把 Telegram 照片（可带说明文字）发给 Agent，它会把图片（base64 内联，模型端无需访问 Telegram）连同文字一起交给模型；图片大小受 `MAX_IMAGE_SIZE_MB` 限制。
+- **图片持久化**（Phase 2.2）：收到的图片以内容寻址 blob 落盘（`ATTACHMENT_STORAGE_PATH`，默认 `./data/attachments`，按 SHA-256 去重、原子写入），并在后续历史上下文里重新作为图片交给模型——**重启后**，只要那条消息仍在 `MAX_CONTEXT_MESSAGES` 窗口内，模型依然看得到它。`/new` 会清理不再被任何消息引用的图片（被多条消息共用的去重 blob 不会误删）。
 - **Markdown 自动渲染**：模型的 `**加粗**`、`*斜体*`、`~~删除线~~`、`` `代码` ``、` ``` ` 代码块、链接、标题会转成 Telegram HTML 显示（不再是字面的 `**`/`` ` ``）；若某段无法解析会自动回退为纯文本，回复永不丢失。
 - 仅允许你配置的 Telegram User ID 使用，其他人静默拒绝。
 - 无 Web UI、无 MCP（Phase 2.2+）、无危险/状态变更类工具、无外部依赖数据库。
@@ -117,7 +118,8 @@ cp .env.example .env
 | `MAX_CONTEXT_MESSAGES` | context 中携带的**最近 N 条消息**（消息数，不是 token 数），默认 `50`，另加一条 system 消息。 |
 | `ENABLE_TOOLS` | 是否启用工具调用循环，默认 `true`。设为 `false` 时完全退回 Phase 1 纯对话行为（不传 tools、不做任何工具相关持久化）。 |
 | `MAX_TOOL_ITERATIONS` | 单条消息内 LLM↔工具的最大往返次数，默认 `5`。超过则返回一条通用的「工具调用次数过多」提示。 |
-| `MAX_IMAGE_SIZE_MB` | 单张 Telegram 图片的最大字节数（MB），默认 `10`。超过则返回「图片过大，暂时无法处理。」，不会发给模型。图片仅在本次请求的内存中使用，**不持久化**。 |
+| `MAX_IMAGE_SIZE_MB` | 单张 Telegram 图片的最大字节数（MB），默认 `10`。超过则返回「图片过大，暂时无法处理。」，不会发给模型。 |
+| `ATTACHMENT_STORAGE_PATH` | 持久化图片附件 blob 的根目录，默认 `./data/attachments`（相对工作目录，目录按需自动创建）。图片**字节**存在这里（按 SHA-256 内容寻址、去重、原子写入），数据库里只存元数据。Docker 下默认路径落在 `./data` 绑定挂载内，随容器持久化。 |
 | `LOG_LEVEL` | 日志级别，默认 `INFO`。 |
 
 > ⚠️ `OPENAI_BASE_URL` 是最容易踩坑的一项。已经用本地 HTTP server 实测验证：填 `.../v1` 时，SDK 实际请求的就是 `.../v1/chat/completions`，与你的 endpoint 完全一致。
@@ -164,7 +166,7 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 | --- | --- |
 | `/start` | 启动 Agent / 查看当前会话（无会话时自动创建） |
 | `/new` | 开始新会话，清空本 chat 的历史上下文 |
-| `/status` | 查看运行状态（模型、会话 id、消息数） |
+| `/status` | 查看运行状态（版本、模型、会话 id、消息数） |
 | `/help` | 列出本帮助 |
 
 其它任何文字消息都会作为对话发给 Agent。
@@ -199,8 +201,24 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
   | `id` | 自增主键 |
   | `conversation_id` | 外键 → conversations.id（级联删除） |
   | `role` | `system` / `user` / `assistant`（schema 已允许 `tool`，为工具调用预留；当前只写 user/assistant） |
-  | `content` | 消息文本 |
+  | `content` | 消息文本（**纯文本**；图片字节不存这里，见 `attachments`） |
   | `created_at` | 时间戳 |
+
+  **attachments**
+  | 字段 | 说明 |
+  | --- | --- |
+  | `id` | 自增主键 |
+  | `message_id` | 外键 → messages.id（级联删除：删消息即删其附件元数据） |
+  | `sha256` | 图片内容 SHA-256（内容寻址键；同一图片去重为同一 blob） |
+  | `storage_key` | blob 在 `ATTACHMENT_STORAGE_PATH` 下的相对路径（`<前2位>/<完整hash>`） |
+  | `content_type` | `image`（Phase 2.2 只写图片；字段为未来的 File/Audio/Video 预留） |
+  | `mime_type` | 如 `image/jpeg` / `image/png` / `image/webp`（按魔数嗅探） |
+  | `size_bytes` | 字节数 |
+  | `filename` | 原始文件名（可空） |
+  | `position` | 该图在消息内容中的顺序（让「图+说明」重启后按原顺序还原） |
+  | `created_at` | 时间戳 |
+
+  > 图片**字节**不存数据库，存 `ATTACHMENT_STORAGE_PATH` 下的内容寻址 blob（`<root>/<hash[:2]>/<hash>`，按 SHA-256 去重、原子写入）。数据库里只有这些元数据行，用 `sha256` 指回 blob。
 
 - **一个 Telegram chat 对应一个 conversation**，`/new` 只影响该 chat。
 - 用命令行直接查看（可选）：
@@ -298,19 +316,25 @@ Telegram → Agent Service → Tool Loop → LLM（支持 OpenAI-style tool call
 
 **加一个新工具**：实现 `tools.base.Tool`（`name`/`description`/`parameters`/`async execute`），在 `tools/builtin/__init__.py::build_default_tools()` 里 `registry.add(…)` 即可——**不要**在别处写 `if name == "…"` 分支，registry 是唯一分发点。
 
-## 当前限制（Phase 2.1）
+## 当前限制（Phase 2.1 / 2.2）
 
 - 仅 3 个只读内置工具；**无** shell 执行、文件读写、联网扫描、SSH/Docker、任何状态变更类工具（有意为之）。
 - 工具参数**不做 schema 校验**就直接 `execute`；**无**权限审批（只有 allow-list 的 chat 能触发已注册工具）；单个工具**无独立超时**。
 - tool 往返不落库，无法事后回放/审计。
+- **图片持久化（Phase 2.2）**仅覆盖 Telegram **照片**（文档/贴纸/视频/音频仍被丢弃，是 `ContentPart` 已预留但未实现的 `FileContent`/`AudioContent`/…）。blob 只落**本地磁盘**（`ATTACHMENT_STORAGE_PATH`），无配额/后台 GC/单条附件删除；`/new` 是唯一的回收点。图片按**消息条数**窗口进出 context，尚无 token 预算裁剪（见 Future「上下文管理」）。
 
-## Future（Phase 2.2+，尚未实现）
+## Future（尚未实现）
 
-Phase 1 起就明确不实现、Phase 2.1 仍未涉及：**MCP、SSH、让 Agent *调用* Docker、Web search、RAG**、向量库、Redis、PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/图像/TTS/STT。
+Phase 1 起就明确不实现、截至 Phase 2.2 仍未涉及：**MCP、SSH、让 Agent *调用* Docker、Web search、RAG**、向量库、Redis、PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/TTS/STT。
 
 下一批能力都应作为 **Tool Provider** 接入同一个 `Tool`/`ToolRegistry` 接口，而不是改动 service / LLM client / Telegram 层：
 
 - **MCP**：实现一个 `MCPClient`，把远端 server 的工具列表拉下来、逐个包装成 `Tool`（`execute` 转发到 MCP 调用），启动时 `registry.add(...)`。循环本身已经是工具无关的。
 - **SSH / Docker / Pi**：同样是 `Tool`（或产出多个工具的小 Provider），subprocess 等副作用关在工具内部。**注意：这类有副作用的工具上线前必须先加权限审批**（见"当前限制"）。
 
-保持不变式：Agent service 里不放 Telegram 逻辑；OpenAI SDK 只在 `llm/client.py` 引入；日志不出现任何 secret 或完整消息体；`ENABLE_TOOLS=false` 永远是完整的 Phase 1 降级。
+**多模态扩展**建在 Phase 2.1.x / 2.2 的 `AgentMessage` / `ContentPart` / 附件存储之上——加一个新 `ContentPart` 子类型 + `telegram/media.py` 的一个分支 + `llm/message_converter.py` 的映射即可，agent / tool loop / service 都不动。持久化、去重、重启后重新入窗、`/new` 回收这些**已经通用**（`attachments.content_type` 已为 File/Audio/Video 预留）。建议的下一步：
+
+- **上下文管理（Context Management）**：当前 context 按**消息条数**（`MAX_CONTEXT_MESSAGES`）截断，图片会随其所在消息整体进出窗口。下一步可引入按 **token 预算** 的裁剪 + 图片成本/数量策略（例如窗口内保留最近 N 张、更早的降级为文字引用），让长对话既装得下又能控住 token 成本。
+- **新的 `ContentPart` 类型**（File / Audio / Video / Sticker）：复用同一套附件存储与重入窗机制，只需补对应的下载分支与 OpenAI 映射。
+
+保持不变式：Agent service 里不放 Telegram 逻辑；OpenAI SDK 只在 `llm/client.py` 引入；日志不出现任何 secret、完整消息体或**图片字节/base64**；`ENABLE_TOOLS=false` 永远是完整的 Phase 1 降级；`attachments/` 保持不依赖 Telegram / OpenAI SDK / ORM。

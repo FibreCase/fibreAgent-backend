@@ -1,14 +1,22 @@
-"""SQLAlchemy ORM models for conversations and messages.
+"""SQLAlchemy ORM models for conversations, messages, and attachments.
 
 The schema deliberately allows a ``tool`` role (used by future tool/MCP
 support) even though phase one only stores ``user`` / ``assistant`` turns.
+
+The ``attachments`` table (phase 2.2) stores *metadata* about persisted media:
+the raw bytes live on disk in a content-addressed blob store (see
+:mod:`..attachments`), never in the database. A message may have zero or more
+attachments, kept in a stable in-message ``position`` so a photo + caption can
+be rehydrated in the original order. ``sha256`` is the content id of the blob
+and is shared across any number of attachment records (dedup); ``storage_key``
+is the store-relative path, never derived from user input.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import CheckConstraint, ForeignKey, String, Text
+from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -61,10 +69,56 @@ class Message(Base):
         nullable=False,
     )
     role: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Pure-text content only. Media is never stored here (no base64, no bytes);
+    # it lives in the blob store and is referenced by ``attachments``.
     content: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+    # A message may carry zero or more attachments, kept in a stable order.
+    attachments: Mapped[list["Attachment"]] = relationship(
+        back_populates="message",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="Attachment.position",
+    )
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid only
         return f"<Message id={self.id} conv={self.conversation_id} role={self.role}>"
+
+
+class Attachment(Base):
+    __tablename__ = "attachments"
+    __table_args__ = (
+        # ``sha256`` is indexed so "is this blob still referenced anywhere?" is a
+        # cheap lookup during /new garbage collection.
+        Index("ix_attachments_sha256", "sha256"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # One attachment links exactly one message. The message's conversation is
+    # reached through Message.conversation_id (we do not denormalise it here).
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    # Content id of the on-disk blob (deduplicated — many rows can share it).
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Store-relative path ("ab/abcdef...") produced by the store, never user input.
+    storage_key: Mapped[str] = mapped_column(String(68), nullable=False)
+    # Currently always "image"; left a column so future file/audio/video slot in.
+    content_type: Mapped[str] = mapped_column(String(16), nullable=False, default="image")
+    mime_type: Mapped[str] = mapped_column(String(64), nullable=False, default="image/jpeg")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # Optional; a Telegram photo does not currently carry a filename.
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Stable order of this attachment within its message's content.
+    position: Mapped[int] = mapped_column(nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    message: Mapped["Message"] = relationship(back_populates="attachments")
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return f"<Attachment id={self.id} msg={self.message_id} sha={self.sha256[:8]}... pos={self.position}>"
+

@@ -17,6 +17,7 @@ import logging
 import sys
 
 from .agent.service import AgentService
+from .attachments import AttachmentStore
 from .config import Config, ConfigError, load_config
 from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
@@ -43,6 +44,10 @@ class AgentBackend:
         self.engine = create_engine(config.database_url)
         self.session_factory = create_session_factory(self.engine)
         self.repository = ConversationRepository(self.session_factory)
+        # Content-addressed blob store for persistent image attachments. The root
+        # directory is created on demand by the store (Docker's ./data mount
+        # covers the default ./data/attachments path).
+        self.attachment_store = AttachmentStore(config.attachment_storage_path)
         self.llm = OpenAIClient(
             base_url=config.openai_base_url,
             api_key=config.openai_api_key,
@@ -61,6 +66,7 @@ class AgentBackend:
             registry=registry,
             enable_tools=config.enable_tools,
             max_tool_iterations=config.max_tool_iterations,
+            attachment_store=self.attachment_store,
         )
         application = build_application(config, self.service, self.repository)
         # Chain the Telegram adapter's command-menu registration with our own
