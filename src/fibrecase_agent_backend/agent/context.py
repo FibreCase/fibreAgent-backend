@@ -16,6 +16,14 @@ from typing import Any
 class ChatMessage:
     """A single chat message in an OpenAI-compatible shape.
 
+    ``content`` is normally a plain ``str`` (every phase-one message, and every
+    persisted message). A *current* turn that carries an image is the only
+    multimodal case: its ``content`` is a ``list`` of typed OpenAI content parts
+    (``{"type": "text", ...}`` / ``{"type": "image_url", ...}``), produced by
+    :func:`..llm.message_converter.agent_message_to_openai_content`. History is
+    always rehydrated from the DB as plain strings, so a multimodal message
+    appears in the wire payload only on the turn it was sent.
+
     ``tool_calls`` / ``tool_call_id`` are only populated on the assistant and
     tool turns created by the tool loop (:mod:`.tool_loop`); they stay ``None``
     for every phase-one (chat-only) message, so ``to_dict()`` output — and the
@@ -23,7 +31,7 @@ class ChatMessage:
     """
 
     role: str
-    content: str
+    content: str | list[dict[str, Any]]
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
 

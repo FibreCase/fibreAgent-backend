@@ -34,8 +34,10 @@ from contextlib import asynccontextmanager
 
 from ..database.repository import ConversationRepository, MessageRecord
 from ..llm.client import LLMError, OpenAIClient
+from ..llm.message_converter import agent_message_to_openai_content
 from ..tools.registry import ToolRegistry
 from .context import ChatMessage, build_context
+from .messages import AgentMessage, TextContent
 from .tool_loop import ToolLoopLimitError, run_tool_loop
 
 logger = logging.getLogger("agent")
@@ -117,18 +119,42 @@ class AgentService:
         return conversation.id
 
     # ------------------------------------------------------------ process
-    async def process_message(self, conversation_id: int, user_message: str) -> str:
-        text = user_message.strip()
-        if not text:
-            return ""
+    async def process_message(self, conversation_id: int, user_message: str | AgentMessage) -> str:
+        """Process one inbound message and return the assistant reply text.
+
+        ``user_message`` is either a plain ``str`` (phase-one callers, and
+        existing tests) or a channel-independent :class:`AgentMessage` carrying
+        text and/or image parts. A bare string is normalised to a single-part
+        text :class:`AgentMessage`, so both entry points share one code path.
+
+        Persistence stores **text only**: an image rides along in the *current*
+        request but is not written to the DB (a deliberate phase limitation —
+        see the module docstring). The assistant reply is always a ``str``.
+        """
+        # Normalise a plain string to a single-part text message so both entry
+        # points share one code path; a string with no text short-circuits.
+        if isinstance(user_message, str):
+            text = user_message.strip()
+            if not text:
+                return ""
+            message = AgentMessage(contents=[TextContent(text)])
+        else:
+            message = user_message
+            text = message.text
+            if message.is_empty():
+                return ""
 
         async with self.conversation_lock(conversation_id):
             history_records = await self._repo.get_messages(conversation_id)
-            # Persist the user turn before generating so a crash does not lose it.
+            # Persist the *text* of the user turn (images are not stored).
             await self._repo.add_message(conversation_id, "user", text)
 
             history = [ChatMessage(role=r.role, content=r.content) for r in history_records]
-            context = build_context(self._system_prompt, [*history, ChatMessage("user", text)])
+            # The current turn may be multimodal (a list of OpenAI parts); the
+            # persisted history is always plain strings, so only the *current*
+            # message can carry an image into the wire payload.
+            current_content = agent_message_to_openai_content(message)
+            context = build_context(self._system_prompt, [*history, ChatMessage("user", current_content)])
 
             try:
                 if self._enable_tools:
@@ -163,6 +189,7 @@ class AgentService:
                 extra={
                     "conversation_id": conversation_id,
                     "reply_length": len(result.text),
+                    "image_attached": message.has_image(),
                 },
             )
             return result.text

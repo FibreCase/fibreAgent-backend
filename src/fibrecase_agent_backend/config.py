@@ -43,6 +43,8 @@ class Config:
     enable_tools: bool
     max_tool_iterations: int
 
+    max_image_size_mb: float
+
     log_level: str = "INFO"
     system_prompt_override: str | None = field(default=None)
 
@@ -64,6 +66,13 @@ class Config:
             raise ConfigError("MAX_CONTEXT_MESSAGES must be >= 1")
         if self.max_tool_iterations < 1:
             raise ConfigError("MAX_TOOL_ITERATIONS must be >= 1")
+        if self.max_image_size_mb < 1:
+            raise ConfigError("MAX_IMAGE_SIZE_MB must be >= 1")
+
+    @property
+    def max_image_size_bytes(self) -> int:
+        """The ``MAX_IMAGE_SIZE_MB`` cap expressed in bytes."""
+        return int(self.max_image_size_mb * 1_000_000)
 
     @property
     def system_prompt(self) -> str:
@@ -142,6 +151,7 @@ def load_config() -> Config:
         max_context_messages=_parse_int(os.environ.get("MAX_CONTEXT_MESSAGES", ""), 50),
         enable_tools=_parse_bool(os.environ.get("ENABLE_TOOLS", ""), True),
         max_tool_iterations=_parse_int(os.environ.get("MAX_TOOL_ITERATIONS", ""), 5),
+        max_image_size_mb=_parse_float(os.environ.get("MAX_IMAGE_SIZE_MB", ""), 10.0),
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,
     )

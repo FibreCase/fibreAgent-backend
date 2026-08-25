@@ -101,6 +101,7 @@ class _FakeService:
 
 class _FakeConfig:
     openai_model = "test-model"
+    max_image_size_bytes = 10_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -154,11 +155,15 @@ async def test_handle_message_returns_llm_reply_and_typing():
     service = _FakeService(reply="hi back", delay=0.1)  # long enough for typing to fire
     app.bot_data["repository"] = _FakeRepo()
     app.bot_data["agent_service"] = service
+    app.bot_data["config"] = _FakeConfig()
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await handle_message(update, context)
     send.assert_awaited_once()
     assert send.await_args.kwargs["text"] == "hi back"
-    assert service.calls == [(5, "hello")]
+    # The handler normalised the Telegram text into an AgentMessage and passed it on.
+    conv_id, agent_message = service.calls[0]
+    assert conv_id == 5
+    assert agent_message.text == "hello"
     assert bot.actions >= 1  # typing keep-alive fired
 
 
@@ -172,6 +177,7 @@ async def test_handle_message_surfaces_user_safe_llm_error():
     update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
     app.bot_data["repository"] = _FakeRepo()
     app.bot_data["agent_service"] = _ErrorService()
+    app.bot_data["config"] = _FakeConfig()
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await handle_message(update, context)
     send.assert_awaited_once()
@@ -248,6 +254,7 @@ async def test_handle_message_renders_reply_as_html():
     service = _FakeService(reply="这是 **加粗** 与 `代码`")
     app.bot_data["repository"] = _FakeRepo()
     app.bot_data["agent_service"] = service
+    app.bot_data["config"] = _FakeConfig()
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await handle_message(update, context)
     send.assert_awaited_once()
@@ -267,6 +274,7 @@ async def test_handle_message_falls_back_to_plain_on_bad_request():
     service = _FakeService(reply="**bold** `code`")
     app.bot_data["repository"] = _FakeRepo()
     app.bot_data["agent_service"] = service
+    app.bot_data["config"] = _FakeConfig()
     with patch.object(Chat, "send_message", new_callable=AsyncMock, side_effect=_side_effect) as send:
         await handle_message(update, context)
     assert send.await_count == 2  # HTML attempt, then plain fallback

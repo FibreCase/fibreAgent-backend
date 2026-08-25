@@ -43,6 +43,7 @@ from ..agent.service import AgentError, AgentService
 from ..config import Config
 from ..database.repository import ConversationRepository
 from .markdown import to_telegram_html_chunks
+from .media import MediaError, normalize_message
 
 logger = logging.getLogger("telegram")
 
@@ -285,23 +286,46 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     chat = update.effective_chat
     message = update.effective_message
-    if message is None or not message.text or not message.text.strip():
+    # Accept either a plain text message or a photo (with or without a caption).
+    # Photo captions carry their text in ``message.caption``, not ``message.text``.
+    has_text = bool((message.text or "").strip()) if message is not None else False
+    has_photo = bool(message.photo) if message is not None else False
+    if message is None or not (has_text or has_photo):
         return
-    text = message.text
     user_id = update.effective_user.id
 
     service: AgentService = context.application.bot_data["agent_service"]
     repo: ConversationRepository = context.application.bot_data["repository"]
+    config: Config = context.application.bot_data["config"]
 
     conversation = await repo.get_or_create_conversation(chat.id, user_id)
     conversation_id = conversation.id
+
+    # Normalize the Telegram message into a channel-independent AgentMessage.
+    # This is where a photo is downloaded (bytes held in memory) and size/MIME
+    # are validated; a failure here is user-safe and never crashes the backend.
+    try:
+        agent_message = await normalize_message(message, config.max_image_size_bytes)
+    except MediaError as exc:
+        logger.warning(
+            "media could not be processed",
+            extra={"conversation_id": conversation_id, "category": exc.category},
+        )
+        await _safe_reply(chat, exc.user_safe)
+        return
+
     logger.info(
         "received message",
-        extra={"conversation_id": conversation_id, "message_id": message.message_id, "length": len(text)},
+        extra={
+            "conversation_id": conversation_id,
+            "message_id": message.message_id,
+            "has_image": agent_message.has_image(),
+            "text_length": len(agent_message.text),
+        },
     )
 
     try:
-        reply = await _with_typing(context.bot, chat.id, service.process_message(conversation_id, text))
+        reply = await _with_typing(context.bot, chat.id, service.process_message(conversation_id, agent_message))
     except AgentError as exc:
         logger.info(
             "llm error surfaced to user",
@@ -397,8 +421,10 @@ def build_application(
     application.add_handler(CommandHandler("new", cmd_new))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("status", cmd_status))
-    # Plain text messages (commands are excluded and handled above).
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Plain text messages *and* photos (with or without a caption). Commands are
+    # excluded and handled above. A photo's caption lives in message.caption, so
+    # it is delivered here, not by the TEXT filter.
+    application.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message))
     # Log any unhandled update error instead of crashing.
     application.add_error_handler(on_error)
     return application

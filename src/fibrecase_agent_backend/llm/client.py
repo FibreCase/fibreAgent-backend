@@ -42,13 +42,18 @@ logger = logging.getLogger("llm")
 class ChatMessage:
     """A single chat message in an OpenAI-compatible shape.
 
+    ``content`` is normally a plain ``str``; a multimodal *current* turn carries
+    a ``list`` of typed content parts (``text`` / ``image_url``) instead — see
+    :mod:`.message_converter`. Both serialise straight through ``to_dict()`` to
+    the shape the OpenAI SDK / endpoint accepts.
+
     ``tool_calls`` and ``tool_call_id`` are only populated on assistant / tool
     messages during a tool-calling loop; they stay ``None`` on every
     phase-one (chat-only) message, so ``to_dict()`` output is unchanged there.
     """
 
     role: str
-    content: str
+    content: str | list[dict[str, Any]]
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
 
