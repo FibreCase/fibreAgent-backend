@@ -5,7 +5,8 @@ to the channel-agnostic :class:`~..agent.service.AgentService` and handles the
 concerns specific to this transport:
 
 * user authorisation (only configured Telegram user ids may use the bot),
-* the ``/start``, ``/new``, ``/help`` and ``/status`` commands,
+* the ``/start``, ``/new``, ``/help``, ``/status``, ``/context``, memory, and
+  ``/tool_audit`` commands,
 * a "typing…" keep-alive while the model is generating,
 * chunking of long model replies (the full reply is persisted *once*,
   upstream, in the Agent service),
@@ -67,6 +68,7 @@ _COMMANDS: list[tuple[str, str]] = [
     ("memories", "List your memories"),
     ("forget", "Forget a memory or all"),
     ("status", "Show run status"),
+    ("tool_audit", "Show tool audit log"),
     ("help", "Show this help"),
 ]
 
@@ -451,6 +453,67 @@ def _utc_stamp(dt) -> str:
         return str(dt)
 
 
+# ---------------------------------------------------------------------------
+# tool audit command (phase 3)
+# ---------------------------------------------------------------------------
+_TOOL_AUDIT_MAX_LIMIT = 50
+
+
+async def cmd_tool_audit(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tool_audit [limit] — show the caller's own recent tool-audit events.
+
+    Read-only and scope-isolated: it reads only the *current* principal's audit
+    rows (by irreversible scope hash) and shows, per event, a timestamp, the
+    event id, the tool name, the event type, a stable result code, and (where
+    recorded) the latency. It never shows tool arguments, tool results, exception
+    text, the raw scope/user id, or any secret. An unauthorised sender is ignored
+    silently, exactly like every other command.
+    """
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    service: AgentService = context.application.bot_data["agent_service"]
+    scope = _memory_scope(update)
+
+    # Optional ``[limit]``: default 20, clamped to 1..50; a non-numeric arg is a
+    # usage hint (not an error, not a crash).
+    arg = _command_body(update.effective_message.text).strip()
+    limit = 20
+    if arg:
+        try:
+            limit = max(1, min(_TOOL_AUDIT_MAX_LIMIT, int(arg)))
+        except ValueError:
+            await _safe_reply(chat, "Usage: /tool_audit [limit]  (limit is 1-50)")
+            return
+
+    try:
+        records = await service.list_tool_audit_events(scope, limit)
+    except AgentError as exc:
+        await _safe_reply(chat, exc.user_safe)
+        return
+    except Exception:  # never crash on an unexpected handler error
+        logger.error("tool_audit command failed", exc_info=True)
+        await _safe_reply(chat, _user_safe_for("tool_audit_error"))
+        return
+
+    if not records:
+        await _send_long(chat, "**No tool activity yet.** Tool calls will appear here as they run.")
+        return
+
+    lines = [f"**Tool audit:** (last {len(records)} events, most recent first)", ""]
+    for r in records:
+        line = f"**#{r.id}** {_utc_stamp(r.created_at)} — {r.tool_name} / {r.event_type}"
+        if r.code:
+            line += f" / {r.code}"
+        if r.latency_ms is not None:
+            line += f" / {r.latency_ms}ms"
+        lines.append(line)
+    lines += ["", "(Codes are stable, human-readable status tags — arguments and results are not shown.)"]
+    # None of the above exposes tool args, results, exception text, raw scope,
+    # the user id, or any secret.
+    await _send_long(chat, "\n".join(lines))
+
+
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, context):
         return
@@ -574,11 +637,18 @@ def build_application(
     config: Config,
     service: AgentService,
     repository: ConversationRepository,
+    approval_broker=None,
 ) -> Application:
     """Assemble the PTB :class:`Application` and register all handlers.
 
     Startup work (command menu, DB init) is wired by the caller via
     :func:`compose_startup_hooks`, not here — this only registers handlers.
+
+    ``approval_broker`` (an in-memory :class:`~..telegram.approval
+    .TelegramApprovalBroker`, optional) supplies the phase-3 Approve/Deny
+    callback handler. When ``None`` (tools disabled, or a bare unit test) no
+    callback handler is registered and no broker is bound — the approval path is
+    simply absent.
     """
     application = (
         ApplicationBuilder()
@@ -599,6 +669,13 @@ def build_application(
     application.add_handler(CommandHandler("forget", cmd_forget))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("tool_audit", cmd_tool_audit))
+    # Phase 3: the Approve/Deny inline-button callback (bound to the exact
+    # (principal, chat) that requested the approval; all other clicks are no-ops).
+    if approval_broker is not None:
+        approval_broker.bind_application(application)
+        application.bot_data["approval_broker"] = approval_broker
+        application.add_handler(approval_broker.build_callback_handler())
     # Plain text messages *and* photos (with or without a caption). Commands are
     # excluded and handled above. A photo's caption lives in message.caption, so
     # it is delivered here, not by the TEXT filter.

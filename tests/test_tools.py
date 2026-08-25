@@ -121,8 +121,12 @@ async def test_registry_execute_tool_exception_returns_error_json():
 
     reg = ToolRegistry().register(Boom())
     out = await reg.execute("boom", {})
-    assert "kaboom" in out
-    assert "error" in json.loads(out)
+    # Phase 3: a tool exception becomes a stable, non-echoing error result.
+    # The exception *text* ("kaboom") must NOT leak to the model — only the
+    # stable code does.
+    payload = json.loads(out)
+    assert payload["error"]["code"] == "tool_execution_failed"
+    assert "kaboom" not in out
 
 
 async def test_registry_execute_tolerates_missing_arguments():

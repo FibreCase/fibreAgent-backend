@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..base import Tool
+from ..policy import ToolPermission
 
 
 class EchoTool(Tool):
@@ -10,6 +11,8 @@ class EchoTool(Tool):
 
     name = "echo"
     description = "Echo the given message back exactly as provided. Takes one argument: message."
+    # Safe, read-only (returns exactly what it was given) — allow without approval.
+    default_permission = ToolPermission.ALLOW
     parameters: dict[str, object] = {
         "type": "object",
         "properties": {

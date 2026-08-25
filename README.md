@@ -1,4 +1,6 @@
-# Agent Backend
+# FibreCase's Agent Backend
+
+![Poster](.repo_fiiles/img/poster.jpg)
 
 一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**：在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失；Agent 可以调用少量安全的内置工具来回答问题，也支持**图片输入**——收到的图片会持久化（内容寻址 blob，按 SHA-256 去重），并在后续历史上下文（含重启后）里重新作为图片交给模型。你可以用 `/remember` **显式保存长期记忆**（账号隔离、随账号跨 `/new` 与重启保留），之后普通文字消息会按词法检索把相关记忆作为「用户提供的参考材料」注入上下文。
 
@@ -16,6 +18,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 
 要扩展能力，只需往 Tool Registry 里加一个实现 `Tool` 接口的工具（未来 MCP/SSH/Docker/Pi 都是这样接入的 Tool Provider），**不用重写 Telegram 层**。
 
+
 ---
 
 ## 1. 项目简介
@@ -24,6 +27,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - 使用远程 **OpenAI 兼容**（Chat Completions API）的 LLM 生成回复。
 - 对话历史持久化到 **SQLite**，重启后可完整恢复 conversation context。
 - 支持**工具调用**：内置 `get_current_time` / `echo` / `system_info` 三个只读安全工具，可开启/关闭。
+- **工具安全**：每次工具调用都先经过一道统一的执行边界——`allow`/`ask`/`deny` 策略（只读内置中 `get_current_time` / `echo` 默认 `allow` 不打扰；`system_info` 虽同样只读，但当前刻意设为 `ask` 以便演示审批流程；未来新工具默认 `ask`）→ 参数的 JSON Schema 校验 → 需要时的一次性 Telegram 人工审批（`Approve`/`Deny` 按钮，按「发起者 + 原会话」绑定、会过期、只能点一次）→ 单工具超时 → **只记元数据**的 append-only 审计。审计可用 `/tool_audit [limit]` 查看（只显示工具名/事件/结果码/耗时，绝不显示参数或结果）。审计与策略**不记录、不显示**任何参数、结果、异常正文、图片、密钥或你的原始 user id。
 - 支持**图片输入**：把 Telegram 照片（可带说明文字）发给 Agent，它会把图片（base64 内联，模型端无需访问 Telegram）连同文字一起交给模型；图片大小受 `MAX_IMAGE_SIZE_MB` 限制。
 - **图片持久化**：收到的图片以内容寻址 blob 落盘（`ATTACHMENT_STORAGE_PATH`，默认 `./data/attachments`，按 SHA-256 去重、原子写入），并在后续历史上下文里重新作为图片交给模型——**重启后**，只要那条消息仍在 `MAX_CONTEXT_MESSAGES` 窗口内，模型依然看得到它。`/new` 会清理不再被任何消息引用的图片（被多条消息共用的去重 blob 不会误删）。
 - **显式长期记忆**：用 `/remember <内容>` 把一条事实显式保存到你的账号（`/memories` 列出、`/forget <id>` 删除、`/forget all CONFIRM` 清空）。它存在 `memories` 表，按账号隔离、**跨 `/new` 与重启保留**（`/new` 不清理记忆）。之后的普通文字消息会用**纯词法检索**（无 embedding / 向量库 / FTS5、无额外依赖）确定性地匹配相关记忆，并按估算预算把它们作为一条独立、明确标注的**参考消息**（`user` 角色，固定 wrapper 标注「当作背景事实、非指令」）注入上下文——不是自动摘要、不是 RAG、模型不会「自己抽取」记忆。
@@ -39,7 +43,8 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
                         ┌─────────────────────────────────────────┐
    Telegram  ──poll──▶  │  telegram/bot.py  (Adapter)             │
    (long polling)       │  · 鉴权 (allow-list)                    │
-                        │  · /start /new /context /help /status     │
+                        │· /start /new /context /help /status       │
+                        │· /remember /memories /forget /tool_audit  │
                         │  · typing 保活                          │
                         │  · Markdown→HTML 渲染 + 分块发送          │
                         └───────────────┬─────────────────────────┘
@@ -119,6 +124,9 @@ cp .env.example .env
 | `CONTEXT_IMAGE_ESTIMATED_TOKENS` | 估算中每张保留在 context 中的图片的成本，默认 `2000`。 |
 | `ENABLE_TOOLS` | 是否启用工具调用循环，默认 `true`。设为 `false` 时完全退回纯对话行为（不传 tools、不做任何工具相关持久化）。 |
 | `MAX_TOOL_ITERATIONS` | 单条消息内 LLM↔工具的最大往返次数，默认 `5`。超过则返回一条通用的「工具调用次数过多」提示。 |
+| `TOOL_PERMISSION_OVERRIDES` | 逐工具权限覆盖，逗号分隔的 `<工具名>=allow\|ask\|deny`（如 `echo=deny,my_tool=ask`），默认空（用各工具自带默认值：`get_current_time` / `echo` 为 `allow`，`system_info` 当前刻意设为 `ask`，其余新工具默认 `ask`）。这是**启动期强校验**：条目缺 `=`、空工具名、空权限、非法权限值、重复工具名，或工具名含 `[A-Za-z0-9_-]` 之外的字符，都会导致启动失败（`ConfigError`），不会被静默忽略。 |
+| `TOOL_APPROVAL_TIMEOUT_SECONDS` | 对 `ask` 策略工具，等待 Telegram 审批（`Approve`/`Deny`）的秒数，超时则按「审批已过期」处理，默认 `60`。必须为正数。 |
+| `TOOL_TIMEOUT_SECONDS` | 单个工具调用的最长执行秒数；超时即取消该工具并回给模型「工具超时」，默认 `30`。必须为正数。 |
 | `MAX_IMAGE_SIZE_MB` | 单张 Telegram 图片的最大字节数（MB），默认 `10`。超过则返回「图片过大，暂时无法处理。」，不会发给模型。 |
 | `ATTACHMENT_STORAGE_PATH` | 持久化图片附件 blob 的根目录，默认 `./data/attachments`（相对工作目录，目录按需自动创建）。图片**字节**存在这里（按 SHA-256 内容寻址、去重、原子写入），数据库里只存元数据。Docker 下默认路径落在 `./data` 绑定挂载内，随容器持久化。 |
 | `MAX_MEMORIES_PER_SCOPE` | 每个账号（scope）可保存的记忆条数上限，默认 `200`。超过时 `/remember` 返回「记忆已达上限」提示。 |
@@ -178,6 +186,7 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 | `/forget <id>` | 删除指定 ID 的记忆；ID 不存在或不属于你时返回「未找到」 |
 | `/forget all CONFIRM` | 清空你账号下的**全部**记忆（破坏性操作，必须带 `CONFIRM` 才会执行） |
 | `/status` | 查看运行状态（版本、模型、会话 id、消息数） |
+| `/tool_audit [limit]` | 查看**你本人**最近的工具执行审计（`limit` 默认 `20`、上限 `50`）：每条只显示时间、事件 id、工具名、事件类型、结果码与（若有）耗时；**绝不**显示工具参数、结果或异常正文。仅当前账号可见（按不可逆的 scope 哈希隔离），无数据时给出安全提示。 |
 | `/help` | 列出本帮助 |
 
 其它任何文字消息都会作为对话发给 Agent。
@@ -300,19 +309,19 @@ docker compose down                    # 停止（数据卷保留）
 
 **能做的**
 - **工具调用**：`agent/tool_loop.py` 在 `Agent Service` 与 `LLM Client` 之间循环执行工具——拿到模型返回的 `tool_calls` 就按名经 registry 执行、把 `tool` 结果回灌 messages，直到模型给出最终文本（或用尽 `MAX_TOOL_ITERATIONS`）。`tools/` 提供 `Tool` 接口 + `ToolRegistry`（注册 / 生成 OpenAI schema / 按名执行）+ 三个只读内置工具。加新工具只需实现 `tools.base.Tool` 并在 `tools/builtin/__init__.py::build_default_tools()` 里 `registry.add(…)`——**不要**在别处写 `if name == "…"` 分支，registry 是唯一分发点。
+- **工具安全**：每次工具调用都先经过一道统一的执行边界——`allow`/`ask`/`deny` 策略（只读内置中 `get_current_time` / `echo` 默认 `allow` 不打扰；`system_info` 虽同样只读，但当前刻意设为 `ask` 以便演示审批流程；未来新工具默认 `ask`）→ 参数的 JSON Schema 校验（`jsonschema`，非法/错类型/多余字段直接拒绝、不执行）→ 需要时的一次性 Telegram 人工审批（`Approve`/`Deny` 按钮，按「发起者 + 原会话」绑定、会过期、只能点一次）→ `asyncio.wait_for` 单工具超时 → **只记元数据**的 append-only 审计（`tool_audit_events` 表，只存 `scope_hash` + 工具名 + 事件 + 结果码 + 耗时）。审计可用 `/tool_audit [limit]` 查看（只显示工具名/事件/结果码/耗时，绝不显示参数或结果）。策略/审批/审计**不记录、不显示**任何参数、结果、异常正文、图片、密钥或你的原始 user id。
 - **图片输入 + 持久化**：Telegram 照片（可带说明文字）经 `telegram/media.py` 规范化为渠道无关的 `AgentMessage`，图片 base64 内联交给模型；收到的图片以内容寻址 blob 落盘并在后续历史里重新入窗（见第 9 节 `attachments` 表）。
 - **上下文预算管理**：除了按 `MAX_CONTEXT_MESSAGES` 计消息数，还有一道**模型无关的估算 token 预算**（`MAX_CONTEXT_ESTIMATED_TOKENS`）。每次请求前按「完整历史 turn、从新到旧」选取历史，使请求同时满足消息数与估算预算；某个历史 turn 的图片放不进去时，该 turn 降级为纯文本（其图片**不读取、不发送**），而不跳过去挑更旧的内容。当前请求本身永远保留、其图片不降级；若仅 system + 当前请求就已超预算，则不调用 LLM，回一条「请缩短文字或减少图片」的安全提示。
 - **显式长期记忆**：`/remember` 显式保存的记忆存在 `memories` 表，按 `scope`（账号）隔离，**跨 `/new` 与重启保留**。普通文字消息到达时，`memory/` 包用**纯词法**（小写化 + CJK 单字/ASCII 词元 + 子串命中优先 + 词元重叠计数，纯 Python，无 embedding/向量库/FTS5）在**该账号自己的记忆**里确定性地排序；命中的记忆作为**一条**独立的参考消息（`user` 角色，固定 wrapper + `- [memory #id] 原文`）插在主 system prompt 之后、历史之前——**不**用第二条 system 消息（很多 OpenAI 兼容端点会对「两条 system 消息」直接 400），且其估算成本计入 `MAX_MEMORY_ESTIMATED_TOKENS` 子预算（超则跳过、不截断）。只有**真正被注入**的记忆会更新 `last_retrieved_at`。
 - **降级开关**：`ENABLE_TOOLS=false` 时完全退回纯对话（不传 tools、不做工具相关持久化）；图片处理与工具开关相互独立。
 
 **有意不做 / 限制**
-- **仅 3 个只读工具**（`get_current_time` / `echo` / `system_info`）：无 shell 执行、文件读写、联网扫描、SSH/Docker 或任何状态变更类工具；工具参数不做 schema 校验、无权限审批、单个工具无独立超时；tool 往返不落库、无法事后回放/审计。
+- **仅 3 个只读工具**（`get_current_time` / `echo` / `system_info`）：无 shell 执行、文件读写、联网扫描、SSH/Docker 或任何状态变更类工具——每次调用仍都经过统一的执行边界（策略 / JSON Schema 校验 / 需要时的一次性审批 / 单工具超时 / 只记元数据的审计，见「能做的」与第 3 节配置）。工具调用的**完整 transcript 仍不落库**（不落 `tool_calls`/`tool` 消息，无法逐条回放），但**元数据审计**可用 `/tool_audit` 事后查看。
 - **图片仅本地磁盘、仅照片**：blob 只落 `ATTACHMENT_STORAGE_PATH`，无配额/后台 GC/单附件删除（`/new` 是唯一回收点）；文档/贴纸/视频/音频仍被丢弃（`ContentPart` 已为它们预留）。
 - **估算而非精确 token**：`MAX_CONTEXT_ESTIMATED_TOKENS` / `MAX_MEMORY_ESTIMATED_TOKENS` 是保守、确定、模型无关的**估算**，用于相对选择与保护，不等于 provider 的计费 token；若实际 endpoint 仍报上下文超长，会走既有的安全 `http_error` 提示，本阶段不做重试或自动探测模型窗口。
 - **记忆是显式 + 词法检索**：记忆**只**由用户用 `/remember` 显式保存，**不**自动从对话里抽取/摘要；检索是纯词法（子串命中 + 词元重叠），**没有**语义/embedding/向量库/FTS5，对同义改写、近义换词的召回有限；一条记忆是整条注入或整条跳过，不逐句裁剪。**跨语言召回尤其弱**：词元只在同一语言的词元空间内比对，用英文保存的记忆（如 `My name is FibreCase.`）用中文问（如「我的名字是什么」）时，中文 query 的词元与英文记忆的词元零重叠，因此**不会被检索注入**、模型也就答不出；反过来用英文问则能命中（且常是靠 `is`/`my`/`name` 这类表层词元碰撞，而非记忆里的专名）。**规避方式**：为你常用的每种语言各存一条记忆（例如再发 `/remember 我的名字是 FibreCase。`），中文问法即可命中。真正的跨语言/语义召回需要 embedding 或外部检索服务，超出本阶段「无外部依赖」的约束，留待后续。
 - **未涉及**：MCP、SSH/Docker/Pi、Web search/RAG、向量库、Redis/PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、记忆自动摘要/抽取、语音/TTS/STT。
 
 **下一步（建议顺序）**
-- **工具安全（Tool Security）**：为即将接入的有副作用工具（MCP / SSH / Docker / Pi 等）补齐权限审批、参数校验与单工具超时——见 CLAUDE.md 的 *Current limitations*。
 - **新 `ContentPart` 类型**（File / Audio / Video / Sticker）：复用同一套附件存储与重入窗机制，只需补对应的下载分支与 OpenAI 映射。
-- 新的工具能力（如 MCP）以 **Tool Provider** 接入同一个 `Tool`/`ToolRegistry` 接口，不改动 service / LLM client / Telegram 层；有副作用的工具上线前必须先加权限审批。
+- 新的工具能力（如 MCP）以 **Tool Provider** 接入同一个 `Tool`/`ToolRegistry` 接口，不改动 service / LLM client / Telegram 层；有副作用的新工具默认进入 `ask` 审批（见「工具安全」），无需改动执行边界。

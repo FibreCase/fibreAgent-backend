@@ -19,11 +19,14 @@ import sys
 from .agent.service import AgentService
 from .attachments import AttachmentStore
 from .config import Config, ConfigError, load_config
+from .database.audit import RepositoryToolAuditor
 from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
 from .llm.client import OpenAIClient
 from .logging_setup import configure_logging
+from .telegram.approval import TelegramApprovalBroker
 from .telegram.bot import build_application, compose_startup_hooks, register_command_menu
+from .tools import build_policy
 from .tools.builtin import build_default_tools
 
 logger = logging.getLogger("main")
@@ -58,6 +61,19 @@ class AgentBackend:
         # the service degrades to the phase-one single-completion path.
         registry = build_default_tools() if config.enable_tools else None
         self.registry = registry
+        # Phase 3: the tool-security runtime. All three are built *only* when
+        # tools are enabled — with tools off there is nothing to advertise,
+        # approve, or audit, so the service stays on the bare phase-one path.
+        #   * policy — resolves each tool to allow/ask/deny (config overrides
+        #     take priority over a tool's declared default).
+        #   * auditor — the concrete SQLite-backed auditor (fail-closed on the
+        #     pre-execution write).
+        #   * broker — the in-memory Telegram Approve/Deny provider, also used
+        #     by the adapter for the callback + /tool_audit.
+        policy = build_policy(config.tool_permission_overrides, registry=registry) if registry else None
+        auditor = RepositoryToolAuditor(self.repository) if registry else None
+        broker = TelegramApprovalBroker(self.repository) if registry else None
+        self.approval_broker = broker
         self.service = AgentService(
             self.repository,
             self.llm,
@@ -73,8 +89,13 @@ class AgentBackend:
             max_memory_chars=config.max_memory_chars,
             max_retrieved_memories=config.max_retrieved_memories,
             max_memory_estimated_tokens=config.max_memory_estimated_tokens,
+            policy=policy,
+            approval_provider=broker,
+            auditor=auditor,
+            tool_timeout_seconds=config.tool_timeout_seconds,
+            tool_approval_timeout_seconds=config.tool_approval_timeout_seconds,
         )
-        application = build_application(config, self.service, self.repository)
+        application = build_application(config, self.service, self.repository, approval_broker=broker)
         # Chain the Telegram adapter's command-menu registration with our own
         # DB init into a single post_init (both run inside the app's loop).
         application.post_init = compose_startup_hooks(register_command_menu, self._post_init)
@@ -96,6 +117,10 @@ class AgentBackend:
 
     async def _post_shutdown(self, application) -> None:
         logger.info("shutting down agent backend")
+        # Cancel any outstanding approvals first so a turn blocked on a human
+        # decision resolves (expired) instead of hanging the shutdown.
+        if self.approval_broker is not None:
+            await self.approval_broker.shutdown()
         try:
             await self.llm.aclose()
         finally:

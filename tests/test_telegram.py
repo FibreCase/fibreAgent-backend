@@ -335,7 +335,7 @@ async def test_cmd_help_lists_commands():
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await cmd_help(update, context)
     sent = send.await_args.kwargs["text"]
-    for cmd in ("/start", "/new", "/status", "/help", "/remember", "/memories", "/forget"):
+    for cmd in ("/start", "/new", "/status", "/help", "/remember", "/memories", "/forget", "/tool_audit"):
         assert cmd in sent
 
 

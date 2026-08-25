@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from ..memory import hash_scope
-from .models import Attachment, Conversation, Memory, Message, utcnow
+from .models import Attachment, Conversation, Memory, Message, ToolAuditEvent, utcnow
 
 logger = logging.getLogger("database")
 
@@ -84,6 +84,28 @@ class MemoryRecord:
     created_at: object
     updated_at: object
     last_retrieved_at: object | None
+
+
+@dataclass(frozen=True)
+class ToolAuditRecord:
+    """A detached, *safe* view of one tool-audit event (phase 3).
+
+    Carries only what the owner may see: the event's id, time, tool name, event
+    type, code, latency, and the **hashed** scope — never the raw scope, the
+    arguments, a result, or any exception text. ``conversation_id`` and
+    ``tool_call_id`` are the safe, nullable identifiers the table stores.
+    """
+
+    id: int
+    created_at: object
+    conversation_id: int | None
+    tool_name: str
+    tool_call_id: str | None
+    iteration: int | None
+    event_type: str
+    code: str | None
+    latency_ms: int | None
+    scope_hash: str
 
 
 class ConversationRepository:
@@ -398,6 +420,85 @@ class ConversationRepository:
                 "memories marked retrieved",
                 extra={"scope_hash": _scope_hash(scope), "count": len(memory_ids)},
             )
+
+    # ------------------------------------------------------- tool audit (phase 3)
+    # Append-only, safe execution log. Every *list* query is filtered by
+    # ``scope_hash`` in the SQL, so one principal can never read another's tool
+    # events. The record stores only safe metadata — never args/results/exceptions.
+
+    def _audit_record(self, row: ToolAuditEvent) -> ToolAuditRecord:
+        return ToolAuditRecord(
+            id=row.id,
+            created_at=row.created_at,
+            conversation_id=row.conversation_id,
+            tool_name=row.tool_name,
+            tool_call_id=row.tool_call_id,
+            iteration=row.iteration,
+            event_type=row.event_type,
+            code=row.code,
+            latency_ms=row.latency_ms,
+            scope_hash=row.scope_hash,
+        )
+
+    async def add_tool_audit_event(self, event: dict[str, object]) -> bool:
+        """Append one safe audit event. Returns ``True`` on success.
+
+        ``event`` supplies only the safe columns: ``scope_hash``, ``tool_name``,
+        ``event_type``, and the optional ``code`` / ``conversation_id`` /
+        ``tool_call_id`` / ``iteration`` / ``latency_ms``. Never pass arguments,
+        results, or exception text — this method stores exactly what it is
+        handed, and the loop is responsible for handing it only safe fields.
+        Returns ``False`` (and logs) on a write failure so the caller can fail
+        closed; the exception is *not* re-raised here.
+        """
+        try:
+            async with self._session() as session:
+                row = ToolAuditEvent(
+                    conversation_id=event.get("conversation_id"),
+                    scope_hash=str(event["scope_hash"]),
+                    tool_name=str(event["tool_name"]),
+                    tool_call_id=event.get("tool_call_id"),
+                    iteration=event.get("iteration"),
+                    event_type=str(event["event_type"]),
+                    code=event.get("code"),
+                    latency_ms=event.get("latency_ms"),
+                )
+                session.add(row)
+                await session.commit()
+            return True
+        except Exception:
+            logger.error(
+                "tool audit write failed",
+                extra={"tool": event.get("tool_name"), "event": event.get("event_type")},
+                exc_info=True,
+            )
+            return False
+
+    async def list_tool_audit_events(self, scope_hash: str, limit: int = 20) -> list[ToolAuditRecord]:
+        """The most recent tool-audit events for ``scope_hash`` (newest first).
+
+        The ``scope_hash`` filter is in the query — a foreign or missing hash
+        yields ``[]`` and leaks nothing. ``limit`` is clamped by the caller to a
+        sane bound (the command clamps to 50).
+        """
+        limit = max(1, int(limit))
+        async with self._session() as session:
+            result = await session.execute(
+                select(ToolAuditEvent)
+                .where(ToolAuditEvent.scope_hash == scope_hash)
+                .order_by(ToolAuditEvent.id.desc())
+                .limit(limit)
+            )
+            rows = result.scalars().all()
+            # Newest first in the query; present newest-first (matches display).
+            return [self._audit_record(row) for row in rows]
+
+    async def get_conversation_by_id(self, conversation_id: int) -> Conversation | None:
+        """Fetch a conversation by its primary key (used for audit context)."""
+        async with self._session() as session:
+            result = await session.execute(select(Conversation).where(Conversation.id == conversation_id))
+            return result.scalar_one_or_none()
+
 
 
 def _scope_hash(scope: str) -> str:

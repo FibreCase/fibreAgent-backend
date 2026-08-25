@@ -8,10 +8,13 @@ OpenAI API key) come *only* from the environment and must never be committed.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from .tools.policy import ToolPolicyError, parse_tool_permission_overrides
 
 
 class ConfigError(RuntimeError):
@@ -57,6 +60,13 @@ class Config:
     max_retrieved_memories: int = 5
     max_memory_estimated_tokens: int = 3000
 
+    # Phase 3: tool security. The permission map is pre-parsed into
+    # name→ToolPermission (empty = use each tool's declared default, which is
+    # ``ask`` unless a built-in opted into ``allow``). Both timeouts are seconds.
+    tool_permission_overrides: dict = field(default_factory=dict)
+    tool_approval_timeout_seconds: float = 60.0
+    tool_timeout_seconds: float = 30.0
+
     log_level: str = "INFO"
     log_color: str = "auto"  # "auto" | "true" | "false" — see logging_setup
     system_prompt_override: str | None = field(default=None)
@@ -98,6 +108,22 @@ class Config:
                 "MAX_MEMORY_ESTIMATED_TOKENS must be <= MAX_CONTEXT_ESTIMATED_TOKENS "
                 "(the memory sub-budget cannot exceed the total context budget)"
             )
+        # Phase 3: tool-security knobs. The permission map was already parsed
+        # (malformed / illegal-policy / duplicate entries raised ConfigError in
+        # load_config); here we check the *names* match the allowed tool-name
+        # charset and that both timeouts are positive. A botched security setting
+        # is a startup error, never silently ignored.
+        _tool_name_re = re.compile(r"^[A-Za-z0-9_-]+$")
+        for tool_name in self.tool_permission_overrides:
+            if not _tool_name_re.match(tool_name):
+                raise ConfigError(
+                    f"TOOL_PERMISSION_OVERRIDES tool name {tool_name!r} is invalid "
+                    "(only letters, digits, '_', '-' are allowed)"
+                )
+        if self.tool_approval_timeout_seconds <= 0:
+            raise ConfigError("TOOL_APPROVAL_TIMEOUT_SECONDS must be > 0")
+        if self.tool_timeout_seconds <= 0:
+            raise ConfigError("TOOL_TIMEOUT_SECONDS must be > 0")
 
     @property
     def max_image_size_bytes(self) -> int:
@@ -187,6 +213,14 @@ def load_config() -> Config:
     provided via env (``OPENAI_*``), kept out of the repo for privacy.
     """
     _load_env()
+    # Phase 3: parse the tool permission overrides up front. A malformed /
+    # illegal / duplicate entry is a ConfigError (startup), never silently ignored.
+    try:
+        tool_permission_overrides = parse_tool_permission_overrides(
+            os.environ.get("TOOL_PERMISSION_OVERRIDES", "")
+        )
+    except ToolPolicyError as exc:
+        raise ConfigError(f"invalid TOOL_PERMISSION_OVERRIDES: {exc}") from exc
     return Config(
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         allowed_user_ids=_parse_user_ids(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")),
@@ -207,6 +241,9 @@ def load_config() -> Config:
         max_memory_chars=_parse_int(os.environ.get("MAX_MEMORY_CHARS", ""), 1000),
         max_retrieved_memories=_parse_int(os.environ.get("MAX_RETRIEVED_MEMORIES", ""), 5),
         max_memory_estimated_tokens=_parse_int(os.environ.get("MAX_MEMORY_ESTIMATED_TOKENS", ""), 3000),
+        tool_permission_overrides=tool_permission_overrides,
+        tool_approval_timeout_seconds=_parse_float(os.environ.get("TOOL_APPROVAL_TIMEOUT_SECONDS", ""), 60.0),
+        tool_timeout_seconds=_parse_float(os.environ.get("TOOL_TIMEOUT_SECONDS", ""), 30.0),
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         log_color=_normalize_log_color(os.environ.get("LOG_COLOR", "")),
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,

@@ -2,14 +2,100 @@
 
 This package is intentionally provider- and channel-agnostic. It knows nothing
 about Telegram, the database, or the OpenAI SDK — only that a tool has a
-name/description/JSON-schema and an async ``execute``. The agent's tool loop
-(:mod:`..agent.tool_loop`) is what drives these through the LLM.
+name/description/JSON-schema, a declared permission, and an async ``execute``.
+The agent's tool loop (:mod:`..agent.tool_loop`) is what drives these through
+the LLM, gated by a policy, schema validation, optional approval, a timeout, and
+an append-only audit (phase 3).
 """
 
 from __future__ import annotations
 
+from .approval import (
+    ApprovalDecision,
+    ApprovalRequest,
+    DEFAULT_APPROVAL_SUMMARY,
+    ToolApprovalProvider,
+)
+from .audit import (
+    EVENT_APPROVAL_APPROVED,
+    EVENT_APPROVAL_DENIED,
+    EVENT_APPROVAL_EXPIRED,
+    EVENT_APPROVAL_REQUESTED,
+    EVENT_AUDIT_UNAVAILABLE,
+    EVENT_COMPLETED,
+    EVENT_DENIED,
+    EVENT_FAILED,
+    EVENT_REQUESTED,
+    EVENT_STARTED,
+    EVENT_TIMED_OUT,
+    EVENT_VALIDATION_FAILED,
+    RESULT_APPROVAL_DENIED,
+    RESULT_APPROVAL_EXPIRED,
+    RESULT_AUDIT_UNAVAILABLE,
+    RESULT_INVALID_ARGUMENTS,
+    RESULT_OK,
+    RESULT_TOOL_DENIED,
+    RESULT_TOOL_EXECUTION_FAILED,
+    RESULT_TOOL_TIMEOUT,
+    RESULT_UNKNOWN_TOOL,
+    NoopAuditor,
+    ToolAuditEvent,
+    ToolAuditor,
+    error_result,
+)
 from .base import Tool
 from .builtin import build_default_tools
+from .policy import (
+    ToolPermission,
+    ToolPolicy,
+    ToolPolicyError,
+    build_policy,
+    parse_permission,
+    parse_tool_permission_overrides,
+)
 from .registry import ToolNotFoundError, ToolRegistry
 
-__all__ = ["Tool", "ToolRegistry", "ToolNotFoundError", "build_default_tools"]
+__all__ = [
+    "Tool",
+    "ToolRegistry",
+    "ToolNotFoundError",
+    "build_default_tools",
+    # policy
+    "ToolPermission",
+    "ToolPolicy",
+    "ToolPolicyError",
+    "build_policy",
+    "parse_permission",
+    "parse_tool_permission_overrides",
+    # approval
+    "ApprovalDecision",
+    "ApprovalRequest",
+    "ToolApprovalProvider",
+    "DEFAULT_APPROVAL_SUMMARY",
+    # audit
+    "ToolAuditEvent",
+    "ToolAuditor",
+    "NoopAuditor",
+    "error_result",
+    "RESULT_OK",
+    "RESULT_UNKNOWN_TOOL",
+    "RESULT_TOOL_DENIED",
+    "RESULT_INVALID_ARGUMENTS",
+    "RESULT_APPROVAL_DENIED",
+    "RESULT_APPROVAL_EXPIRED",
+    "RESULT_TOOL_TIMEOUT",
+    "RESULT_TOOL_EXECUTION_FAILED",
+    "RESULT_AUDIT_UNAVAILABLE",
+    "EVENT_REQUESTED",
+    "EVENT_DENIED",
+    "EVENT_VALIDATION_FAILED",
+    "EVENT_APPROVAL_REQUESTED",
+    "EVENT_APPROVAL_APPROVED",
+    "EVENT_APPROVAL_DENIED",
+    "EVENT_APPROVAL_EXPIRED",
+    "EVENT_STARTED",
+    "EVENT_COMPLETED",
+    "EVENT_TIMED_OUT",
+    "EVENT_FAILED",
+    "EVENT_AUDIT_UNAVAILABLE",
+]

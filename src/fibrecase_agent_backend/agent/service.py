@@ -48,10 +48,14 @@ from ..database.repository import (
     ConversationRepository,
     MemoryRecord,
     MessageWithAttachments,
+    ToolAuditRecord,
 )
 from ..llm.client import LLMError, OpenAIClient
 from ..llm.message_converter import agent_message_to_openai_content
 from ..memory import MemoryCandidate, build_memory_reference_text, hash_scope, normalize_text, rank_memories
+from ..tools.approval import ToolApprovalProvider
+from ..tools.audit import NoopAuditor, ToolAuditor
+from ..tools.policy import ToolPolicy
 from ..tools.registry import ToolRegistry
 from .context import (
     ChatMessage,
@@ -80,6 +84,8 @@ _USER_SAFE: dict[str, str] = {
     "memory_error": "Memory operation failed. Please try again.",
     "memory_not_found": "Memory not found.",
     "memory_clear_confirmation": "Confirm clearing all memories with: /forget all CONFIRM",
+    # Phase 3 tool-security command.
+    "tool_audit_error": "Could not read the tool audit log. Please try again.",
     "error": "模型服务暂时不可用。",
 }
 _DEFAULT_USER_SAFE = "模型服务暂时不可用。"
@@ -116,6 +122,14 @@ class AgentService:
         max_memory_chars: int = 1000,
         max_retrieved_memories: int = 5,
         max_memory_estimated_tokens: int = 3000,
+        # Phase 3: tool-security runtime, injected by the composition root.
+        # ``policy=None`` → allow-all (the three safe built-ins need no prompt);
+        # a real deployment builds it from config overrides + tool defaults.
+        policy: ToolPolicy | None = None,
+        approval_provider: ToolApprovalProvider | None = None,
+        auditor: ToolAuditor | None = None,
+        tool_timeout_seconds: float = 30.0,
+        tool_approval_timeout_seconds: float = 60.0,
     ) -> None:
         self._repo = repository
         self._llm = llm
@@ -144,6 +158,15 @@ class AgentService:
         self._max_memory_chars = max_memory_chars
         self._max_retrieved_memories = max_retrieved_memories
         self._max_memory_estimated_tokens = max_memory_estimated_tokens
+        # Phase 3: the tool-security runtime. The auditor defaults to a no-op so
+        # a bare service (and unit tests) runs without a DB; production injects
+        # a real RepositoryToolAuditor. ``memory_scope`` (a principal string) is
+        # threaded into each tool call for audit hashing + approval binding.
+        self._policy = policy
+        self._approval_provider = approval_provider
+        self._auditor = auditor if auditor is not None else NoopAuditor()
+        self._tool_timeout_seconds = tool_timeout_seconds
+        self._tool_approval_timeout_seconds = tool_approval_timeout_seconds
         self._locks: dict[int, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ locks
@@ -167,6 +190,25 @@ class AgentService:
             "conversation_id": conversation_id,
             "messages": await self._repo.count_messages(conversation_id),
         }
+
+    async def list_tool_audit_events(self, scope: str, limit: int = 20) -> list[ToolAuditRecord]:
+        """The most recent tool-audit events for ``scope`` (newest first).
+
+        Scope-isolated: the repository filters by the **hashed** scope in SQL, so
+        a foreign principal's events are never returned. Returns a safe,
+        user-presentable list (tool name, event type, code, latency, time, id) —
+        never arguments, results, or exception text. A repository failure raises
+        an :class:`AgentError` (``tool_audit_error``).
+        """
+        try:
+            return await self._repo.list_tool_audit_events(hash_scope(scope), limit)
+        except Exception:
+            logger.error(
+                "tool audit read failed",
+                extra={"scope_hash": hash_scope(scope), "category": "tool_audit_error"},
+                exc_info=True,
+            )
+            raise AgentError(_user_safe_for("tool_audit_error"), "tool_audit_error")
 
     async def context_status(self, conversation_id: int) -> dict[str, object]:
         """A preview of the context that *would* be sent for the next request.
@@ -699,6 +741,13 @@ class AgentService:
                         context,
                         self._registry,
                         max_iterations=self._max_tool_iterations,
+                        policy=self._policy,
+                        approval_provider=self._approval_provider,
+                        auditor=self._auditor,
+                        tool_timeout_seconds=self._tool_timeout_seconds,
+                        approval_timeout_seconds=self._tool_approval_timeout_seconds,
+                        conversation_id=conversation_id,
+                        scope=memory_scope,
                     )
                 else:
                     # Phase-one path: one completion, no tools.

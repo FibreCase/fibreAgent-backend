@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from ..base import Tool
+from ..policy import ToolPermission
 
 
 class GetCurrentTimeTool(Tool):
@@ -12,6 +13,8 @@ class GetCurrentTimeTool(Tool):
 
     name = "get_current_time"
     description = "Get the current local date and time (format: YYYY-MM-DD HH:MM:SS). Takes no arguments."
+    # Safe, read-only: no arguments, no side effects — allow without approval.
+    default_permission = ToolPermission.ALLOW
     parameters: dict[str, object] = {
         "type": "object",
         "properties": {},

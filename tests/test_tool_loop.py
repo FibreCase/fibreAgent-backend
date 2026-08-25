@@ -244,4 +244,7 @@ async def test_unknown_tool_request_yields_error_result_not_crash():
     second = llm.calls[1]["messages"]
     tool_msg = second[-1]
     assert tool_msg["role"] == "tool"
-    assert "unknown tool" in tool_msg["content"]
+    # The unknown tool yields a stable, non-echoing error result (phase 3): a
+    # JSON error with the ``unknown_tool`` code — never a raw trace/exception.
+    payload = json.loads(tool_msg["content"])
+    assert payload == {"error": {"code": "unknown_tool", "message": "This tool is not available."}}

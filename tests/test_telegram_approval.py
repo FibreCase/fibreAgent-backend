@@ -1,0 +1,479 @@
+"""The in-memory Telegram approval broker (phase 3 — required #9–#13).
+
+Everything is faked: a fake repository (conversation→chat resolution), a fake
+PTB application (records every ``send_message``), and hand-built callback
+``Update`` objects. No network, no real Telegram, no real LLM. It proves the
+broker presents a secret-free Approve/Deny prompt bound to one ``(user, chat)``,
+resolves it one-time, refuses everyone else, expires/cancels safely, and that a
+blocked conversation stays ordered while another proceeds in parallel.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import pytest
+
+from fibrecase_agent_backend.agent.service import AgentService
+from fibrecase_agent_backend.llm.client import LLMResult
+from fibrecase_agent_backend.memory import hash_scope
+from fibrecase_agent_backend.telegram.approval import (
+    TelegramApprovalBroker,
+    decision_from,
+    request_id_from,
+)
+from fibrecase_agent_backend.tools import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ToolRegistry,
+    build_default_tools,
+    build_policy,
+)
+from fibrecase_agent_backend.tools.base import Tool
+
+CHAT_A = 100
+USER_A = 7
+
+
+# ---------------------------------------------------------------------------
+# fakes
+# ---------------------------------------------------------------------------
+class _FakeBot:
+    def __init__(self):
+        self.sent: list[dict[str, Any]] = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
+
+
+class _FakeApp:
+    def __init__(self):
+        self.bot = _FakeBot()
+
+
+class _FakeRepo:
+    def __init__(self, chat_id: int = CHAT_A, *, exists: bool = True):
+        self.chat_id = chat_id
+        self.exists = exists
+
+    async def get_conversation_by_id(self, conversation_id):
+        if not self.exists:
+            return None
+        return type("C", (), {"telegram_chat_id": self.chat_id})()
+
+
+class _FakeQuery:
+    def __init__(self, data):
+        self.data = data
+        self.answers: list[str] = []
+
+    async def answer(self, text):
+        self.answers.append(text)
+
+
+class _FakeUpdate:
+    def __init__(self, data, chat_id, user_id):
+        self.callback_query = _FakeQuery(data)
+        self.effective_chat = type("C", (), {"id": chat_id})()
+        self.effective_user = type("U", (), {"id": user_id})()
+
+
+def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None):
+    return ApprovalRequest(
+        request_id=request_id,
+        conversation_id=5,
+        scope=scope,
+        tool_name=tool,
+        summary=summary or f"{tool} — Arguments are not shown for your safety.",
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=seconds),
+    )
+
+
+def _callback_data(sent, button_text):
+    """The callback_data of the named button on the first sent keyboard."""
+    keyboard = sent["reply_markup"]
+    for row in keyboard.inline_keyboard:
+        for btn in row:
+            if btn.text == button_text:
+                return btn.callback_data
+    raise AssertionError(f"button {button_text!r} not found in keyboard")
+
+
+async def _await_pending(broker, request_id, *, tries=50):
+    """Let the broker get to the point where it is awaiting the callback."""
+    for _ in range(tries):
+        await asyncio.sleep(0)
+        if request_id in broker._pending:
+            return
+    raise AssertionError("approval never entered the pending state")
+
+
+# ---------------------------------------------------------------------------
+# required #9 — ask tool: Approve/Deny keyboard, approve → runs exactly once
+# ---------------------------------------------------------------------------
+async def test_approve_executes_exactly_once():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+
+    req = _request("r1")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "r1")
+
+    # The prompt went to the *original* chat with Approve + Deny buttons.
+    sent = app.bot.sent[0]
+    assert sent["chat_id"] == CHAT_A
+    approve = _callback_data(sent, "Approve")
+    deny = _callback_data(sent, "Deny")
+    assert approve != deny
+
+    # The owner (same user + chat) clicks Approve.
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+    # The request was consumed: nothing left pending.
+    assert "r1" not in broker._pending
+
+
+async def test_deny_click_does_not_execute():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("r2")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "r2")
+    deny = _callback_data(app.bot.sent[0], "Deny")
+    await broker.handle_callback(_FakeUpdate(deny, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.DENIED
+    assert "r2" not in broker._pending
+
+
+# ---------------------------------------------------------------------------
+# required #10 — timeout / shutdown / repeat / unknown / expired all safe
+# ---------------------------------------------------------------------------
+async def test_timeout_yields_expired():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    broker.bind_application(_FakeApp())
+    req = _request("r3", seconds=0.05)
+    task = asyncio.create_task(broker.request_approval(req))
+    # Do NOT click; the wait must expire on its own.
+    assert await task == ApprovalDecision.EXPIRED
+    assert "r3" not in broker._pending
+
+
+async def test_shutdown_cancels_pending():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    broker.bind_application(_FakeApp())
+    req = _request("r4", seconds=600)
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "r4")
+    await broker.shutdown()
+    assert await task == ApprovalDecision.EXPIRED
+    assert broker._pending == {}
+
+
+async def test_repeat_click_is_rejected():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("r5")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "r5")
+    approve = _callback_data(app.bot.sent[0], "Approve")
+
+    # First click resolves the request.
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+
+    # A *second* click on the same stale button must be a safe no-op (EXPIRED),
+    # and must not re-execute anything.
+    repeat = _FakeUpdate(approve, CHAT_A, USER_A)
+    await broker.handle_callback(repeat, None)
+    assert repeat.callback_query.answers == ["This approval has expired or is no longer valid."]
+    assert broker._pending == {}
+
+
+async def test_unknown_id_is_safe_noop():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    broker.bind_application(_FakeApp())
+    update = _FakeUpdate("v1:does-not-exist:a", CHAT_A, USER_A)
+    await broker.handle_callback(update, None)
+    # The callback is answered with the safe "no longer valid" text; nothing
+    # pending is touched.
+    assert update.callback_query.answers == ["This approval has expired or is no longer valid."]
+    assert broker._pending == {}
+
+
+async def test_expired_deadline_is_rejected():
+    # A request whose deadline has already passed is refused even for the owner.
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("r6", seconds=-1)  # already in the past
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "r6")
+    approve = _callback_data(app.bot.sent[0], "Approve")
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    # The deadline check fires before the button is honoured → expired.
+    assert await task == ApprovalDecision.EXPIRED
+
+
+async def test_callback_data_parser_is_safe():
+    assert request_id_from("v1:abc123:a") == "abc123"
+    assert decision_from("v1:abc123:a") is ApprovalDecision.APPROVED
+    assert decision_from("v1:abc123:d") is ApprovalDecision.DENIED
+    assert decision_from("v2:abc123:a") is None  # wrong version
+    assert decision_from("v1:abc123:x") is None  # bad decision
+    assert request_id_from("garbage") == ""
+
+
+# ---------------------------------------------------------------------------
+# required #11 — other user / other chat cannot approve; no existence leak
+# ---------------------------------------------------------------------------
+async def test_other_allowlisted_user_cannot_approve():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("r7")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "r7")
+    approve = _callback_data(app.bot.sent[0], "Approve")
+
+    # A *different* (but allow-listed) user clicks in the same chat.
+    other = _FakeUpdate(approve, CHAT_A, 999)
+    await broker.handle_callback(other, None)
+    # The owner's request is denied-by-expiry, NOT approved; and the reply does
+    # not reveal that a pending request even existed for them.
+    assert await task == ApprovalDecision.EXPIRED
+    assert other.callback_query.answers == ["This approval has expired or is no longer valid."]
+    assert "r7" not in broker._pending
+
+
+async def test_other_chat_cannot_approve():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("r8")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "r8")
+    approve = _callback_data(app.bot.sent[0], "Approve")
+
+    # Same user, but the callback arrives from a different chat id.
+    other = _FakeUpdate(approve, CHAT_A + 1, USER_A)
+    await broker.handle_callback(other, None)
+    assert await task == ApprovalDecision.EXPIRED
+
+
+# ---------------------------------------------------------------------------
+# required #12 — callback data + message carry no secrets; summary hides args
+# ---------------------------------------------------------------------------
+async def test_prompt_and_callback_data_are_secret_free():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("r9", scope="telegram:7")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "r9")
+    sent = app.bot.sent[0]
+
+    text = sent["text"]
+    # Shows the tool name (allowed) and a safe summary…
+    assert "risky" in text
+    assert "Arguments are not shown" in text
+    # …but never the raw scope, the user id, or the chat id.
+    assert "telegram:7" not in text
+    assert "7" not in text  # no bare user id
+    assert "100" not in text  # no chat id
+
+    # Every callback data value is just <version>:<id>:<decision> — no scope,
+    # chat id, or arguments.
+    for row in sent["reply_markup"].inline_keyboard:
+        for btn in row:
+            cd = btn.callback_data
+            assert cd.startswith("v1:")
+            assert "telegram:" not in cd
+            assert "100" not in cd
+            assert len(cd.split(":")) == 3
+
+    await broker.shutdown()
+
+
+async def test_prompt_is_telegram_html_not_literal_markdown():
+    # The prompt is sent with parse_mode=HTML, so it must use Telegram HTML tags
+    # (<b>/<i>) — not Markdown (** / _) — or Telegram shows the markers literally.
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+
+    req = _request("rh", tool="risky")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "rh")
+    sent = app.bot.sent[0]
+
+    assert sent["parse_mode"] == "HTML"
+    text = sent["text"]
+    # Real HTML emphasis is present…
+    assert "<b>Tool:</b>" in text
+    assert "<b>Summary:</b>" in text
+    assert "<i>This approval is one-time" in text
+    assert "<b>Approve tool call?</b>" in text
+    # …and no literal Markdown markers leaked into the body.
+    assert "**" not in text
+    assert "_This approval" not in text
+    # The interpolated tool name is still shown (and would be escaped if hostile).
+    assert "risky" in text
+
+    await broker.shutdown()
+
+
+def test_default_approval_summary_does_not_echo_arguments():
+    class Secrety(Tool):
+        name = "secret_tool"
+        description = "d"
+        parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+
+        async def execute(self, arguments):  # pragma: no cover
+            return ""
+
+    # The default summary withholds arguments entirely.
+    summary = Secrety().approval_summary({"password": "hunter2", "url": "https://x"})
+    assert "hunter2" not in summary
+    assert "secret_tool" in summary
+    assert "Arguments are not shown" in summary
+
+
+# ---------------------------------------------------------------------------
+# required #13 — a blocked conversation stays ordered; another proceeds
+# ---------------------------------------------------------------------------
+class _RiskyTool(Tool):
+    name = "risky"
+    description = "an ask tool"
+    parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+    # default_permission is the base default ASK (deliberately not overridden).
+
+    async def execute(self, arguments):
+        return "risky ran"
+
+
+class _GatedApproval:
+    def __init__(self):
+        self.gate = asyncio.Event()
+        self.calls = []
+
+    async def request_approval(self, request):
+        self.calls.append(request)
+        await self.gate.wait()
+        return ApprovalDecision.APPROVED
+
+    async def shutdown(self):  # pragma: no cover
+        self.gate.set()
+
+
+class _MarkerLLM:
+    """Final answer once a tool result is present; else a tool-call if the user
+    asked for it, else plain text. ``messages`` are :class:`ChatMessage`s."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, messages, *, tools=None):
+        roles = [m.role for m in messages]
+        if "tool" in roles:
+            return LLMResult(content="all done after tool")
+        last_user = [m for m in messages if m.role == "user"][-1].content
+        if "USE_TOOL" in str(last_user):
+            return LLMResult(
+                content=None,
+                tool_calls=[{"id": "c1", "type": "function", "function": {"name": "risky", "arguments": "{}"}}],
+            )
+        return LLMResult(content="no tools here")
+
+
+async def _until(predicate, *, timeout=2.0):
+    """Yield the loop until ``predicate()`` is true, or ``timeout`` seconds pass."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            return False
+        await asyncio.sleep(0.005)
+    return True
+
+
+async def test_blocked_conversation_ordered_while_other_proceeds(repo):
+    conv_a = await repo.get_or_create_conversation(11, 1)
+    conv_b = await repo.get_or_create_conversation(22, 2)
+
+    llm = _MarkerLLM()
+    approval = _GatedApproval()
+    reg = ToolRegistry().register(_RiskyTool())
+    service = AgentService(
+        repo,
+        llm,
+        system_prompt="S",
+        registry=reg,
+        enable_tools=True,
+        max_tool_iterations=5,
+        # The base default permission for a tool is ASK, so no override is
+        # needed to make "risky" require approval.
+        policy=build_policy({}, registry=reg),
+        approval_provider=approval,
+    )
+
+    a1 = asyncio.create_task(service.process_message(conv_a.id, "USE_TOOL", memory_scope=f"telegram:{USER_A}"))
+    b1 = asyncio.create_task(service.process_message(conv_b.id, "plain question"))
+    a2 = asyncio.create_task(service.process_message(conv_a.id, "USE_TOOL"))
+
+    # Let A1 reach the gated approval and B1 finish, before A2 can start
+    # (A2 is queued on A's per-conversation lock).
+    settled = await _until(lambda: approval.calls and b1.done() and not a1.done() and not a2.done())
+    assert settled, f"expected A1 blocked + B1 done + A2 queued; approval={len(approval.calls)}"
+
+    # A different conversation completed while A1 is blocked on the human.
+    assert b1.result() == "no tools here"
+    # Only A1 has reached the approval so far (A2 is still queued on A's lock).
+    assert len(approval.calls) == 1
+
+    # The owner approves; A1 finishes, then A2 (same conversation) proceeds.
+    approval.gate.set()
+    await asyncio.wait_for(asyncio.gather(a1, a2, b1, return_exceptions=True), timeout=5)
+    assert a1.result() == "all done after tool"
+    assert a2.result() == "all done after tool"
+    assert len(approval.calls) == 2  # both of A's tool turns asked for approval
+
+
+# ---------------------------------------------------------------------------
+# approval requested but the conversation is unknown → fail closed (DENIED)
+# ---------------------------------------------------------------------------
+async def test_unknown_conversation_denies():
+    broker = TelegramApprovalBroker(_FakeRepo(exists=False))
+    broker.bind_application(_FakeApp())
+    assert await broker.request_approval(_request("rx")) == ApprovalDecision.DENIED
+
+
+# ---------------------------------------------------------------------------
+# build_application wires the callback handler only when a broker is given
+# ---------------------------------------------------------------------------
+def test_build_application_wires_broker_callback_handler():
+    from telegram.ext import CallbackQueryHandler
+
+    from fibrecase_agent_backend.telegram.bot import build_application
+
+    class _Cfg:
+        telegram_bot_token = "123:abc-def"
+        allowed_user_ids = frozenset({1})
+
+    class _Svc:  # minimal; build_application only stores it
+        pass
+
+    broker = TelegramApprovalBroker(_FakeRepo())
+    app = build_application(_Cfg(), _Svc(), _FakeRepo(), approval_broker=broker)
+    # The broker was bound to the application…
+    assert broker._application is app
+    # …and a callback handler was registered in the first group.
+    handlers = app.handlers[0]
+    assert any(isinstance(h, CallbackQueryHandler) for h in handlers)
+
+    # Without a broker, no callback handler is registered.
+    app2 = build_application(_Cfg(), _Svc(), _FakeRepo())
+    assert not any(isinstance(h, CallbackQueryHandler) for h in app2.handlers[0])

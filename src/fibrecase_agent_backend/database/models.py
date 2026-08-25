@@ -165,3 +165,55 @@ class Memory(Base):
     def __repr__(self) -> str:  # pragma: no cover - debugging aid only
         return f"<Memory id={self.id} scope_len={len(self.scope)} content_len={len(self.content)}>"
 
+
+class ToolAuditEvent(Base):
+    """One append-only, *safe* audit record of a tool-call step (phase 3).
+
+    Rows are immutable once written (the repository only ever ``add``s) and are
+    the durable execution-security log the owner can inspect via ``/tool_audit``.
+
+    The table stores **only** what is safe to persist: the tool name, the stable
+    event type, an optional stable code, a nullable short call id, the loop
+    iteration, a nullable latency, and — instead of the raw scope/user id — a
+    short, *irreversible* ``scope_hash`` (a salted SHA-256 prefix). It deliberately
+    never stores tool **arguments**, tool **results**, exception text, memory or
+    user content, the full scope, a storage path, or any image/base64/secret.
+    ``conversation_id`` is a *logical* (nullable) reference used for ordering;
+    it is **not** a foreign key, because auditing must survive ``/new`` (which
+    drops the conversation) and must work even before a conversation exists.
+    """
+
+    __tablename__ = "tool_audit_events"
+    # ``scope_hash`` is indexed so a principal's own ``/tool_audit`` list is a
+    # cheap, per-principal lookup (foreign events are simply not returned).
+    __table_args__ = (
+        Index("ix_tool_audit_scope_hash", "scope_hash"),
+        Index("ix_tool_audit_conversation", "conversation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    # Nullable *logical* conversation id (no FK): ordering + context only.
+    conversation_id: Mapped[int | None] = mapped_column(nullable=True)
+    # Short, irreversible fingerprint of the requesting principal (see
+    # :func:`..memory.hash_scope`). The raw scope / user id is never stored.
+    scope_hash: Mapped[str] = mapped_column(String(16), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # OpenAI ``tool_call_id`` (short, nullable). Never the arguments.
+    tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    iteration: Mapped[int | None] = mapped_column(nullable=True)
+    # requested / denied / validation_failed / approval_requested /
+    # approval_approved / approval_denied / approval_expired / started /
+    # completed / timed_out / failed / audit_unavailable
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Stable machine-readable result code (e.g. "tool_timeout"); None for plain
+    # lifecycle events. Never a message / exception text.
+    code: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    # Milliseconds; set only on a terminal (started→completed/timed_out/failed)
+    # event.
+    latency_ms: Mapped[int | None] = mapped_column(nullable=True)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return f"<ToolAuditEvent id={self.id} tool={self.tool_name} type={self.event_type}>"
+
+

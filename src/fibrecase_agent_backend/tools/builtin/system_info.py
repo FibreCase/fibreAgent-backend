@@ -12,6 +12,7 @@ import platform
 import socket
 
 from ..base import Tool
+from ..policy import ToolPermission
 
 
 class SystemInfoTool(Tool):
@@ -19,6 +20,10 @@ class SystemInfoTool(Tool):
 
     name = "system_info"
     description = "Get basic information about the system running the agent: hostname, platform, and Python version. Takes no arguments."
+    # Read-only stdlib facts; normally ``ALLOW`` like the other safe built-ins.
+    # Currently set to ``ask`` (deliberately) to exercise the approval flow —
+    # flip back to ``ToolPermission.ALLOW`` to restore approval-free behaviour.
+    default_permission = ToolPermission.ASK
     parameters: dict[str, object] = {
         "type": "object",
         "properties": {},
