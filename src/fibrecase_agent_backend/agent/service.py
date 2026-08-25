@@ -12,11 +12,16 @@ Responsibilities, per message:
    across conversations),
 2. load history (with attachment metadata),
 3. append + persist the user message, and persist any image blobs it carries
-   (phase 2.2 — images now survive a restart),
-4. build context (system prompt + recent window), re-attaching in-window
-   history images from the store in their original order,
+   (phase 2.3 — images now survive a restart),
+4. **plan the context** (phase 2.4): before reading any attachment blob, run
+   :func:`.context.plan_context` on lightweight candidates to choose complete
+   history turns that fit *both* the message cap and the estimated-token budget
+   (a history turn whose images won't fit is downgraded to text-only), then
+   rehydrate *only* the selected attachments from the store in their original
+   order;
 5. call the LLM — via the tool loop when tools are enabled, or a single
-   completion when they are not (phase-one behaviour),
+   completion when they are not (phase-one behaviour) — unless the plan reports
+   the current request itself is over budget, in which case no LLM call is made;
 6. persist the assistant reply,
 7. return the reply text.
 
@@ -26,10 +31,10 @@ conversation schema is unchanged from phase one. **Text** is the only thing
 stored in ``messages.content``; image **bytes** live in the content-addressed
 attachment store, referenced by metadata rows.
 
-Provider and storage failures are translated into a :class:`AgentError` whose
-``user_safe`` message is generic and safe to show to a user, while the
-structured cause is logged for operators (never with bytes, base64, paths, or
-secrets).
+Provider, storage, and context-budget failures are translated into an
+:class:`AgentError` whose ``user_safe`` message is generic and safe to show to a
+user, while the structured cause is logged for operators (never with bytes,
+base64, paths, or secrets).
 """
 
 from __future__ import annotations
@@ -46,7 +51,12 @@ from ..database.repository import (
 from ..llm.client import LLMError, OpenAIClient
 from ..llm.message_converter import agent_message_to_openai_content
 from ..tools.registry import ToolRegistry
-from .context import ChatMessage, build_context
+from .context import (
+    ChatMessage,
+    PlannedMessage,
+    TurnCandidate,
+    plan_context,
+)
 from .messages import AgentMessage, ImageContent, TextContent
 from .tool_loop import ToolLoopLimitError, run_tool_loop
 
@@ -61,6 +71,7 @@ _USER_SAFE: dict[str, str] = {
     "empty_response": "模型服务暂时不可用。",
     "tool_limit": "处理该请求时工具调用次数过多，请重新尝试。",
     "attachment_error": "图片附件保存失败，请重新发送。",
+    "context_limit": "当前消息超出可处理的上下文限制，请缩短文字或减少图片后重试。",
     "error": "模型服务暂时不可用。",
 }
 _DEFAULT_USER_SAFE = "模型服务暂时不可用。"
@@ -87,6 +98,8 @@ class AgentService:
         *,
         system_prompt: str,
         max_context_messages: int = 50,
+        max_context_estimated_tokens: int = 24000,
+        context_image_estimated_tokens: int = 2000,
         registry: ToolRegistry | None = None,
         enable_tools: bool = False,
         max_tool_iterations: int = 5,
@@ -96,6 +109,12 @@ class AgentService:
         self._llm = llm
         self._system_prompt = system_prompt
         self._max_context_messages = max_context_messages
+        # Phase 2.4: a conservative, model-agnostic estimated-token budget on top
+        # of the message cap. Before any attachment blob is read, the planner
+        # chooses complete turns so the request fits *both* limits; a history
+        # turn's images can be downgraded to text when the full form won't fit.
+        self._max_context_estimated_tokens = max_context_estimated_tokens
+        self._context_image_estimated_tokens = context_image_estimated_tokens
         # Tools are opt-in: when disabled (or no registry is supplied) the
         # service behaves exactly as in phase one — a single LLM call, no tools.
         self._enable_tools = enable_tools
@@ -128,6 +147,57 @@ class AgentService:
         return {
             "conversation_id": conversation_id,
             "messages": await self._repo.count_messages(conversation_id),
+        }
+
+    async def context_status(self, conversation_id: int) -> dict[str, object]:
+        """A preview of the context that *would* be sent for the next request.
+
+        Runs the same :func:`.context.plan_context` the live path uses, but with
+        an empty "current" user candidate — so it reports the stored history and
+        how much of it (and how many of its images) would fit both the message
+        cap and the estimated-token budget. It reads **no** attachment bytes
+        (planning is metadata-only) and returns only counts/costs — never
+        message text, captions, digests, paths, or secrets. The figures are the
+        same conservative, model-agnostic *estimates* as at request time.
+        """
+        history_wa = await self._repo.get_messages_with_attachments(conversation_id)
+        history_candidates = [
+            TurnCandidate(
+                role=m.role,
+                text=m.content,
+                message_id=m.message_id,
+                attachments=tuple(
+                    (att.sha256, att.mime_type, att.filename, att.position) for att in m.attachments
+                ),
+                image_count=len(m.attachments),
+            )
+            for m in history_wa
+        ]
+        # An empty placeholder current user: the mandatory "always kept" slot is
+        # present (so the planner's arithmetic matches a real request) but costs
+        # only its per-message envelope and carries no image.
+        current_candidate = TurnCandidate(role="user", text="", message_id=0)
+        plan = plan_context(
+            self._system_prompt,
+            current_candidate,
+            history_candidates,
+            max_messages=self._max_context_messages,
+            max_estimated_tokens=self._max_context_estimated_tokens,
+            image_cost=self._context_image_estimated_tokens,
+        )
+        images_kept = sum(len(pm.attachments) for pm in plan.selected if pm.keep_images)
+        images_in_store = sum(len(m.attachments) for m in history_wa)
+        return {
+            "conversation_id": conversation_id,
+            "cap": self._max_context_messages,
+            "budget": self._max_context_estimated_tokens,
+            "image_cost": self._context_image_estimated_tokens,
+            "stored_messages": len(history_wa),
+            "history_messages": len(plan.selected),
+            "estimated_cost": plan.estimated_cost,
+            "system_cost": plan.system_cost,
+            "images_kept": images_kept,
+            "images_in_store": images_in_store,
         }
 
     async def reset(self, telegram_chat_id: int, telegram_user_id: int) -> int:
@@ -325,19 +395,93 @@ class AgentService:
             user_message_obj = await self._repo.add_message(conversation_id, "user", text)
             await self._persist_attachments(user_message_obj.id, message)
 
-            # Rebuild the recent window (message count, not tokens), matching
-            # build_context's truncation so an out-of-window image is never
-            # read from disk. The current turn is always in the window.
-            max_n = self._max_context_messages
-            prior_in_window = history_wa[-(max_n - 1):] if max_n > 1 else []
-            history = [
-                ChatMessage(role=m.role, content=self._rehydrate_content(m, conversation_id))
-                for m in prior_in_window
+            # Phase 2.4: before reading any attachment blob, plan which complete
+            # history turns fit *both* the message cap and the estimated-token
+            # budget. History is candidate metadata only (no bytes); the current
+            # turn is a separate, always-kept candidate whose images are never
+            # downgraded.
+            history_candidates = [
+                TurnCandidate(
+                    role=m.role,
+                    text=m.content,
+                    message_id=m.message_id,
+                    attachments=tuple(
+                        (att.sha256, att.mime_type, att.filename, att.position) for att in m.attachments
+                    ),
+                    image_count=len(m.attachments),
+                )
+                for m in history_wa
             ]
-            # The current turn may be multimodal (a list of OpenAI parts) and
-            # rides the in-memory bytes; history images were read back above.
+            current_images = sum(1 for part in message.contents if isinstance(part, ImageContent))
+            current_candidate = TurnCandidate(
+                role="user",
+                text=text,
+                message_id=user_message_obj.id,
+                image_count=current_images,
+            )
+            plan = plan_context(
+                self._system_prompt,
+                current_candidate,
+                history_candidates,
+                max_messages=self._max_context_messages,
+                max_estimated_tokens=self._max_context_estimated_tokens,
+                image_cost=self._context_image_estimated_tokens,
+            )
+
+            # system + the current user request alone already exceed the budget:
+            # do not call the LLM. The user's text and any image it carried were
+            # already persisted above (consistent with other LLM-failure paths).
+            if plan.status == "current_over_budget":
+                logger.warning(
+                    "request over context budget; skipping llm",
+                    extra={
+                        "conversation_id": conversation_id,
+                        "budget": self._max_context_estimated_tokens,
+                        "system_cost": plan.system_cost,
+                        "current_cost": plan.current_cost,
+                    },
+                )
+                raise AgentError(_user_safe_for("context_limit"), "context_limit")
+
+            # Rehydrate only the turns the plan selected; downgraded turns and
+            # unselected (older) turns are sent as plain text or omitted — their
+            # blobs are never read from disk.
+            by_id = {m.message_id: m for m in history_wa}
+            history: list[ChatMessage] = []
+            for pm in plan.selected:
+                stored = by_id[pm.message_id]
+                if pm.keep_images and self._attachment_store is not None and stored.attachments:
+                    content = self._rehydrate_content(stored, conversation_id)
+                else:
+                    content = stored.content
+                history.append(ChatMessage(role=pm.role, content=content))
+
+            # The current turn rides its in-memory bytes (text and/or a list of
+            # OpenAI parts) and is always kept, images and all.
             current_content = agent_message_to_openai_content(message)
-            context = build_context(self._system_prompt, [*history, ChatMessage("user", current_content)], max_n)
+            context = [
+                ChatMessage(role="system", content=self._system_prompt),
+                *history,
+                ChatMessage(role="user", content=current_content),
+            ]
+
+            images_kept = sum(len(pm.attachments) for pm in plan.selected if pm.keep_images)
+            images_downgraded = sum(len(pm.attachments) for pm in plan.selected if not pm.keep_images)
+            logger.info(
+                "context planned",
+                extra={
+                    "conversation_id": conversation_id,
+                    "budget": self._max_context_estimated_tokens,
+                    "estimated_cost": plan.estimated_cost,
+                    "system_cost": plan.system_cost,
+                    "current_cost": plan.current_cost,
+                    "selected_messages": len(plan.selected),
+                    "history_messages": len(history_candidates),
+                    "cap": self._max_context_messages,
+                    "images_kept": images_kept,
+                    "images_downgraded": images_downgraded,
+                },
+            )
 
             try:
                 if self._enable_tools:

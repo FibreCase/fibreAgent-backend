@@ -38,7 +38,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
                         ┌─────────────────────────────────────────┐
    Telegram  ──poll──▶  │  telegram/bot.py  (Adapter)             │
    (long polling)       │  · 鉴权 (allow-list)                    │
-                        │  · /start /new /help /status           │
+                        │  · /start /new /context /help /status     │
                         │  · typing 保活                          │
                         │  · Markdown→HTML 渲染 + 分块发送          │
                         └───────────────┬─────────────────────────┘
@@ -114,6 +114,8 @@ cp .env.example .env
 | `SYSTEM_PROMPT_PATH` | system prompt 文件路径，默认 `config/system_prompt.txt`。 |
 | `SYSTEM_PROMPT` | 可选：内联 system prompt，**若设置则覆盖文件**。 |
 | `MAX_CONTEXT_MESSAGES` | context 中携带的**最近 N 条消息**（消息数，不是 token 数），默认 `50`，另加一条 system 消息。 |
+| `MAX_CONTEXT_ESTIMATED_TOKENS` | 一次请求（system + 选中的历史 + 当前消息）的**估算** token 预算上限，默认 `24000`。这是一个**模型无关的保守估算**——不是 provider 计费 token，也不做模型专用 tokenization——与 `MAX_CONTEXT_MESSAGES` 共同约束 context。超预算时按「完整历史 turn、从新到旧」选取，必要时把历史图片降级为纯文本（不读取、不发送该图）。 |
+| `CONTEXT_IMAGE_ESTIMATED_TOKENS` | 估算中每张保留在 context 中的图片的成本，默认 `2000`。 |
 | `ENABLE_TOOLS` | 是否启用工具调用循环，默认 `true`。设为 `false` 时完全退回纯对话行为（不传 tools、不做任何工具相关持久化）。 |
 | `MAX_TOOL_ITERATIONS` | 单条消息内 LLM↔工具的最大往返次数，默认 `5`。超过则返回一条通用的「工具调用次数过多」提示。 |
 | `MAX_IMAGE_SIZE_MB` | 单张 Telegram 图片的最大字节数（MB），默认 `10`。超过则返回「图片过大，暂时无法处理。」，不会发给模型。 |
@@ -164,6 +166,7 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 | --- | --- |
 | `/start` | 启动 Agent / 查看当前会话（无会话时自动创建） |
 | `/new` | 开始新会话，清空本 chat 的历史上下文 |
+| `/context` | 查看上下文窗口状态：消息上限、已存入/本次保留条数、估算 token 预算的占用与剩余、历史图片保留/降级数量（只读预览，估算非精确 token） |
 | `/status` | 查看运行状态（版本、模型、会话 id、消息数） |
 | `/help` | 列出本帮助 |
 
@@ -277,15 +280,16 @@ docker compose down                    # 停止（数据卷保留）
 **能做的**
 - **工具调用**：`agent/tool_loop.py` 在 `Agent Service` 与 `LLM Client` 之间循环执行工具——拿到模型返回的 `tool_calls` 就按名经 registry 执行、把 `tool` 结果回灌 messages，直到模型给出最终文本（或用尽 `MAX_TOOL_ITERATIONS`）。`tools/` 提供 `Tool` 接口 + `ToolRegistry`（注册 / 生成 OpenAI schema / 按名执行）+ 三个只读内置工具。加新工具只需实现 `tools.base.Tool` 并在 `tools/builtin/__init__.py::build_default_tools()` 里 `registry.add(…)`——**不要**在别处写 `if name == "…"` 分支，registry 是唯一分发点。
 - **图片输入 + 持久化**：Telegram 照片（可带说明文字）经 `telegram/media.py` 规范化为渠道无关的 `AgentMessage`，图片 base64 内联交给模型；收到的图片以内容寻址 blob 落盘并在后续历史里重新入窗（见第 9 节 `attachments` 表）。
+- **上下文预算管理**：除了按 `MAX_CONTEXT_MESSAGES` 计消息数，还有一道**模型无关的估算 token 预算**（`MAX_CONTEXT_ESTIMATED_TOKENS`）。每次请求前按「完整历史 turn、从新到旧」选取历史，使请求同时满足消息数与估算预算；某个历史 turn 的图片放不进去时，该 turn 降级为纯文本（其图片**不读取、不发送**），而不跳过去挑更旧的内容。当前请求本身永远保留、其图片不降级；若仅 system + 当前请求就已超预算，则不调用 LLM，回一条「请缩短文字或减少图片」的安全提示。
 - **降级开关**：`ENABLE_TOOLS=false` 时完全退回纯对话（不传 tools、不做工具相关持久化）；图片处理与工具开关相互独立。
 
 **有意不做 / 限制**
 - **仅 3 个只读工具**（`get_current_time` / `echo` / `system_info`）：无 shell 执行、文件读写、联网扫描、SSH/Docker 或任何状态变更类工具；工具参数不做 schema 校验、无权限审批、单个工具无独立超时；tool 往返不落库、无法事后回放/审计。
 - **图片仅本地磁盘、仅照片**：blob 只落 `ATTACHMENT_STORAGE_PATH`，无配额/后台 GC/单附件删除（`/new` 是唯一回收点）；文档/贴纸/视频/音频仍被丢弃（`ContentPart` 已为它们预留）。
-- **按消息条数截断**：`MAX_CONTEXT_MESSAGES` 计消息数而非 token；窗口内图片随其消息整体进出 context，尚无 token 预算裁剪。
+- **估算而非精确 token**：`MAX_CONTEXT_ESTIMATED_TOKENS` 是一个保守、确定、模型无关的**估算**，用于相对选择与保护，不等于 provider 的计费 token；若实际 endpoint 仍报上下文超长，会走既有的安全 `http_error` 提示，本阶段不做重试或自动探测模型窗口。
 - **未涉及**：MCP、SSH/Docker/Pi、Web search/RAG、向量库、Redis/PostgreSQL、Web 前端、OAuth、多 Agent、autonomous loop、cron/scheduler、memory summarization、语音/TTS/STT。
 
 **下一步（建议顺序）**
-- **上下文管理**：按 token 预算裁剪 + 图片成本/数量策略（例如窗口内保留最近 N 张、更早降级为文字引用），让长对话既装得下又能控住 token 成本。
+- **长期记忆（Memory）**：在已建好的预算化 context 之上，做显式、可控的长期记忆检索（而非把长对话硬塞进窗口）。
 - **新 `ContentPart` 类型**（File / Audio / Video / Sticker）：复用同一套附件存储与重入窗机制，只需补对应的下载分支与 OpenAI 映射。
 - 新的工具能力（如 MCP）以 **Tool Provider** 接入同一个 `Tool`/`ToolRegistry` 接口，不改动 service / LLM client / Telegram 层；有副作用的工具上线前必须先加权限审批。

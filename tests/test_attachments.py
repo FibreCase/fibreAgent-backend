@@ -37,6 +37,7 @@ from fibrecase_agent_backend.attachments import (
     AttachmentStore,
     AttachmentStorageError,
 )
+from fibrecase_agent_backend.config import Config, ConfigError
 from fibrecase_agent_backend.database.models import Base, Conversation, Message
 from fibrecase_agent_backend.database.repository import ConversationRepository
 from fibrecase_agent_backend.database.session import (
@@ -104,12 +105,22 @@ class _FailingAttachRepo:
         raise RuntimeError("simulated attachment metadata write failure")
 
 
-def _service_with_store(repo, llm, store, max_context=50, **kwargs) -> AgentService:
+def _service_with_store(
+    repo,
+    llm,
+    store,
+    max_context=50,
+    max_tokens=24000,
+    image_cost=2000,
+    **kwargs,
+) -> AgentService:
     return AgentService(
         repo,
         llm,
         system_prompt="You are a test agent.",
         max_context_messages=max_context,
+        max_context_estimated_tokens=max_tokens,
+        context_image_estimated_tokens=image_cost,
         attachment_store=store,
         **kwargs,
     )
@@ -473,6 +484,272 @@ async def test_history_image_replay_tools_disabled(repo, tmp_path):
 
 
 # ===========================================================================
+# 9-17 — phase 2.4 budget-aware context management (service + attachments)
+# ===========================================================================
+async def test_budget_does_not_read_history_images_before_selection(repo, tmp_path):
+    # Seed an image-bearing turn with a generous budget (so it fits as the
+    # current turn and is persisted), then drive a text follow-up with a *tight*
+    # budget that only fits the turn's text-only form. The planner must downgrade
+    # it — so the store is never read and no image part reaches the LLM.
+    store = RecordingStore(tmp_path / "a")
+    seed_llm = RecordingMultimodalLLM([LLMResult(content="a")])
+    seed_service = _service_with_store(repo, seed_llm, store, max_tokens=1_000_000)
+    conv = await repo.get_or_create_conversation(1, 1)
+    await seed_service.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=PNG, mime_type="image/png"), TextContent("pic")])
+    )
+    reads_after_seed = len(store.reads)  # 0 — nothing to rehydrate on the first turn
+    # A fresh, tight-budget service over the SAME repo + store.
+    llm = RecordingMultimodalLLM([LLMResult(content="b")])
+    tight_service = _service_with_store(repo, llm, store, max_tokens=30)
+    await tight_service.process_message(conv.id, "what was that?")
+    # The downgraded image was never read from disk…
+    assert len(store.reads) == reads_after_seed
+    # …and the history user turn is plain text (not an image list) on the wire.
+    ctx = llm.calls[0][0]
+    hist_user = [m for m in ctx if m["role"] == "user" and m is not ctx[-1]]
+    assert hist_user, "the downgraded history user turn must still be present as text"
+    assert all(isinstance(m["content"], str) for m in hist_user)
+
+
+async def test_budget_ample_replays_history_image_unchanged(repo, tmp_path):
+    # With a generous budget, v1.4.0 replay is preserved: the history image is
+    # read from the store and sent as the correct data URL + position.
+    store = RecordingStore(tmp_path / "a")
+    llm = RecordingMultimodalLLM([LLMResult(content="a"), LLMResult(content="b")])
+    service = _service_with_store(repo, llm, store)  # default generous budget
+    conv = await repo.get_or_create_conversation(1, 1)
+    await service.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=JPEG, mime_type="image/jpeg"), TextContent("cap")])
+    )
+    reads_after_first = len(store.reads)
+    await service.process_message(conv.id, "recall the image")
+    assert len(store.reads) > reads_after_first  # rehydrated from the store
+    ctx = llm.calls[1][0]
+    rehyd = _image_user_call(ctx)
+    assert len(rehyd) == 1
+    assert _decode_data_url(rehyd[0]["content"][0]) == JPEG
+    assert rehyd[0]["content"][1] == {"type": "text", "text": "cap"}
+
+
+async def test_downgraded_history_image_is_plain_str_on_wire(repo, tmp_path):
+    # A downgraded history image: its caption + assistant reply remain in the
+    # LLM payload, and the user `content` is a plain `str` (no image part).
+    store = RecordingStore(tmp_path / "a")
+    seed_service = _service_with_store(repo, RecordingMultimodalLLM([LLMResult(content="I saw it")]), store, max_tokens=1_000_000)
+    conv = await repo.get_or_create_conversation(1, 1)
+    await seed_service.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=PNG, mime_type="image/png"), TextContent("my caption")])
+    )
+    # Tight budget so the follow-up downgrades the history image.
+    llm = RecordingMultimodalLLM([LLMResult(content="ok")])
+    tight_service = _service_with_store(repo, llm, store, max_tokens=40)
+    await tight_service.process_message(conv.id, "follow up")
+    ctx = llm.calls[0][0]
+    # The caption (user text) and the assistant reply are both still present…
+    assert any(m.get("content") == "my caption" for m in ctx)
+    assert any(m.get("content") == "I saw it" for m in ctx)
+    # …and the downgraded user turn is a plain str, never a list of parts.
+    user_turns = [m for m in ctx if m["role"] == "user" and m is not ctx[-1]]
+    assert user_turns and all(isinstance(m["content"], str) for m in user_turns)
+
+
+async def test_cap_and_budget_both_apply_current_always_present(repo, tmp_path):
+    # Both limits on at once: the result satisfies both, and the current user
+    # turn is always the last message, always present.
+    store = RecordingStore(tmp_path / "a")
+    llm = RecordingMultimodalLLM([LLMResult(content="ok")] * 6)
+    cap = 4
+    service = _service_with_store(repo, llm, store, max_context=cap, max_tokens=100)
+    conv = await repo.get_or_create_conversation(1, 1)
+    for i in range(4):
+        await service.process_message(conv.id, f"turn {i}")
+    ctx = llm.calls[-1][0]
+    # system is first, current user is last and always present…
+    assert ctx[0]["role"] == "system"
+    assert ctx[-1]["role"] == "user"
+    assert ctx[-1]["content"] == "turn 3"
+    # …and the non-system, non-current history count respects the message cap
+    # (cap counts the current user message but not system).
+    non_system_non_current = [m for m in ctx[1:] if m is not ctx[-1]]
+    assert len(non_system_non_current) <= cap - 1
+    # And the estimated payload is within budget.
+    from fibrecase_agent_backend.agent.context import estimate_parts_cost, message_cost
+
+    est = estimate_parts_cost(ctx[0]["content"], 2000) + sum(
+        message_cost(m["content"], 2000) for m in ctx[1:]
+    )
+    assert est <= 100
+
+
+async def test_current_text_over_budget_no_llm_call(repo, tmp_path):
+    # A current user text so long that system + current alone exceed the budget:
+    # no LLM call, a user-safe context_limit error, and the turn still persisted
+    # (so a later smaller request can still see it in history).
+    store = AttachmentStore(tmp_path / "a")
+    llm = RecordingMultimodalLLM([LLMResult(content="must not be called")])
+    service = _service_with_store(repo, llm, store, max_tokens=40)
+    conv = await repo.get_or_create_conversation(1, 1)
+    with pytest.raises(AgentError) as exc:
+        await service.process_message(conv.id, "y" * 500)  # ~125 units > 40
+    assert exc.value.category == "context_limit"
+    assert llm.calls == []  # the LLM was never called
+    # The over-budget user turn was persisted and is replayable later…
+    wa = await repo.get_messages_with_attachments(conv.id)
+    assert any(m.role == "user" and m.content == "y" * 500 for m in wa)
+    # …and a smaller subsequent request succeeds with it in history.
+    small_llm = RecordingMultimodalLLM([LLMResult(content="ok")])
+    small_service = _service_with_store(repo, small_llm, store, max_tokens=1000)
+    await small_service.process_message(conv.id, "short")
+    assert small_llm.calls  # the second (small) request did reach the LLM
+
+
+async def test_current_image_request_over_budget_no_llm_call(repo, tmp_path):
+    # A current request whose *images* push system + current over the budget:
+    # no LLM call, context_limit, but the image is still persisted.
+    store = AttachmentStore(tmp_path / "a")
+    llm = RecordingMultimodalLLM([LLMResult(content="must not be called")])
+    service = _service_with_store(repo, llm, store, max_tokens=100)  # < 2*image_cost
+    conv = await repo.get_or_create_conversation(1, 1)
+    with pytest.raises(AgentError) as exc:
+        await service.process_message(
+            conv.id,
+            AgentMessage(
+                contents=[
+                    ImageContent(data=JPEG, mime_type="image/jpeg"),
+                    ImageContent(data=PNG, mime_type="image/png"),
+                    TextContent("two big pics"),
+                ]
+            ),
+        )
+    assert exc.value.category == "context_limit"
+    assert llm.calls == []
+    # The image turn was persisted despite the over-budget refusal.
+    wa = await repo.get_messages_with_attachments(conv.id)
+    user = next(m for m in wa if m.role == "user")
+    assert user.content == "two big pics" and len(user.attachments) == 2
+
+
+async def test_selected_missing_blob_still_degrades_no_expansion(repo, tmp_path):
+    # A selected, in-budget image whose blob is missing at read time degrades to
+    # text (the v1.4.0 behaviour) — no unhandled exception, and the intact, newer
+    # image still replays (the window is not re-expanded or the planner re-run).
+    store = RecordingStore(tmp_path / "a")
+    llm = RecordingMultimodalLLM([LLMResult(content="a"), LLMResult(content="b"), LLMResult(content="c")])
+    service = _service_with_store(repo, llm, store)  # generous budget
+    conv = await repo.get_or_create_conversation(1, 1)
+    await service.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=PNG, mime_type="image/png"), TextContent("pic")])
+    )
+    first_blob = next(iter(store.iter_blobs()))
+    # A second, intact image turn.
+    await service.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=JPEG, mime_type="image/jpeg"), TextContent("second")])
+    )
+    store.delete(first_blob)  # the older blob is gone before the next turn
+    # Follow-up (text) turn: the older image's blob is missing → its text kept.
+    await service.process_message(conv.id, "recall both")
+    ctx = llm.calls[2][0]
+    # The intact, newer image still replayed from the store…
+    assert any(_decode_data_url(p["content"][0]) == JPEG for p in _image_user_call(ctx) if p["content"])
+    # …the missing image's text is still present (degraded, not dropped)…
+    assert any(m.get("content") == "pic" for m in ctx)
+    # …and the whole request completed without raising (asserted by reaching here).
+
+
+async def test_budget_selected_history_tools_on_and_off(repo, tmp_path):
+    # (a) tools ON: budget-selected history is sent and tools are advertised.
+    store = RecordingStore(tmp_path / "a")
+    llm_on = RecordingMultimodalLLM([LLMResult(content="a"), LLMResult(content="final")])
+    svc_on = _service_with_store(
+        repo, llm_on, store, max_tokens=5000,  # fits the current image turn
+        registry=build_default_tools(), enable_tools=True, max_tool_iterations=5,
+    )
+    conv = await repo.get_or_create_conversation(1, 1)
+    await svc_on.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=JPEG, mime_type="image/jpeg"), TextContent("pic")])
+    )
+    await svc_on.process_message(conv.id, "again")
+    assert llm_on.calls[-1][1] is not None  # tools advertised
+    # (b) tools OFF: same budget-selected history, but tools is None.
+    llm_off = RecordingMultimodalLLM([LLMResult(content="a"), LLMResult(content="b")])
+    svc_off = _service_with_store(repo, llm_off, store, max_tokens=5000, enable_tools=False)
+    await svc_off.process_message(conv.id, "again")
+    assert llm_off.calls[-1][1] is None  # tools is None when disabled
+
+
+async def test_store_none_keeps_phase_21x_current_image(repo, tmp_path):
+    # With no attachment store (phase 2.1.x opt-out): the current image is still
+    # sent, nothing is persisted to disk, and the plain-text wire shape is intact.
+    llm = RecordingMultimodalLLM([LLMResult(content="a"), LLMResult(content="b"), LLMResult(content="c")])
+    service = AgentService(
+        repo,
+        llm,
+        system_prompt="You are a test agent.",
+        max_context_messages=50,
+        max_context_estimated_tokens=24000,
+        context_image_estimated_tokens=2000,
+        attachment_store=None,  # phase 2.1.x opt-out
+    )
+    conv = await repo.get_or_create_conversation(1, 1)
+    await service.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=PNG, mime_type="image/png"), TextContent("cap")])
+    )
+    # The current image was delivered to the LLM as a data URL…
+    cur = llm.calls[0][0][-1]
+    assert isinstance(cur["content"], list)
+    assert cur["content"][0]["type"] == "image_url"
+    assert _decode_data_url(cur["content"][0]) == PNG
+    # …but nothing was written (no store), so a follow-up has no history image.
+    await service.process_message(conv.id, "recall")
+    assert not any(isinstance(m["content"], list) for m in llm.calls[1][0])
+    # Plain-text wire shape is a str, not a list.
+    await service.process_message(conv.id, "plain")
+    assert isinstance(llm.calls[2][0][-1]["content"], str)
+
+
+# ===========================================================================
+# 18 — config: new budget knobs
+# ===========================================================================
+def _config_kwargs(**overrides) -> dict:
+    base = dict(
+        telegram_bot_token="token",
+        allowed_user_ids=frozenset({1}),
+        openai_base_url="https://host/v1",
+        openai_api_key="key",
+        openai_model="model",
+        openai_timeout=120.0,
+        database_url="sqlite+aiosqlite:///:memory:",
+        system_prompt_path=Path("config/system_prompt.txt"),
+        max_context_messages=50,
+        max_context_estimated_tokens=24000,
+        context_image_estimated_tokens=2000,
+        enable_tools=True,
+        max_tool_iterations=5,
+        max_image_size_mb=10.0,
+        attachment_storage_path=Path("./data/attachments"),
+    )
+    base.update(overrides)
+    return base
+
+
+def test_config_budget_defaults_and_validation():
+    # Defaults are the documented values and valid.
+    cfg = Config(**_config_kwargs(max_context_estimated_tokens=24000, context_image_estimated_tokens=2000))
+    assert cfg.max_context_estimated_tokens == 24000
+    assert cfg.context_image_estimated_tokens == 2000
+    # The minimum valid value is 1.
+    assert Config(**_config_kwargs(max_context_estimated_tokens=1, context_image_estimated_tokens=1)).max_context_estimated_tokens == 1
+    # Zero is invalid for both knobs.
+    for field_name in ("max_context_estimated_tokens", "context_image_estimated_tokens"):
+        with pytest.raises(ConfigError):
+            Config(**_config_kwargs(**{field_name: 0}))
+    # A negative value is invalid.
+    with pytest.raises(ConfigError):
+        Config(**_config_kwargs(context_image_estimated_tokens=-5))
+
+
+# ===========================================================================
 # 15-17 — /new GC & reclaim
 # ===========================================================================
 async def test_new_removes_orphan_blob_and_metadata(repo, tmp_path):
@@ -595,6 +872,62 @@ async def test_text_path_unchanged_with_store_attached(repo, tmp_path):
     assert user_call["content"] == "My name is Alice."  # str, not a list
     assert llm.calls[0][1] is None  # no tools
     assert list(store.iter_blobs()) == []
+
+
+# ===========================================================================
+# Phase 2.4 — /context read-only preview (context_status)
+# ===========================================================================
+async def test_context_status_counts_and_never_calls_llm_or_reads_blob(repo, tmp_path):
+    store = AttachmentStore(tmp_path / "ctx")
+    llm = RecordingMultimodalLLM([LLMResult(content="ok"), LLMResult(content="ok")])
+    service = _service_with_store(repo, llm, store, max_tokens=10_000)
+    conv = await repo.get_or_create_conversation(1, 1)
+    # Stored history: an image turn (user image + assistant) and a text turn.
+    await service.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=PNG, mime_type="image/png")])
+    )
+    await service.process_message(conv.id, "plain text turn")
+
+    # /context is read-only: it must not call the LLM and must not read a blob.
+    reads = {"n": 0}
+    real_read = store.read
+
+    def _counting_read(digest):
+        reads["n"] += 1
+        return real_read(digest)
+
+    store.read = _counting_read
+    calls_before = len(llm.calls)
+
+    status = await service.context_status(conv.id)
+
+    assert len(llm.calls) == calls_before  # no completion issued
+    assert reads["n"] == 0  # metadata-only planning never reads a blob
+    # 4 stored messages (image-user, assistant, text-user, assistant).
+    assert status["stored_messages"] == 4
+    # A generous budget keeps every turn and its image.
+    assert status["history_messages"] == 4
+    assert status["images_kept"] == 1
+    assert status["images_in_store"] == 1
+    assert status["cap"] == 50 and status["budget"] == 10_000 and status["image_cost"] == 2000
+
+
+async def test_context_status_downgrades_image_when_over_budget(repo, tmp_path):
+    store = AttachmentStore(tmp_path / "ctx2")
+    llm = RecordingMultimodalLLM([LLMResult(content="ok")])
+    # Budget large enough for the *seeding* request (system + the in-memory
+    # image) to succeed, but small enough that, on the /context preview, the
+    # stored image turn's full form no longer fits and is downgraded to text.
+    service = _service_with_store(repo, llm, store, max_tokens=2015)
+    conv = await repo.get_or_create_conversation(1, 1)
+    await service.process_message(
+        conv.id, AgentMessage(contents=[ImageContent(data=PNG, mime_type="image/png")])
+    )
+
+    status = await service.context_status(conv.id)
+    # The image is persisted (in the store) but the planner downgraded its turn.
+    assert status["images_in_store"] == 1
+    assert status["images_kept"] == 0
 
 
 class _LogCapture(logging.Handler):

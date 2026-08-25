@@ -60,6 +60,7 @@ class MessageWithAttachments:
 
     role: str
     content: str
+    message_id: int = 0
     attachments: tuple[AttachmentRef, ...] = ()
 
     def has_attachments(self) -> bool:
@@ -186,7 +187,7 @@ class ConversationRepository:
                     )
                     for a in sorted(row.attachments, key=lambda a: a.position)
                 )
-                out.append(MessageWithAttachments(role=row.role, content=row.content, attachments=refs))
+                out.append(MessageWithAttachments(role=row.role, content=row.content, message_id=row.id, attachments=refs))
             return out
 
     async def count_messages(self, conversation_id: int) -> int:

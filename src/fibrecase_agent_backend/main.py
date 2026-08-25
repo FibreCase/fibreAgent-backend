@@ -63,6 +63,8 @@ class AgentBackend:
             self.llm,
             system_prompt=config.system_prompt,
             max_context_messages=config.max_context_messages,
+            max_context_estimated_tokens=config.max_context_estimated_tokens,
+            context_image_estimated_tokens=config.context_image_estimated_tokens,
             registry=registry,
             enable_tools=config.enable_tools,
             max_tool_iterations=config.max_tool_iterations,

@@ -59,10 +59,11 @@ TYPING_REFRESH_SECONDS = 4.0
 # Single source of truth for the command list: rendered by ``cmd_help`` and
 # advertised to Telegram's native "/" menu. ``(command, short_description)``.
 _COMMANDS: list[tuple[str, str]] = [
-    ("start", "启动 / 查看当前 Agent"),
-    ("new", "开始新会话（清空历史）"),
-    ("status", "查看运行状态"),
-    ("help", "显示本帮助"),
+    ("start", "Start / view the agent"),
+    ("new", "Start a new conversation"),
+    ("context", "Show context budget"),
+    ("status", "Show run status"),
+    ("help", "Show this help"),
 ]
 
 
@@ -209,15 +210,15 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         conversation = await repo.get_or_create_conversation(chat.id, user_id)
         await _send_long(
             chat,
-            "Agent 已启动。\n\n"
-            f"当前模型：\n{config.openai_model}\n\n"
-            f"当前会话：\n{conversation.id}\n\n"
-            "你可以直接发送消息。",
+            "**Agent started.**\n\n"
+            f"**Model:** {config.openai_model}\n"
+            f"**Conversation:** {conversation.id}\n\n"
+            "You can send messages directly.",
         )
     else:
         await _send_long(
             chat,
-            f"Agent 已在运行。当前会话：{conversation.id}。",
+            f"**Agent is already running.** Current conversation: {conversation.id}.",
         )
 
 
@@ -229,7 +230,7 @@ async def cmd_new(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     service: AgentService = context.application.bot_data["agent_service"]
     await service.reset(chat.id, user_id)
-    await _send_long(chat, "已开始新的会话（历史已清空）。")
+    await _send_long(chat, "**New conversation started** (history cleared).")
 
 
 async def cmd_help(update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -237,10 +238,10 @@ async def cmd_help(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, context):
         return
     chat = update.effective_chat
-    lines = ["可用命令：", ""]
+    lines = ["**Available commands:**", ""]
     for cmd, desc in _COMMANDS:
         lines.append(f"/{cmd} — {desc}")
-    lines += ["", "其它文字消息都会发给 Agent。"]
+    lines += ["", "Any other text message is sent to the agent."]
     await _send_long(chat, "\n".join(lines))
 
 
@@ -255,34 +256,72 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conversation = await repo.get_conversation(chat.id)
     if conversation is None:
         lines = [
-            "Agent Backend",
-            "Status: OK",
+            "**Agent Backend:**",
+            "**Status:** OK",
             "",
-            f"Version:\n{__version__}",
-            "",
-            f"Model:\n{config.openai_model}",
-            "",
-            "Conversation:\n(none yet — 发送 /start 开始)",
-            "",
-            "Database:\nOK",
+            f"**Version:** {__version__}",
+            f"**Model:** {config.openai_model}",
+            "**Conversation:** (none yet — send /start)",
+            "**Database:** OK",
         ]
     else:
         status = await service.conversation_status(conversation.id)
         lines = [
-            "Agent Backend",
-            "Status: OK",
+            "**Agent Backend:**",
+            "**Status:** OK",
             "",
-            f"Version:\n{__version__}",
-            "",
-            f"Model:\n{config.openai_model}",
-            "",
-            f"Conversation:\n{conversation.id}",
-            "",
-            f"Messages:\n{status['messages']}",
-            "",
-            "Database:\nOK",
+            f"**Version:** {__version__}",
+            f"**Model:** {config.openai_model}",
+            f"**Conversation:** {conversation.id}",
+            f"**Messages:** {status['messages']}",
+            "**Database:** OK",
         ]
     # None of the above exposes keys, tokens, or file paths.
+    await _send_long(chat, "\n".join(lines))
+
+
+async def cmd_context(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Report the context window: how much of the stored history (and its images)
+    would fit both the message cap and the estimated-token budget.
+
+    A read-only preview. It never reads an attachment blob (planning is
+    metadata-only) and the reply exposes only counts and the conservative
+    estimated costs — no message text, captions, digests, paths, or secrets.
+    """
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    service: AgentService = context.application.bot_data["agent_service"]
+    repo: ConversationRepository = context.application.bot_data["repository"]
+
+    conversation = await repo.get_conversation(chat.id)
+    if conversation is None:
+        await _send_long(chat, "**No conversation yet** — send /start first.")
+        return
+
+    s = await service.context_status(conversation.id)
+    free_tokens = s["budget"] - s["estimated_cost"]
+    free_messages = s["cap"] - (s["history_messages"] + 1)
+    images_downgraded = s["images_in_store"] - s["images_kept"]
+    lines = [
+        "**Context:**",
+        f"**Conversation:** {s['conversation_id']}",
+        "",
+        f"**Message cap:** {s['cap']}",
+        f"**Stored:** {s['stored_messages']} messages",
+        f"**Kept this turn:** {s['history_messages']} (+1 current)",
+        f"**Room left:** ~{free_messages} messages",
+        "",
+        f"**Estimated budget:** {s['budget']} units",
+        f"**Used:** ~{s['estimated_cost']} units (system {s['system_cost']})",
+        f"**Free:** ~{free_tokens} units",
+        "",
+        f"**History images kept:** {s['images_kept']} / {s['images_in_store']}"
+        + (f" ({images_downgraded} downgraded to text)" if images_downgraded > 0 else ""),
+        "",
+        "(Conservative estimate, not exact tokens.)",
+    ]
+    # None of the above exposes message text, keys, tokens, digests, or paths.
     await _send_long(chat, "\n".join(lines))
 
 
@@ -424,6 +463,7 @@ def build_application(
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("new", cmd_new))
+    application.add_handler(CommandHandler("context", cmd_context))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("status", cmd_status))
     # Plain text messages *and* photos (with or without a caption). Commands are

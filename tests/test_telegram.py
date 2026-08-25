@@ -21,6 +21,7 @@ from fibrecase_agent_backend import __version__
 from fibrecase_agent_backend.telegram.bot import (
     CHUNK_SIZE,
     _is_authorized,
+    cmd_context,
     cmd_help,
     cmd_new,
     cmd_start,
@@ -95,6 +96,20 @@ class _FakeService:
     async def conversation_status(self, conv_id):
         return {"conversation_id": conv_id, "messages": 2}
 
+    async def context_status(self, conv_id):
+        return {
+            "conversation_id": conv_id,
+            "cap": 50,
+            "budget": 24000,
+            "image_cost": 2000,
+            "stored_messages": 12,
+            "history_messages": 10,
+            "estimated_cost": 1200,
+            "system_cost": 200,
+            "images_kept": 3,
+            "images_in_store": 5,
+        }
+
     async def reset(self, chat_id, user_id):
         self.reset_calls.append((chat_id, user_id))
         return 99
@@ -148,7 +163,7 @@ async def test_cmd_start_creates_and_replies():
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await cmd_start(update, context)
     send.assert_awaited_once()
-    assert "Agent 已启动" in send.await_args.kwargs["text"]
+    assert "<b>Agent started.</b>" in send.await_args.kwargs["text"]
 
 
 async def test_handle_message_returns_llm_reply_and_typing():
@@ -185,6 +200,42 @@ async def test_handle_message_surfaces_user_safe_llm_error():
     assert "超时" in send.await_args.kwargs["text"]
 
 
+async def test_cmd_context_reports_window_and_downgrade():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/context", allowed=(1,))
+    app.bot_data["repository"] = _FakeRepo(conv_id=7)
+    app.bot_data["agent_service"] = _FakeService()
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_context(update, context)
+    sent = send.await_args.kwargs["text"]
+    assert "<b>Context:</b>" in sent and "<b>Conversation:</b> 7" in sent
+    # Budget + free-space arithmetic (estimated, not exact tokens).
+    assert "<b>Estimated budget:</b> 24000" in sent
+    assert "<b>Free:</b> ~22800 units" in sent
+    assert "<b>Kept this turn:</b> 10" in sent
+    # Image downgrade is surfaced when some stored images won't fit.
+    assert "<b>History images kept:</b> 3 / 5 (2 downgraded to text)" in sent
+    assert "Conservative estimate, not exact tokens" in sent
+
+
+async def test_cmd_context_no_conversation_is_safe():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/context", allowed=(1,))
+    app.bot_data["repository"] = _FakeRepo(exists=False)
+    app.bot_data["agent_service"] = _FakeService()
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_context(update, context)
+    send.assert_awaited_once()
+    assert "No conversation yet" in send.await_args.kwargs["text"]
+
+
+async def test_cmd_context_unauthorized_noop():
+    update, chat, context, app, bot = _make(user_id=999, chat_id=1, text="/context", allowed=(1,))
+    app.bot_data["repository"] = _FakeRepo(conv_id=7)
+    app.bot_data["agent_service"] = _FakeService()
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_context(update, context)
+    send.assert_not_awaited()
+
+
 async def test_cmd_status_reports_conversation():
     update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/status", allowed=(1,))
     app.bot_data["repository"] = _FakeRepo(conv_id=7, messages=3)
@@ -193,9 +244,9 @@ async def test_cmd_status_reports_conversation():
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await cmd_status(update, context)
     sent = send.await_args.kwargs["text"]
-    assert "Status: OK" in sent and "test-model" in sent
+    assert "<b>Status:</b> OK" in sent and "test-model" in sent
     # /status reports the backend version.
-    assert f"Version:\n{__version__}" in sent
+    assert f"<b>Version:</b> {__version__}" in sent
 
 
 async def test_cmd_new_resets_and_confirms():
@@ -205,7 +256,7 @@ async def test_cmd_new_resets_and_confirms():
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await cmd_new(update, context)
     assert service.reset_calls == [(1, 1)]  # reset triggered for this chat/user
-    assert "新的会话" in send.await_args.kwargs["text"]
+    assert "<b>New conversation started</b>" in send.await_args.kwargs["text"]
 
 
 async def test_cmd_new_unauthorized_noop():

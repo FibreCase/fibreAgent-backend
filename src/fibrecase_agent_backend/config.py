@@ -39,6 +39,8 @@ class Config:
     database_url: str
     system_prompt_path: Path
     max_context_messages: int
+    max_context_estimated_tokens: int
+    context_image_estimated_tokens: int
 
     enable_tools: bool
     max_tool_iterations: int
@@ -66,6 +68,10 @@ class Config:
             raise ConfigError("OPENAI_MODEL is not set")
         if self.max_context_messages < 1:
             raise ConfigError("MAX_CONTEXT_MESSAGES must be >= 1")
+        if self.max_context_estimated_tokens < 1:
+            raise ConfigError("MAX_CONTEXT_ESTIMATED_TOKENS must be >= 1")
+        if self.context_image_estimated_tokens < 1:
+            raise ConfigError("CONTEXT_IMAGE_ESTIMATED_TOKENS must be >= 1")
         if self.max_tool_iterations < 1:
             raise ConfigError("MAX_TOOL_ITERATIONS must be >= 1")
         if self.max_image_size_mb < 1:
@@ -151,6 +157,8 @@ def load_config() -> Config:
         database_url=os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/agent.db").strip(),
         system_prompt_path=Path(os.environ.get("SYSTEM_PROMPT_PATH", "config/system_prompt.txt")),
         max_context_messages=_parse_int(os.environ.get("MAX_CONTEXT_MESSAGES", ""), 50),
+        max_context_estimated_tokens=_parse_int(os.environ.get("MAX_CONTEXT_ESTIMATED_TOKENS", ""), 24000),
+        context_image_estimated_tokens=_parse_int(os.environ.get("CONTEXT_IMAGE_ESTIMATED_TOKENS", ""), 2000),
         enable_tools=_parse_bool(os.environ.get("ENABLE_TOOLS", ""), True),
         max_tool_iterations=_parse_int(os.environ.get("MAX_TOOL_ITERATIONS", ""), 5),
         max_image_size_mb=_parse_float(os.environ.get("MAX_IMAGE_SIZE_MB", ""), 10.0),
