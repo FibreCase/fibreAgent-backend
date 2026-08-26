@@ -19,9 +19,24 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
+from fibrecase_agent_backend import config as _config_module
 from fibrecase_agent_backend.database.models import Base
 from fibrecase_agent_backend.database.repository import ConversationRepository
 from fibrecase_agent_backend.llm.client import LLMError, LLMResult
+
+
+@pytest.fixture(autouse=True)
+def _no_dotenv(monkeypatch):
+    """Keep every test hermetic: never read the developer's real ``.env``.
+
+    ``load_config`` auto-loads a ``.env`` from the working directory via
+    ``load_dotenv``. Without this, any real ``.env`` present in the repo would
+    leak live values (e.g. ``MCP_SERVERS``, ``OAUTH_CALLBACK_BASE_URL``) into
+    tests that assert on *default* (unset) config — ``load_dotenv(override=False)``
+    happily refills a key a test just ``delenv``'d. All config tests set their
+    own env explicitly, so the ambient file must be inert.
+    """
+    monkeypatch.setattr(_config_module, "load_dotenv", lambda *a, **k: None)
 
 
 @pytest.fixture

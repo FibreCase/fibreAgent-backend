@@ -30,7 +30,7 @@ uv run fibrecase-agent-backend
 - 看到日志 `telegram long polling started` 即表示就绪。
 - 用 `Ctrl+C` 停止；会优雅关闭 LLM 客户端与数据库连接。
 
-> long polling 的原因：你的服务器可能没有公网 HTTP 入站能力，long polling 只出站连接 Telegram。
+> long polling 的原因：你的服务器可能没有公网 HTTP 入站能力，long polling 只出站连接 Telegram。**唯一例外**：启用 MCP 用户级 OAuth 后，回调服务器会在 `OAUTH_CALLBACK_PORT`（默认 8090）上监听 `GET /oauth/callback`——该地址必须能被 OAuth provider（如 Google）访问（见 [远程 MCP 工具](mcp.md)）。不启用 OAuth 时没有任何入站监听。
 
 ## 命令参考
 
@@ -47,6 +47,8 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 | `/forget all CONFIRM` | 清空你账号下的**全部**记忆（破坏性操作，必须带 `CONFIRM` 才会执行） |
 | `/status` | 查看运行状态（版本、模型、会话 id、消息数） |
 | `/tool_audit [limit]` | 查看**你本人**最近的工具执行审计（`limit` 默认 `20`、上限 `50`）：每条只显示时间、事件 id、工具名、事件类型、结果码与（若有）耗时；**绝不**显示工具参数、结果或异常正文。仅当前账号可见（按不可逆的 scope 哈希隔离），无数据时给出安全提示。 |
+| `/mcp` | 只读查看 MCP 服务器状态（名称、`available`/`unavailable`、工具数、总数），**并**对 OAuth 服务器显示**你本人**的登录状态（已连接 / 需要认证 / 已过期 / 未配置）；别的用户的登录状态永不显示。**不**发起连接 / 刷新，也不调用 LLM / MCP；**绝不**显示 URL / host / token / 工具描述。 |
+| `/mcp auth <server>` | 为**你的账号**发起第三方 OAuth 登录（如 `/mcp auth gcal`）：返回一个**内联 URL 登录按钮**（点一下即跳转，无需复制 URL）+ 一条有效期提示。凭据绑定到你的 Telegram user（不是会话），自动刷新；`/new` 与重启不影响。需要 `OAUTH_CALLBACK_BASE_URL` 与相应 provider 凭据已配置，否则给出安全提示。 |
 | `/mcp_status` | 只读查看已配置的远程 MCP 服务器状态：每台的名称、`available`/`unavailable`、发现到的工具数，以及可用工具总数。**不**发起连接/刷新，也不调用 LLM 或 MCP；未配置（或 `ENABLE_TOOLS=false`）时显示「MCP: disabled」；**绝不**显示 URL/host/token/头/工具描述或服务器 instructions。 |
 | `/help` | 列出本帮助 |
 

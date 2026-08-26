@@ -27,6 +27,7 @@ from .manager import (
     CODE_DISCOVERY_FAILED,
     CODE_INITIALIZE_FAILED,
     CODE_INVALID_TOOL,
+    CODE_OAUTH_NOT_CONFIGURED,
     McpManager,
 )
 from .wrapper import McpTool, is_valid_remote_tool_name, local_tool_name
@@ -40,4 +41,5 @@ __all__ = [
     "CODE_INITIALIZE_FAILED",
     "CODE_DISCOVERY_FAILED",
     "CODE_INVALID_TOOL",
+    "CODE_OAUTH_NOT_CONFIGURED",
 ]

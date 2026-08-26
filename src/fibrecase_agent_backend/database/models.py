@@ -217,3 +217,78 @@ class ToolAuditEvent(Base):
         return f"<ToolAuditEvent id={self.id} tool={self.tool_name} type={self.event_type}>"
 
 
+class OAuthCredential(Base):
+    """One active user-level OAuth credential for an MCP server (phase 4.x).
+
+    Bound to the Telegram **user** (``telegram_user_id``) — *never* to a
+    conversation or chat — so it survives ``/new`` and restarts. There is at
+    most **one** active credential per ``(telegram_user_id, provider,
+    mcp_server)`` (the unique index); a re-authorization *replaces* it rather
+    than creating a second row.
+
+    ``access_token`` / ``refresh_token`` are **sensitive**: they are stored here
+    (independent of conversation messages, never in ``messages.content``, tool
+    results, the system prompt, or logs) and read only by the OAuth storage.
+    There is deliberately **no** encryption at rest this phase — the storage
+    interface leaves an extension point for one — so these two columns are the
+    only place secrets may live.
+    """
+
+    __tablename__ = "oauth_credentials"
+    # One active credential per (user, provider, server); enforces the "no
+    # unlimited duplicates" rule at the database level.
+    __table_args__ = (
+        Index(
+            "uq_oauth_credentials_user_provider_server",
+            "telegram_user_id",
+            "provider",
+            "mcp_server",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(index=True, nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    mcp_server: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Sensitive — see class docstring. Never logged.
+    access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    scopes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow, nullable=False)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only (no tokens)
+        return f"<OAuthCredential id={self.id} provider={self.provider} server={self.mcp_server}>"
+
+
+class OAuthAuthorizationState(Base):
+    """One in-flight OAuth authorization, keyed by its single-use ``state``
+    (phase 4.x).
+
+    The ``state`` is a ``secrets.token_urlsafe`` value (never a user id / chat
+    id / timestamp / predictable UUID). It binds the flow to the originating
+    Telegram **user** and chat so the callback can verify the binding and
+    notify the right user. A row is deleted as soon as the flow succeeds *or*
+    fails (single-use) — a replayed ``state`` finds no row and is rejected.
+    """
+
+    __tablename__ = "oauth_authorization_states"
+    __table_args__ = (Index("ix_oauth_states_state", "state", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # The single-use OAuth ``state`` (indexed unique for the consume lookup).
+    state: Mapped[str] = mapped_column(String(128), nullable=False)
+    telegram_user_id: Mapped[int] = mapped_column(index=True, nullable=False)
+    # The originating chat, so the callback can notify the right conversation.
+    chat_id: Mapped[int] = mapped_column(nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    mcp_server: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only (no secrets)
+        return f"<OAuthAuthorizationState id={self.id} provider={self.provider} server={self.mcp_server}>"
+
+

@@ -29,7 +29,7 @@ import logging
 from datetime import timezone
 from typing import Callable
 
-from telegram import BotCommand, Chat
+from telegram import BotCommand, Chat, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
@@ -44,6 +44,7 @@ from telegram.ext import (
 from ..agent.service import AgentError, AgentService, _user_safe_for
 from ..config import Config
 from ..database.repository import ConversationRepository
+from ..mcp.auth.models import OAuthError
 from .markdown import to_telegram_html_chunks
 from .media import MediaError, normalize_message
 from .. import __version__
@@ -70,6 +71,7 @@ _COMMANDS: list[tuple[str, str]] = [
     ("status", "Show run status"),
     ("tool_audit", "Show tool audit log"),
     ("mcp_status", "Show remote MCP tool status"),
+    ("mcp", "Show MCP servers / start OAuth login"),
     ("help", "Show this help"),
 ]
 
@@ -551,6 +553,136 @@ async def cmd_mcp_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_long(chat, "\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# MCP status + user-level OAuth (phase 4.x)
+# ---------------------------------------------------------------------------
+async def _send_long_html(chat: Chat, text: str, reply_markup=None) -> None:
+    """Send a short, already-HTML command reply (single message, no chunking).
+
+    The OAuth replies are always short; on an HTML parse failure they fall back
+    to plain text so a notice is never lost.
+    """
+    try:
+        await chat.send_message(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except BadRequest:
+        await _safe_reply(chat, text)
+
+
+async def cmd_mcp(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mcp — show the caller's MCP status, or start an OAuth login.
+
+    With **no argument** it is a read-only status view: for each configured
+    server it reports availability and, for a server that uses **user-level
+    OAuth**, *this user's* connection state (connected / authentication required
+    / expired / not configured) — it never reads or shows a token, a URL, a
+    header, or another user's state.
+
+    With **``auth <server>``** it starts the user-level OAuth flow for that one
+    server: the credential binds to **this Telegram user** (never to a
+    conversation, so ``/new`` never affects it) and the reply is an inline URL
+    button (the user is never asked to copy a URL). The link embeds a single-use,
+    expiring ``state``. Any failure is a fixed, user-safe message — never a
+    token, a full callback URL, or a stack trace.
+
+    An unauthorised sender is ignored silently, like every other command.
+    """
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    bot_data = context.application.bot_data
+    body = _command_body(update.effective_message.text).strip()
+    tokens = body.split()
+    # ``/mcp auth <server>`` → start the login flow (the only OAuth entry point;
+    # Telegram treats ``/mcp auth ...`` as the single command ``/mcp`` with args).
+    if tokens and tokens[0].lower() == "auth":
+        server_name = " ".join(tokens[1:]).strip()
+        await _start_mcp_auth(chat, update.effective_user.id, server_name, bot_data.get("oauth_manager"))
+        return
+    await _show_mcp_status(
+        chat,
+        update.effective_user.id,
+        bot_data["config"],
+        bot_data.get("mcp_manager"),
+        bot_data.get("oauth_manager"),
+    )
+
+
+async def _show_mcp_status(chat, user_id, config, manager, oauth_manager) -> None:
+    """The read-only ``/mcp`` status view (availability + per-user OAuth state)."""
+    if manager is None or not getattr(config, "enable_tools", True) or len(manager) == 0:
+        await _send_long(chat, "**MCP:** disabled")
+        return
+
+    status_by_name = {entry["name"]: entry for entry in manager.status()}
+    lines = ["**MCP servers:**", ""]
+    for spec in config.mcp_servers:
+        entry = status_by_name.get(spec.name)
+        if entry is None or not entry["available"]:
+            lines.append(f"✗ **{spec.name}** — unavailable")
+            continue
+        if spec.auth_type == "oauth" and oauth_manager is not None:
+            try:
+                state = await oauth_manager.oauth_status(telegram_user_id=user_id, mcp_server=spec.name)
+            except Exception:  # a status lookup failure must never crash the reply
+                logger.warning("mcp oauth status lookup failed", extra={"server": spec.name})
+                state = "authentication_required"
+            _oauth_lines = {
+                "connected": f"✓ **{spec.name}** — connected (your {spec.auth_provider} account)",
+                "authentication_required": f"✗ **{spec.name}** — authentication required — /mcp auth {spec.name}",
+                "expired": f"✗ **{spec.name}** — authorization expired — /mcp auth {spec.name}",
+                "not_configured": f"✗ **{spec.name}** — OAuth not configured",
+                "provider_not_configured": f"✗ **{spec.name}** — OAuth provider not configured",
+                "not_oauth": f"✓ **{spec.name}** — available",
+            }
+            lines.append(_oauth_lines.get(state, f"✓ **{spec.name}** — available"))
+        else:
+            lines.append(f"✓ **{spec.name}** — available")
+    await _send_long_html(chat, "\n".join(lines))
+
+
+async def _start_mcp_auth(chat, user_id, server_name, oauth_manager) -> None:
+    """The ``/mcp auth <server>`` flow: an inline **URL button**, bound to the
+    caller's Telegram user. Any failure is a fixed, user-safe message — never a
+    token, a full callback URL, or a stack trace."""
+    if not server_name:
+        await _safe_reply(chat, "Usage: /mcp auth <server>")
+        return
+    if oauth_manager is None:
+        await _safe_reply(
+            chat,
+            "OAuth is not configured on this server (set OAUTH_CALLBACK_BASE_URL and the provider credentials).",
+        )
+        return
+
+    try:
+        pending = await oauth_manager.initiate(
+            telegram_user_id=user_id, chat_id=chat.id, mcp_server=server_name
+        )
+    except OAuthError as exc:
+        # exc.user_safe is a fixed, secret-free message naming only the code.
+        await _safe_reply(chat, exc.user_safe)
+        return
+    except Exception:  # never crash the handler; a DB failure is user-safe too
+        logger.error("mcp auth initiate failed", extra={"server": server_name})
+        await _safe_reply(chat, "Could not start the authorization. Please try again.")
+        return
+
+    minutes = max(1, int(pending.expires_in_seconds // 60))
+    body = (
+        f"**{server_name}** requires authorization.\n\n"
+        "Please sign in with your account:\n"
+    )
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text="🔐 Sign in", url=pending.authorization_url)]]
+    )
+    note = f"The authorization link expires in ~{minutes} minutes."
+    try:
+        await chat.send_message(text=body, parse_mode=ParseMode.HTML, reply_markup=markup)
+        await _safe_reply(chat, note)
+    except TelegramError:
+        logger.error("failed to send oauth login prompt", extra={"server": server_name})
+
+
 async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update, context):
         return
@@ -676,6 +808,7 @@ def build_application(
     repository: ConversationRepository,
     approval_broker=None,
     mcp_manager=None,
+    oauth_manager=None,
 ) -> Application:
     """Assemble the PTB :class:`Application` and register all handlers.
 
@@ -694,6 +827,12 @@ def build_application(
     servers configured, or tools disabled) ``/mcp_status`` reports MCP as
     disabled. It is **never** used to connect or refresh — the manager is
     started/closed by the composition root's lifecycle hooks only.
+
+    ``oauth_manager`` (the phase-4.x :class:`~..mcp.auth.OAuthManager`,
+    optional) is exposed in ``bot_data`` for the ``/mcp`` status view and the
+    ``/mcp auth <server>`` login flow. When ``None`` (OAuth not configured)
+    ``/mcp auth`` reports "not configured" and ``/mcp`` shows OAuth servers as
+    unavailable — no OAuth URL is ever generated.
     """
     application = (
         ApplicationBuilder()
@@ -706,6 +845,7 @@ def build_application(
     application.bot_data["config"] = config
     application.bot_data["allowed_user_ids"] = set(config.allowed_user_ids)
     application.bot_data["mcp_manager"] = mcp_manager
+    application.bot_data["oauth_manager"] = oauth_manager
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("new", cmd_new))
@@ -717,6 +857,11 @@ def build_application(
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("tool_audit", cmd_tool_audit))
     application.add_handler(CommandHandler("mcp_status", cmd_mcp_status))
+    # Phase 4.x: MCP status + user-level OAuth login. ``/mcp auth <server>`` is
+    # the single ``/mcp`` command with an ``auth`` argument (Telegram treats it
+    # as one command), so it is dispatched inside ``cmd_mcp`` — there is no
+    # separate ``mcp_auth`` command (that would never match ``/mcp auth …``).
+    application.add_handler(CommandHandler("mcp", cmd_mcp))
     # Phase 3: the Approve/Deny inline-button callback (bound to the exact
     # (principal, chat) that requested the approval; all other clicks are no-ops).
     if approval_broker is not None:

@@ -45,6 +45,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, runtime_checkable
 
+from ..mcp.auth.principal import active_principal
 from ..tools.approval import ApprovalDecision, ApprovalRequest, ToolApprovalProvider
 from ..tools.audit import (
     EVENT_APPROVAL_APPROVED,
@@ -385,6 +386,12 @@ async def _execute_gated(
     # 7. Execute with a per-call timeout (cancel on timeout).
     await auditor.record(_event(EVENT_STARTED, code=RESULT_OK))
     started = time.monotonic()
+    # Phase 4.x: expose the requesting principal for the duration of this one
+    # tool execution. The MCP OAuth transport reads this contextvar to attach
+    # the *requesting user's* access token to outgoing requests; it is unset
+    # outside a tool call, so no request ever rides a stale or wrong principal.
+    # This is identity propagation only — no OAuth logic lives in the loop.
+    principal_token = active_principal.set(scope or None)
     try:
         output = await asyncio.wait_for(tool.execute(args_for_exec), timeout=tool_timeout_seconds)
     except asyncio.TimeoutError:
@@ -407,6 +414,8 @@ async def _execute_gated(
         )
         await auditor.record(_event(EVENT_FAILED, code=RESULT_TOOL_EXECUTION_FAILED, latency_ms=latency_ms))
         return error_result(RESULT_TOOL_EXECUTION_FAILED)
+    finally:
+        active_principal.reset(principal_token)
 
     latency_ms = int((time.monotonic() - started) * 1000)
     logger.info("tool completed: %s latency=%dms", name, latency_ms, extra={"iteration": iteration})

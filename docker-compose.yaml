@@ -4,7 +4,12 @@
 #   docker compose up -d --build
 #   docker compose logs -f
 #
-# The app is outbound-only (Telegram long polling + LLM API): nothing to expose.
+# The app is outbound-only by default (Telegram long polling + LLM API):
+# nothing to expose. The ONE exception is user-level OAuth for MCP (phase 4.x):
+# when OAUTH_CALLBACK_BASE_URL is set, the app opens a single inbound listener
+# (GET /oauth/callback) that the OAuth provider must reach. That port is
+# published *only* in that case, via the opt-in file docker-compose.oauth.yaml
+# (see the "Inbound ports" note at the bottom of this file).
 
 services:
   agent-backend:
@@ -49,4 +54,23 @@ services:
     # The bot is a single long-running process; this keeps it up.
     restart: unless-stopped
 
-    # Outbound-only long polling — no inbound ports.
+    # ------------------------------------------------------------------
+    # Inbound ports
+    # ------------------------------------------------------------------
+    # This base file publishes NO ports, so the image stays "no inbound
+    # ports" by default — correct while OAuth is off, when the app is purely
+    # outbound.
+    #
+    # DANGER: do not hand-add a `ports:` mapping for the OAuth callback here.
+    # Compose cannot publish a port *conditionally* on an env var (the ports
+    # mapping has no `when`/`condition` field — that only exists on
+    # `depends_on`), so any static port in this file would open a hole for
+    # users who never enable OAuth.
+    #
+    # Instead, to enable OAuth (i.e. you have set OAUTH_CALLBACK_BASE_URL in
+    # .env), ALSO run with the opt-in file that publishes the callback port:
+    #
+    #     docker compose -f docker-compose.yaml -f docker-compose.oauth.yaml up -d --build
+    #
+    # When OAuth is off, just `docker compose up -d --build` as usual — no port
+    # is published and the app stays outbound-only.

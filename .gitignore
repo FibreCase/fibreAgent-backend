@@ -21,7 +21,7 @@ data/*
 !data/.gitkeep
 
 # Local temporary notes / task specs — not part of the project
-TASK.md
+TASK*.md
 ROADMAP.md
 
 # OS / editor noise

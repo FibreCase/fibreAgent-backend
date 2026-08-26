@@ -14,23 +14,43 @@ engine, repository, tool registry and service; everything else is passed down.
 from __future__ import annotations
 
 import logging
+import os
 import sys
+
+from telegram.constants import ParseMode
+from telegram.error import BadRequest, TelegramError
 
 from .agent.service import AgentService
 from .attachments import AttachmentStore
-from .config import Config, ConfigError, load_config
+from .config import Config, ConfigError, McpServer, load_config
 from .database.audit import RepositoryToolAuditor
+from .database.oauth import OAuthStorageImpl
 from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
 from .llm.client import OpenAIClient
 from .logging_setup import configure_logging
 from .mcp import McpManager
+from .mcp.auth import (
+    GoogleOAuthProvider,
+    McpOAuthAuth,
+    OAuthManager,
+    OAuthProvider,
+    build_oauth_callback_server,
+)
 from .telegram.approval import TelegramApprovalBroker
 from .telegram.bot import build_application, compose_startup_hooks, register_command_menu
 from .tools import build_policy
 from .tools.builtin import build_default_tools
 
 logger = logging.getLogger("main")
+
+# Phase 4.x: the *only* place that knows a provider's concrete env-var names.
+# This is the single provider registry — the rest of the codebase (config,
+# manager, storage, the Telegram layer) stays provider-agnostic and never
+# special-cases "google".
+_GOOGLE_CLIENT_ID_ENV = "GOOGLE_OAUTH_CLIENT_ID"
+_GOOGLE_CLIENT_SECRET_ENV = "GOOGLE_OAUTH_CLIENT_SECRET"
+_GOOGLE_SCOPES_ENV = "GOOGLE_OAUTH_SCOPES"
 
 
 class AgentBackend:
@@ -75,6 +95,18 @@ class AgentBackend:
         auditor = RepositoryToolAuditor(self.repository) if registry else None
         broker = TelegramApprovalBroker(self.repository) if registry else None
         self.approval_broker = broker
+        # Phase 4.x: user-level OAuth for MCP. The manager is built **only**
+        # when a callback base URL is configured *and* at least one provider's
+        # client credentials are present *and* at least one server declares
+        # user-level OAuth — otherwise it does not exist, no callback server
+        # starts, and ``/mcp auth`` simply reports "not configured". The
+        # provider's client id/secret are read from the environment **here and
+        # only here** (in-memory; never stored on config, never logged).
+        self.oauth_manager: OAuthManager | None = None
+        self.oauth_callback_server = None
+        self._oauth_providers: dict[str, OAuthProvider] = {}
+        self._has_oauth = False
+        self._setup_oauth()
         # Phase 4: remote MCP tool provider. Built **only** when tools are
         # enabled *and* at least one server is configured — with no servers
         # there is nothing to connect, so the manager does not exist and no MCP
@@ -87,6 +119,7 @@ class AgentBackend:
                 config.mcp_servers,
                 connect_timeout_seconds=config.mcp_connect_timeout_seconds,
                 max_result_chars=config.max_mcp_tool_result_chars,
+                oauth_auth_factory=self._mcp_oauth_auth if self._has_oauth else None,
             )
             if (config.enable_tools and config.mcp_servers)
             else None
@@ -113,13 +146,103 @@ class AgentBackend:
             tool_approval_timeout_seconds=config.tool_approval_timeout_seconds,
         )
         application = build_application(
-            config, self.service, self.repository, approval_broker=broker, mcp_manager=self.mcp_manager
+            config,
+            self.service,
+            self.repository,
+            approval_broker=broker,
+            mcp_manager=self.mcp_manager,
+            oauth_manager=self.oauth_manager,
         )
         # Chain the Telegram adapter's command-menu registration with our own
         # DB init into a single post_init (both run inside the app's loop).
         application.post_init = compose_startup_hooks(register_command_menu, self._post_init)
         application.post_shutdown = self._post_shutdown
         self.application = application
+
+    # Phase 4.x: user-level OAuth setup (provider registry + manager) -----------
+    def _setup_oauth(self) -> None:
+        """Build the OAuth provider registry and :class:`OAuthManager`, if at all.
+
+        OAuth is activated only when **all** of these hold: a callback base URL
+        is configured, at least one MCP server declares ``auth_type == "oauth"``,
+        and every referenced provider's client credentials are present in the
+        environment. A missing provider credential leaves that provider out of
+        the registry (its server reports ``provider_not_configured``) rather
+        than failing the whole startup — the bot must never fail to boot because
+        an optional credential is absent. A provider is referenced but has
+        *both* credentials missing vs present is decided purely on the env; the
+        *name* → env mapping lives only here.
+        """
+        config = self.config
+        if config.oauth_callback_base_url is None:
+            return
+        oauth_servers = [s for s in config.mcp_servers if s.auth_type == "oauth"]
+        if not oauth_servers:
+            return
+        # Build each referenced provider from its env credentials (in-memory).
+        for spec in oauth_servers:
+            provider = self._build_provider(spec.auth_provider)
+            if provider is not None and provider.name not in self._oauth_providers:
+                self._oauth_providers[provider.name] = provider
+        server_providers = {spec.name: spec.auth_provider for spec in oauth_servers}
+        if not self._oauth_providers:
+            # No provider could be built (missing credentials): leave OAuth
+            # off. ``/mcp auth`` then reports "OAuth not configured" for every
+            # OAuth server, and the servers fail to start with a stable code.
+            return
+        self._has_oauth = True
+        self.oauth_manager = OAuthManager(
+            storage=OAuthStorageImpl(self.session_factory),
+            providers=self._oauth_providers,
+            server_providers=server_providers,
+            callback_base_url=config.oauth_callback_base_url,
+            state_ttl_seconds=config.oauth_state_ttl_seconds,
+            notifier=self._oauth_notifier,
+        )
+
+    def _build_provider(self, provider_name: str) -> OAuthProvider | None:
+        """The single, explicit provider registry (env names live **here only**).
+
+        A future GitHub / Microsoft provider is a new branch here plus a new
+        env pair — nothing elsewhere learns about it.
+        """
+        if provider_name == "google":
+            client_id = os.environ.get(_GOOGLE_CLIENT_ID_ENV, "").strip()
+            client_secret = os.environ.get(_GOOGLE_CLIENT_SECRET_ENV, "").strip()
+            if not client_id or not client_secret:
+                return None
+            scopes_raw = os.environ.get(_GOOGLE_SCOPES_ENV, "").strip()
+            scopes = tuple(s.strip() for s in scopes_raw.split() if s.strip())
+            return GoogleOAuthProvider(client_id=client_id, client_secret=client_secret, scopes=scopes)
+        return None
+
+    def _mcp_oauth_auth(self, spec: "McpServer") -> McpOAuthAuth:
+        """The per-user token hook for one OAuth MCP server (phase 4.x)."""
+        return McpOAuthAuth(manager=self.oauth_manager, mcp_server=spec.name)
+
+    async def _oauth_notifier(self, telegram_user_id: int, chat_id: int, mcp_server: str, ok: bool) -> None:
+        """Notify the user in Telegram after an OAuth outcome (same loop).
+
+        Runs inside the application's event loop (the callback server is a task
+        on it), so it can drive the bot directly. Never sends a token, code,
+        secret, or the callback URL — only the fixed, secret-free outcome text.
+        A send failure is logged and swallowed (the callback still succeeded).
+        """
+        if self.application is None or self.application.bot is None:
+            return
+        if ok:
+            text = f"✓ **{mcp_server}** connected.\n\nYour account is now available to the Agent."
+        else:
+            text = f"✗ **{mcp_server}** authorization was not completed."
+        try:
+            await self.application.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        except BadRequest:
+            try:
+                await self.application.bot.send_message(chat_id=chat_id, text=text.replace("**", ""))
+            except TelegramError:
+                logger.warning("oauth notifier send failed", extra={"server": mcp_server})
+        except TelegramError:
+            logger.warning("oauth notifier send failed", extra={"server": mcp_server})
 
     # PTB lifecycle hooks (run inside the application's own event loop) ------
     async def _post_init(self, application) -> None:
@@ -141,6 +264,16 @@ class AgentBackend:
             if discovered:
                 self.registry.add(*discovered)
                 mcp_tool_count = len(discovered)
+        # Phase 4.x: start the minimal OAuth callback server (only when OAuth is
+        # configured). It runs as a task on *this* loop, so the callback handler
+        # and the Telegram notifier share the polling bot's loop. A failure to
+        # bind (e.g. the port is taken) never stops the bot — it is logged and
+        # OAuth degrades to "unavailable".
+        if self.oauth_manager is not None:
+            self.oauth_callback_server = build_oauth_callback_server(
+                self.oauth_manager, port=self.config.oauth_callback_port
+            )
+            await self.oauth_callback_server.start()
         logger.info(
             "agent backend initialised",
             extra={
@@ -158,6 +291,11 @@ class AgentBackend:
         # decision resolves (expired) instead of hanging the shutdown.
         if self.approval_broker is not None:
             await self.approval_broker.shutdown()
+        # Stop the OAuth callback listener before the MCP sessions (idempotent,
+        # never raises) — an in-flight callback after this is rejected by the
+        # manager as invalid/expired state, not by a dead loop.
+        if self.oauth_callback_server is not None:
+            await self.oauth_callback_server.stop()
         # Close the MCP sessions (and their HTTP transports/clients) before the
         # LLM client and engine — ``close`` is idempotent and never raises.
         if self.mcp_manager is not None:

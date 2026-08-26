@@ -30,14 +30,23 @@ class McpServer:
     ``bearer_token_env`` is the *name* of an environment variable holding the
     bearer token — **never the token itself** (the token stays env-only, out of
     the frozen config and out of logs). It is ``None`` when the server needs no
-    auth. The ``url`` is guaranteed, at config-parse time, to be an absolute
-    ``https://`` URL (``http://`` only under an explicit insecure opt-in) with no
-    userinfo, fragment, query, or missing host.
+    operator bearer auth. The ``url`` is guaranteed, at config-parse time, to be
+    an absolute ``https://`` URL (``http://`` only under an explicit insecure
+    opt-in) with no userinfo, fragment, query, or missing host.
+
+    ``auth_type`` / ``auth_provider`` (phase 4.x) declare *user-level* OAuth:
+    ``auth_type`` is ``"none"`` (the default) or ``"oauth"``; when ``"oauth"``
+    the ``auth_provider`` (e.g. ``"google"``) names the OAuth provider whose
+    *per-user* access token is attached to this server's requests at request
+    time. The provider's client id/secret are read from the environment and are
+    never stored here.
     """
 
     name: str
     url: str
-    bearer_token_env: str | None
+    bearer_token_env: str | None = None
+    auth_type: str = "none"
+    auth_provider: str | None = None
 
 
 def _load_env() -> None:
@@ -95,6 +104,19 @@ class Config:
     mcp_connect_timeout_seconds: float = 10.0
     max_mcp_tool_result_chars: int = 10000
     mcp_allow_insecure_http: bool = False
+
+    # Phase 4.x: user-level OAuth for MCP servers. ``oauth_callback_base_url``
+    # is the public base (no trailing slash, validated) that the OAuth provider
+    # redirects to at ``<base>/oauth/callback``; ``None`` = OAuth is not
+    # configured and the callback server never starts. ``oauth_state_ttl_seconds``
+    # bounds a pending authorization's lifetime (single-use state). The Google
+    # client id/secret are read from the *environment* at provider-build time in
+    # the composition root — they are never stored on this frozen config and
+    # never logged. ``oauth_callback_port`` is where the minimal callback HTTP
+    # server listens when OAuth is configured.
+    oauth_callback_base_url: str | None = None
+    oauth_callback_port: int = 8090
+    oauth_state_ttl_seconds: float = 600.0
 
     log_level: str = "INFO"
     log_color: str = "auto"  # "auto" | "true" | "false" — see logging_setup
@@ -160,6 +182,16 @@ class Config:
             raise ConfigError("MCP_CONNECT_TIMEOUT_SECONDS must be > 0")
         if self.max_mcp_tool_result_chars < 1:
             raise ConfigError("MAX_MCP_TOOL_RESULT_CHARS must be >= 1")
+        # Phase 4.x: OAuth knobs. The callback base URL (when set) must be an
+        # absolute http(s) URL with a host and no trailing slash / userinfo /
+        # fragment / query — it is the public redirect base the OAuth provider
+        # is told, so a malformed one must fail at startup, never at callback.
+        if self.oauth_callback_base_url is not None:
+            _validate_oauth_callback_base(self.oauth_callback_base_url)
+        if not 1 <= self.oauth_callback_port <= 65535:
+            raise ConfigError("OAUTH_CALLBACK_PORT must be a port in 1..65535")
+        if self.oauth_state_ttl_seconds <= 0:
+            raise ConfigError("OAUTH_STATE_TTL_SECONDS must be > 0")
 
     @property
     def max_image_size_bytes(self) -> int:
@@ -255,7 +287,85 @@ _MCP_SERVER_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _MCP_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # The only fields a server entry may carry. Any other key is rejected — a typo
 # in the config is a startup error, never silently dropped.
-_MCP_SERVER_FIELDS = frozenset({"name", "url", "bearer_token_env"})
+_MCP_SERVER_FIELDS = frozenset({"name", "url", "bearer_token_env", "authentication"})
+# The only fields the optional ``authentication`` object may carry.
+_MCP_AUTH_FIELDS = frozenset({"type", "provider"})
+# ``auth_type`` values; ``oauth`` is the only authenticated kind this phase
+# implements (api_key / basic / custom are out of scope).
+_MCP_AUTH_TYPES = frozenset({"none", "oauth"})
+# A provider id (e.g. "google") — lowercase letters/digits/dashes. Validated
+# here so a typo'd provider fails at startup; *which providers actually exist*
+# is resolved at composition time against the built providers, not here.
+_MCP_AUTH_PROVIDER_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+
+def _validate_oauth_callback_base(base: str) -> None:
+    """Raise :class:`ConfigError` unless ``base`` is a safe, absolute callback base.
+
+    ``OAUTH_CALLBACK_BASE_URL`` is the public origin the OAuth provider
+    redirects to (``<base>/oauth/callback``). Rules (startup, fail-fast):
+      * absolute, scheme ``http`` or ``https``, with a non-empty host;
+      * no trailing slash, no userinfo, no fragment, no query — the redirect
+        path is appended by the manager, and anything else would make the
+        redirect URI the provider is told differ from the real endpoint.
+
+    The full URL is **never** echoed in the error message (it is an operator
+    secret-adjacent endpoint); only the field name is named.
+    """
+    try:
+        parsed = urlparse(base)
+    except ValueError as exc:
+        raise ConfigError(f"invalid OAUTH_CALLBACK_BASE_URL: {type(exc).__name__}") from exc
+    if parsed.scheme not in ("http", "https"):
+        raise ConfigError("OAUTH_CALLBACK_BASE_URL must be an absolute http(s) URL")
+    if not parsed.netloc or not parsed.hostname:
+        raise ConfigError("OAUTH_CALLBACK_BASE_URL must include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigError("OAUTH_CALLBACK_BASE_URL must not embed userinfo (credentials)")
+    if parsed.path or parsed.fragment or parsed.query:
+        raise ConfigError("OAUTH_CALLBACK_BASE_URL must be a bare origin (no path, query, or fragment)")
+    if base.rstrip() != base or base.endswith("/"):
+        raise ConfigError("OAUTH_CALLBACK_BASE_URL must not have a trailing slash")
+
+
+def _parse_mcp_authentication(entry: dict, *, where: str) -> tuple[str, str | None]:
+    """Parse + validate one server's optional ``authentication`` object.
+
+    Returns ``(auth_type, auth_provider)``. ``None``/absent → ``("none", None)``.
+    An ``oauth`` type **requires** a provider id and **forbids**
+    ``bearer_token_env`` (a server is either operator-bearer-authenticated or
+    user-OAuth-authenticated, never both). Every violation is a startup
+    :class:`ConfigError` naming the server and the field.
+    """
+    auth = entry.get("authentication")
+    if auth is None:
+        return "none", None
+    if not isinstance(auth, dict):
+        raise ConfigError(f"{where} 'authentication' must be a JSON object")
+    unknown = set(auth) - _MCP_AUTH_FIELDS
+    if unknown:
+        raise ConfigError(f"{where} 'authentication' has unknown field(s): {', '.join(sorted(unknown))}")
+    auth_type = auth.get("type")
+    if not isinstance(auth_type, str) or auth_type not in _MCP_AUTH_TYPES:
+        raise ConfigError(f"{where} 'authentication.type' must be one of {sorted(_MCP_AUTH_TYPES)}")
+    provider = auth.get("provider")
+    if auth_type == "none":
+        if provider is not None:
+            raise ConfigError(f"{where} 'authentication' with type 'none' must not set 'provider'")
+        return "none", None
+    # oauth
+    if not isinstance(provider, str) or not provider:
+        raise ConfigError(
+            f"{where} 'authentication' with type 'oauth' requires a 'provider' (non-empty string)"
+        )
+    if not _MCP_AUTH_PROVIDER_RE.match(provider):
+        raise ConfigError(
+            f"{where} 'authentication.provider' {provider!r} is invalid "
+            "(lowercase letters, digits, '-'; must start with a letter)"
+        )
+    if entry.get("bearer_token_env") is not None:
+        raise ConfigError(f"{where} cannot set both 'bearer_token_env' and user-level 'authentication'")
+    return "oauth", provider
 
 
 def _validate_mcp_url(url: str, *, allow_insecure_http: bool) -> None:
@@ -354,7 +464,16 @@ def _parse_mcp_servers(raw: str, *, allow_insecure_http: bool) -> tuple[McpServe
                 raise ConfigError(
                     f"{where} references bearer token env {token_env!r}, which is not set (or is empty)"
                 )
-        servers.append(McpServer(name=name, url=url, bearer_token_env=token_env))
+        auth_type, auth_provider = _parse_mcp_authentication(entry, where=where)
+        servers.append(
+            McpServer(
+                name=name,
+                url=url,
+                bearer_token_env=token_env,
+                auth_type=auth_type,
+                auth_provider=auth_provider,
+            )
+        )
     return tuple(servers)
 
 
@@ -381,6 +500,17 @@ def load_config() -> Config:
     mcp_servers = _parse_mcp_servers(
         os.environ.get("MCP_SERVERS", ""), allow_insecure_http=mcp_allow_insecure_http
     )
+    # Phase 4.x: user-level OAuth for MCP. The callback base URL is optional —
+    # unset means OAuth is not configured (no callback server, and ``/mcp auth``
+    # reports "not configured"). The Google client id/secret are intentionally
+    # **not** read here: they are read from the environment only when the
+    # composition root builds the Google provider, so a config object never
+    # carries them and they can never be logged from one.
+    oauth_callback_base_url = os.environ.get("OAUTH_CALLBACK_BASE_URL", "").strip() or None
+    if oauth_callback_base_url is not None:
+        _validate_oauth_callback_base(oauth_callback_base_url)
+    oauth_callback_port = _parse_int(os.environ.get("OAUTH_CALLBACK_PORT", ""), 8090)
+    oauth_state_ttl_seconds = _parse_float(os.environ.get("OAUTH_STATE_TTL_SECONDS", ""), 600.0)
     return Config(
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         allowed_user_ids=_parse_user_ids(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")),
@@ -408,6 +538,9 @@ def load_config() -> Config:
         mcp_connect_timeout_seconds=mcp_connect_timeout_seconds,
         max_mcp_tool_result_chars=max_mcp_tool_result_chars,
         mcp_allow_insecure_http=mcp_allow_insecure_http,
+        oauth_callback_base_url=oauth_callback_base_url,
+        oauth_callback_port=oauth_callback_port,
+        oauth_state_ttl_seconds=oauth_state_ttl_seconds,
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         log_color=_normalize_log_color(os.environ.get("LOG_COLOR", "")),
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,

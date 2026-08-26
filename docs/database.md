@@ -1,8 +1,8 @@
 # 数据库（SQLite）
 
 - 文件：默认 `./data/agent.db`（由 `DATABASE_URL` 决定）。
-- 启动时自动初始化（`CREATE TABLE IF NOT EXISTS` / `Base.metadata.create_all`），可安全重复启动。**升级不丢数据**：新版本表（`attachments`、`memories`）会在已有库上补建，无需手动 wipe、无需 Alembic。
-- **一个 Telegram chat 对应一个 conversation**，`/new` 只影响该 chat，**不触碰 `memories`**（记忆按 `scope` 归属账号，而非会话）。
+- 启动时自动初始化（`CREATE TABLE IF NOT EXISTS` / `Base.metadata.create_all`），可安全重复启动。**升级不丢数据**：新版本表（`attachments`、`memories`、`tool_audit_events`、`oauth_credentials`、`oauth_authorization_states`）会在已有库上补建，无需手动 wipe、无需 Alembic。
+- **一个 Telegram chat 对应一个 conversation**，`/new` 只影响该 chat，**不触碰 `memories`，也不触碰 OAuth 凭据 / 授权 state**（记忆按 `scope` 归属账号，OAuth 凭据按 Telegram user 归属，二者都与会话无关）。
 
 ## 表结构
 
@@ -67,6 +67,36 @@
 | `created_at` | 时间戳 |
 
 > 审计**只**存 `scope_hash` + 工具名 + 事件 + 结果码 +（若有）耗时——**绝不**存工具参数、结果、异常正文、图片或任何密钥。用 `/tool_audit [limit]` 查看（按 `scope_hash` 隔离，仅本人可见）。
+
+**oauth_credentials**（MCP 用户级 OAuth，phase 4.x）
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 自增主键 |
+| `telegram_user_id` | 凭据归属的 Telegram user id（**唯一键的组成**，带索引）——凭据按**用户**绑定，不按 chat / 会话 |
+| `provider` | OAuth provider 名（如 `google`，`String(32)`） |
+| `mcp_server` | 该凭据服务的 MCP 服务器名（`String(64)`） |
+| `access_token` | OAuth access token（**敏感**，只在库内，永不进日志/命令/异常文案） |
+| `refresh_token` | refresh token（可空；**敏感**，同上） |
+| `expires_at` | access token 过期时间（可空 = provider 未声明过期） |
+| `scopes` | 授予的 scope 列表（可空） |
+| `created_at` / `updated_at` | 时间戳 |
+
+> 唯一约束 `(telegram_user_id, provider, mcp_server)`——**每用户每服务器一条活跃凭据**；重新登录是 **upsert**（覆盖，不新增行）。跨用户隔离在 SQL 层：查别的 user id 等价于「不存在」。**`/new`（reset_conversation）绝不触碰本表**；重启后凭据仍在（SQLite 文件持久化）。
+
+**oauth_authorization_states**（OAuth 授权中的 state，phase 4.x）
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 自增主键 |
+| `state` | `secrets.token_urlsafe(32)` 生成的不透明 state（**唯一**） |
+| `telegram_user_id` | 发起登录的 Telegram user id（带索引） |
+| `chat_id` | 发起登录的 chat（登录结果通知回这里） |
+| `provider` / `mcp_server` | 本次授权针对的 provider 与 MCP 服务器 |
+| `expires_at` | state 过期时间（`OAUTH_STATE_TTL_SECONDS`，默认 600s） |
+| `created_at` | 时间戳 |
+
+> 每行**单次使用**：回调处理时「查 + 删」在同一事务内完成（重放无效），过期 / 未知 / 缺 `code` 一律作废。目标 (user, provider, server) **只**取自本表记录——回调 query 里伪造的参数无法改变凭据的归属。`/new` 同样**不触碰**本表。
 
 ## 直接查看（可选）
 

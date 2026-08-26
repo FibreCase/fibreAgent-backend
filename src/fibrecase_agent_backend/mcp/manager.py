@@ -37,15 +37,18 @@ import asyncio
 import contextlib
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 from jsonschema import Draft202012Validator
 
 from ..config import McpServer
 from ..tools import Tool
+from .auth.oauth_auth import McpOAuthAuth
 from .wrapper import McpTool, is_valid_remote_tool_name
 
 logger = logging.getLogger("mcp")
@@ -56,6 +59,8 @@ CODE_CONNECT_FAILED = "mcp_connect_failed"
 CODE_INITIALIZE_FAILED = "mcp_initialize_failed"
 CODE_DISCOVERY_FAILED = "mcp_discovery_failed"
 CODE_INVALID_TOOL = "mcp_invalid_tool"
+# Phase 4.x: an OAuth-configured server whose OAuth infrastructure was not wired.
+CODE_OAUTH_NOT_CONFIGURED = "mcp_oauth_not_configured"
 
 
 @dataclass
@@ -87,10 +92,17 @@ class McpManager:
         *,
         connect_timeout_seconds: float,
         max_result_chars: int,
+        oauth_auth_factory: "Callable[[McpServer], httpx2.Auth] | None" = None,
     ) -> None:
         self._servers = list(servers)
         self._connect_timeout = connect_timeout_seconds
         self._max_result_chars = max_result_chars
+        # Phase 4.x: for a server whose ``auth_type == "oauth"``, this factory
+        # returns the per-user :class:`McpOAuthAuth` that attaches the
+        # requesting user's access token to each request. ``None`` = no OAuth
+        # infrastructure was wired (an OAuth server then fails to start with a
+        # stable code instead of connecting unauthenticated).
+        self._oauth_auth_factory = oauth_auth_factory
         self._states: list[_ServerState] = []
         # One AsyncExitStack per healthy server keeps its http client, the
         # Streamable HTTP transport, and the ClientSession entered for the app
@@ -137,6 +149,18 @@ class McpManager:
     async def _start_one(self, state: _ServerState, taken: set[str]) -> None:
         """Bring up one server; on any failure leave it marked unavailable."""
         spec = state.spec
+        # Phase 4.x: an OAuth server requires the OAuth infrastructure (the
+        # per-user token auth) to have been wired by the composition root.
+        # Without it we must **not** connect unauthenticated — fail with a
+        # stable code; the rest of the fleet still starts.
+        if spec.auth_type == "oauth" and self._oauth_auth_factory is None:
+            logger.warning(
+                "mcp server unavailable (oauth not configured)",
+                extra={"server": spec.name, "code": CODE_OAUTH_NOT_CONFIGURED},
+            )
+            state.code = CODE_OAUTH_NOT_CONFIGURED
+            state.available = False
+            return
         stack = contextlib.AsyncExitStack()
         try:
             http_client = self._build_http_client(spec)
@@ -301,9 +325,23 @@ class McpManager:
 
     # ----------------------------------------------------------------- helpers
     def _build_http_client(self, spec: McpServer) -> Any:
-        """The outbound HTTP client for one server, carrying only a bearer auth
-        header when the server references a token env var. The token value is
-        read from the env at call time and **never** logged or stored."""
+        """The outbound HTTP client for one server.
+
+        Two mutually-exclusive authentication sources (enforced at config
+        parse):
+
+        * ``bearer_token_env`` — an *operator* token: read from the env at call
+          time and carried as a fixed ``Authorization`` header (phase 4).
+        * ``auth_type == "oauth"`` — a *per-user* token: the ``auth=`` hook
+          resolves the **requesting** Telegram user's valid access token for
+          this server on every request (phase 4.x) and attaches it; it never
+          logs the token, the header, the endpoint, or the user id.
+
+        The token value is never stored on the spec, never logged, never echoed.
+        """
+        if spec.auth_type == "oauth":
+            auth = self._oauth_auth_factory(spec) if self._oauth_auth_factory is not None else None
+            return create_mcp_http_client(auth=auth)
         headers: dict[str, str] = {}
         if spec.bearer_token_env:
             token = os.environ.get(spec.bearer_token_env, "")

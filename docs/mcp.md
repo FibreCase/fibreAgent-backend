@@ -9,6 +9,20 @@
 | 命令 | 作用 |
 | --- | --- |
 | `/mcp_status` | 只读查看已配置服务器的状态：每台的名称、`available`/`unavailable`、发现到的工具数，以及可用工具总数。**不**发起连接 / 刷新，也不调用 LLM 或 MCP；未配置或 `ENABLE_TOOLS=false` 时显示「MCP: disabled」；**绝不**显示 URL / host / token / 头 / 工具描述 / schema / 服务器 instructions / 失败细节。 |
+| `/mcp` | 只读查看 MCP 服务器状态（同 `/mcp_status`），**并且**对 OAuth 服务器显示**你本人**的登录状态（connected / 需要认证 / 未配置 / 已过期等）；别的用户的登录状态**永不**显示。 |
+| `/mcp auth <server>` | 为**你的账号**发起第三方 OAuth 登录：返回一个**内联 URL 按钮**（点一下即跳登录页，**从不**让你复制 URL）+ 一条有效期提示。发起的是 authorization-code flow（`state` 单次使用、带 TTL）。 |
+
+## 用户级 OAuth（phase 4.x）
+
+给 MCP 服务器配上**用户级 OAuth** 后（`MCP_SERVERS` 条目里 `"authentication": {"type": "oauth", "provider": "google"}`，与 `bearer_token_env` **互斥**），凭据按 **Telegram user** 绑定，而不是会话 / chat：
+
+- **登录流**：`/mcp auth gcal` → `OAuthManager.initiate` 生成 `state`（`secrets.token_urlsafe(32)`，存库、绑定 (user, chat, provider, server)、TTL 默认 600s）→ 把 provider 授权 URL 以**内联按钮**发出 → provider 302 回 `GET <OAUTH_CALLBACK_BASE_URL>/oauth/callback?state=…&code=…` → 回调服务器（starlette 应用，跑在 PTB 自己的事件循环里，`OAUTH_CALLBACK_PORT` 默认 8090）**消费 state（单次、原子）→ 换 token → 凭据落库 → Telegram 通知结果**（成功 / 拒绝 / 无效 / 过期，都是固定文案）。
+- **state 安全**：`state` 单次使用（消费即删，重放无效）、过期作废、未知作废、缺 `code` 作废；**目标 (user, provider, server) 来自库里的 pending 记录**——伪造 query 参数无法把凭据绑到别的用户 / provider / 服务器（spec §28 wrong-user / wrong-provider / wrong-server）。
+- **凭据**：`oauth_credentials` 表，唯一键 `(telegram_user_id, provider, mcp_server)`——**每用户每服务器一条活跃凭据**，重新登录是 upsert 不是新增。跨用户隔离：别人的凭据对查找不可区分于「不存在」。`/new`（`reset_conversation`）**绝不**触碰凭据或 pending state；**重启**后凭据仍在（SQLite 持久化）。
+- **自动刷新**：MCP 工具执行时由 `McpOAuthAuth`（`httpx2.Auth`，经 contextvar 拿到当前 principal）向 manager 要一个有效 access token：未过期直接用；临近/已过期则用 refresh token 刷新——provider 返回新 refresh token 就**持久化轮换后的**，不返回就**保留旧的**；**刷新失败不删凭据**（状态显示「已过期，重新登录」，重登是唯一恢复路径）。并发刷新有 per-(user, server) 锁，只刷一次。
+- **与 MCP client 的最小集成点**：oauth 类型服务器建 http client 时注入 `auth=McpOAuthAuth`；工具 loop 在 `tool.execute()` 周围 set/reset `active_principal`（`telegram:<user_id>`），所以**同一个** registry / gate / 审批 / 审计对 OAuth 服务器与 bearer 服务器一视同仁。启动握手（无 principal）不发 Authorization 头。现有 bearer / 无鉴权服务器完全不受影响。
+- **回调服务器**：只有 `GET /oauth/callback` 一条路由 + 其余固定 404；**不**监听在 PTB 之外——它作为任务跑在 long polling 的同一个事件循环里，随 bot 启停。日志**绝不**记 access_token / refresh_token / authorization code / client_secret / 完整回调 URL（含 query）。
+- **provider 无关**：`mcp/auth/provider.py` 是 `OAuthProvider` 抽象（`authorization_url` / `exchange_code` / `refresh_token`）；`main.py` 的 `_build_provider` 是**全代码库唯一**按 provider 名分派的地方（`google` 读 `GOOGLE_OAUTH_CLIENT_ID/SECRET/SCOPES`，仅在**该处**从 env 读、从不存到 config）。加新 provider = 实现 ABC + 在该处加一个分支，manager / 存储 / 回调 / 命令零改动。
 
 ## 启动发现（`mcp/manager.py`）
 
@@ -53,22 +67,31 @@
 - **URL 强校验**（启动期，`ConfigError`）：绝对 `https://` + host、无 userinfo / fragment / query；`http://` 默认拒绝（`MCP_ALLOW_INSECURE_HTTP=true` 才放行）。报错只点名服务器与字段，**从不**回显 token 值或完整 URL。
 - **日志 / 审计 / `/mcp_status` 永不**泄露：端点 URL / host、`Authorization` 头或 token、工具参数、工具结果、异常正文、服务器 instructions、原始 scope / user id、图片 / base64。启动失败只记**服务器名 + 稳定码**（异常只记**类名**）。审计沿用 Phase 3：只存 `scope_hash` + 工具名 + 事件 + 稳定码 +（可选）耗时。
 - **审批仍是回调、不是工具**：MCP 工具的 `ask` 审批走同一个 Telegram 回调 broker——模型无法用文本给自己批准。
+- **OAuth 凭据永不**出现在日志 / 审计 / 命令输出 / 异常文案里：access_token、refresh_token、authorization code、client_secret、`Authorization` 头、完整回调 URL（含 query）都不行。回调错误是**固定文案**，不带 provider 错误正文（可能含 token 或端点）。凭据表只存 token 本身与元数据，`/mcp` 只显示状态分类（connected / 需要认证 / 已过期 / 未配置），**不**显示 token、scope 原文或 provider 细节。
 
 ## 配置项
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `MCP_SERVERS` | 空 | JSON **数组**；空 = 不建 MCP 客户端、永不发起 MCP 网络连接。对象字段 `{ "name", "url", "bearer_token_env"? }`，见上。任何违规是启动期 `ConfigError`。 |
+| `MCP_SERVERS` | 空 | JSON **数组**；空 = 不建 MCP 客户端、永不发起 MCP 网络连接。对象字段 `{ "name", "url", "bearer_token_env"? , "authentication"? }`，见上；`authentication` 与 `bearer_token_env` 互斥。任何违规是启动期 `ConfigError`。 |
 | `MCP_CONNECT_TIMEOUT_SECONDS` | `10` | 每台服务器握手（连接/initialize/tools-list）超时秒数；超时 → 该服务器 unavailable，其余照常。必须 `> 0`。 |
 | `MAX_MCP_TOOL_RESULT_CHARS` | `10000` | 单个远程工具结果回传给模型的文本硬上限；超大 → `mcp_result_too_large`（不截断、不回显）。必须 `>= 1`。 |
 | `MCP_ALLOW_INSECURE_HTTP` | `false` | 硬开关允许 `http://`（明文）端点；默认仅 `https`。仅用于你控制的本地/内网可信端点。 |
+| `OAUTH_CALLBACK_BASE_URL` | 空 | 空 = OAuth 整体关闭（不建 provider、不起回调服务器）。非空必须是**裸 origin**：绝对 `http(s)://` + host、无 userinfo / path / query / fragment / 末尾斜杠，否则启动期 `ConfigError`。 |
+| `OAUTH_CALLBACK_PORT` | `8090` | 回调 HTTP 服务器监听端口（仅 OAuth 配置时启动）。`1..65535`。 |
+| `OAUTH_STATE_TTL_SECONDS` | `600` | 授权 state 存活秒数，过期后回调作废。必须 `> 0`。 |
+| `GOOGLE_OAUTH_CLIENT_ID` | 空 | google provider 的 client id。**只在** `main.py` 的 provider 注册处从 env 读（该处是唯一按 provider 名分派的地方），不存 config、不进日志。 |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | 空 | google provider 的 client secret，同上，env-only。 |
+| `GOOGLE_OAUTH_SCOPES` | 空 | OAuth scope 列表（**空白分隔**）。空 = Google Calendar 只读 scope。 |
 
-两个数值项在 `Config.__post_init__` 校验（`> 0` / `>= 1`），`MCP_SERVERS` 的结构在 `load_config` 里强校验。
+两个数值项在 `Config.__post_init__` 校验（`> 0` / `>= 1`），`MCP_SERVERS` 的结构（含 `authentication`）在 `load_config` 里强校验。
 
 ## 限制
 
-- **仅远程 Streamable HTTP 发现 + 调用**：只发现远程工具并转发调用；**不**做 stdio / subprocess / 本地起服务、**不**自动重连、**不**支持 resources / prompts / sampling / OAuth。
+- **仅远程 Streamable HTTP 发现 + 调用**：只发现远程工具并转发调用；**不**做 stdio / subprocess / 本地起服务、**不**自动重连、**不**支持 resources / prompts / sampling。
+- **OAuth 仅用户级、单 provider 起步**：凭据按 Telegram user 绑定，**不**支持群组 / 共享 / 多账号 / 账号切换 / Web 面板；本阶段内置 provider 仅 `google`（加新 provider 见上「provider 无关」）。
 - **只取文本结果**：非文本（image / audio / resource / tool-use / structured）、空、超大、异常都回稳定码、**不回显**。结果受 `MAX_MCP_TOOL_RESULT_CHARS` 硬上限约束。
 - **默认 `ask`**：远程工具默认走一次性审批（安全）；确认某远程工具确属只读无害，才可用 `TOOL_PERMISSION_OVERRIDES` 按命名空间名 pin 成 `allow`。
 - **无运行时重发现**：工具集在启动时确定；服务器新增/删除工具需重启进程才反映。
 - **不持久化 MCP 调用 transcript**：同 Phase 3，只持久化 user + 最终 assistant 轮；MCP 调用的元数据审计走 `tool_audit_events`（`/tool_audit` 可查）。
+- **刷新失败不自动重登**：access token 刷新失败时凭据**保留**（不删）、状态显示已过期——恢复路径是用户重新 `/mcp auth`，后端绝不悄悄重发登录链接。

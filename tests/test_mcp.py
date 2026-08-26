@@ -605,12 +605,22 @@ async def test_no_bearer_header_when_no_token_env(monkeypatch):
 # required #6 — a pre-2.5 DB needs no migration; no unexpected tables
 # ===========================================================================
 def test_phase4_adds_no_new_db_table():
-    # MCP is a tool *provider*; it persists no new table. The ORM table set is
-    # unchanged from the v1.6.0 schema, so an existing DB needs no migration.
+    # The MCP tool *provider* itself persists no table. Phase 4.x (user-level
+    # OAuth) is the only thing that added tables since: ``oauth_credentials``
+    # and ``oauth_authorization_states``. ``create_all`` adds them to a fresh
+    # DB *and* to a pre-4.x DB, so nothing else here changes.
     from fibrecase_agent_backend.database.models import Base
 
     tables = set(Base.metadata.tables)
-    assert tables == {"conversations", "messages", "attachments", "memories", "tool_audit_events"}
+    assert tables == {
+        "conversations",
+        "messages",
+        "attachments",
+        "memories",
+        "tool_audit_events",
+        "oauth_credentials",
+        "oauth_authorization_states",
+    }
 
 
 # ===========================================================================
