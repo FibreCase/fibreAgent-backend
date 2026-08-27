@@ -45,7 +45,7 @@ from ..agent.service import AgentError, AgentService, _user_safe_for
 from ..config import Config
 from ..database.repository import ConversationRepository
 from ..mcp.auth.models import OAuthError
-from .markdown import to_telegram_html_chunks
+from .markdown import to_telegram_html, to_telegram_html_chunks
 from .media import MediaError, normalize_message
 from .. import __version__
 
@@ -556,18 +556,6 @@ async def cmd_mcp_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 # MCP status + user-level OAuth (phase 4.x)
 # ---------------------------------------------------------------------------
-async def _send_long_html(chat: Chat, text: str, reply_markup=None) -> None:
-    """Send a short, already-HTML command reply (single message, no chunking).
-
-    The OAuth replies are always short; on an HTML parse failure they fall back
-    to plain text so a notice is never lost.
-    """
-    try:
-        await chat.send_message(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-    except BadRequest:
-        await _safe_reply(chat, text)
-
-
 async def cmd_mcp(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/mcp — show the caller's MCP status, or start an OAuth login.
 
@@ -637,7 +625,7 @@ async def _show_mcp_status(chat, user_id, config, manager, oauth_manager) -> Non
             lines.append(_oauth_lines.get(state, f"✓ **{spec.name}** — available"))
         else:
             lines.append(f"✓ **{spec.name}** — available")
-    await _send_long_html(chat, "\n".join(lines))
+    await _send_long(chat, "\n".join(lines))
 
 
 async def _start_mcp_auth(chat, user_id, server_name, oauth_manager) -> None:
@@ -677,7 +665,11 @@ async def _start_mcp_auth(chat, user_id, server_name, oauth_manager) -> None:
     )
     note = f"The authorization link expires in ~{minutes} minutes."
     try:
-        await chat.send_message(text=body, parse_mode=ParseMode.HTML, reply_markup=markup)
+        # body is Markdown; render it to HTML before the parse_mode=HTML send
+        # (this call carries the inline URL button, so it can't use _send_long).
+        await chat.send_message(
+            text=to_telegram_html(body), parse_mode=ParseMode.HTML, reply_markup=markup
+        )
         await _safe_reply(chat, note)
     except TelegramError:
         logger.error("failed to send oauth login prompt", extra={"server": server_name})
