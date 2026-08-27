@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
-from .tools.policy import ToolPolicyError, parse_tool_permission_overrides
+from .tools.permissions_file import PermissionsFileError, parse_permissions_json
 
 
 class ConfigError(RuntimeError):
@@ -25,28 +25,49 @@ class ConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class McpServer:
-    """One validated, operator-configured remote MCP Streamable HTTP server.
+    """One validated, operator-configured MCP server (Streamable HTTP **or** stdio).
 
-    ``bearer_token_env`` is the *name* of an environment variable holding the
-    bearer token — **never the token itself** (the token stays env-only, out of
-    the frozen config and out of logs). It is ``None`` when the server needs no
-    operator bearer auth. The ``url`` is guaranteed, at config-parse time, to be
-    an absolute ``https://`` URL (``http://`` only under an explicit insecure
-    opt-in) with no userinfo, fragment, query, or missing host.
+    ``transport`` is ``"http"`` (the default) or ``"stdio"``. The two transports
+    are mutually exclusive in their config:
 
-    ``auth_type`` / ``auth_provider`` (phase 4.x) declare *user-level* OAuth:
-    ``auth_type`` is ``"none"`` (the default) or ``"oauth"``; when ``"oauth"``
-    the ``auth_provider`` (e.g. ``"google"``) names the OAuth provider whose
-    *per-user* access token is attached to this server's requests at request
-    time. The provider's client id/secret are read from the environment and are
-    never stored here.
+    * ``http`` — ``url`` is required and guaranteed, at config-parse time, to be
+      an absolute ``https://`` URL (``http://`` only under an explicit insecure
+      opt-in) with no userinfo, fragment, query, or missing host.
+      ``bearer_token_env`` / ``authentication`` (http-only) may be present.
+    * ``stdio`` — ``command`` is required (the executable, PATH-resolved or
+      absolute); ``args`` / ``env`` / ``cwd`` are optional. ``url`` and any
+      auth (``bearer_token_env`` / ``authentication``) must be **absent** — a
+      spawned process has no HTTP request to carry a header on; a credential it
+      needs belongs in the process ``env``.
+
+    ``bearer_token_env`` (http-only) is the *name* of an environment variable
+    holding the bearer token — **never the token itself** (the token stays
+    env-only, out of the frozen config and out of logs). It is ``None`` when the
+    server needs no operator bearer auth.
+
+    ``auth_type`` / ``auth_provider`` (phase 4.x, http-only) declare *user-level*
+    OAuth: ``auth_type`` is ``"none"`` (the default) or ``"oauth"``; when
+    ``"oauth"`` the ``auth_provider`` (e.g. ``"google"``) names the OAuth
+    provider whose *per-user* access token is attached to this server's requests
+    at request time. The provider's client id/secret are read from the
+    environment and are never stored here. Both are ``"none"``/``None`` on a
+    stdio server.
+
+    The stdio ``command`` / ``args`` / ``cwd`` are **operator config** and must
+    never be reachable from the model, chat input, memory, or tool arguments —
+    the same guarantee the http ``url`` already has.
     """
 
     name: str
-    url: str
+    transport: str = "http"
+    url: str = ""
     bearer_token_env: str | None = None
     auth_type: str = "none"
     auth_provider: str | None = None
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    env: tuple[tuple[str, str], ...] = ()
+    cwd: str | None = None
 
 
 def _load_env() -> None:
@@ -88,18 +109,26 @@ class Config:
     max_retrieved_memories: int = 5
     max_memory_estimated_tokens: int = 3000
 
-    # Phase 3: tool security. The permission map is pre-parsed into
-    # name→ToolPermission (empty = use each tool's declared default, which is
-    # ``ask`` unless a built-in opted into ``allow``). Both timeouts are seconds.
-    tool_permission_overrides: dict = field(default_factory=dict)
+    # Phase 3/4.x: tool security. ``mcp_permissions_file`` (a CWD-relative path,
+    # ``None`` when unset) is the dedicated JSON file that holds the MCP-tool
+    # permission overrides (``mcp_<server>__<remote>``) — it replaces the old
+    # inline ``TOOL_PERMISSION_OVERRIDES`` env var. The backend maintains the
+    # file (seeds it with the discovered tools at startup and hot-reloads it),
+    # and built-ins are *not* in it — they always use their declared defaults.
+    # A present-but-malformed file is a startup ConfigError; a missing/blank one
+    # means "no overrides" (all MCP tools default ``ask``). Both timeouts are seconds.
+    mcp_permissions_file: Path | None = None
     tool_approval_timeout_seconds: float = 60.0
     tool_timeout_seconds: float = 30.0
 
-    # Phase 4: remote MCP tool provider (Streamable HTTP). ``mcp_servers`` is the
-    # parsed, validated list (empty = no MCP servers → the manager never starts
-    # and no MCP network connection is ever made). The two numeric knobs are
-    # seconds / max-chars and both must be positive; ``mcp_allow_insecure_http``
-    # is a hard opt-in to ``http://`` (default off → https-only).
+    # Phase 4: MCP tool provider (Streamable HTTP + stdio). ``mcp_servers`` is the
+    # parsed, validated list, read from ``MCP_SERVERS_FILE`` (a JSON array in a
+    # separate file, the preferred source) or, when that is unset, the inline
+    # ``MCP_SERVERS`` JSON string. Empty = no MCP servers → the manager never
+    # starts and no MCP connection / process is ever opened. The two numeric
+    # knobs are seconds / max-chars and both must be positive;
+    # ``mcp_allow_insecure_http`` is a hard opt-in to ``http://`` (default off →
+    # https-only; http-only).
     mcp_servers: tuple = field(default_factory=tuple)
     mcp_connect_timeout_seconds: float = 10.0
     max_mcp_tool_result_chars: int = 10000
@@ -159,18 +188,8 @@ class Config:
                 "MAX_MEMORY_ESTIMATED_TOKENS must be <= MAX_CONTEXT_ESTIMATED_TOKENS "
                 "(the memory sub-budget cannot exceed the total context budget)"
             )
-        # Phase 3: tool-security knobs. The permission map was already parsed
-        # (malformed / illegal-policy / duplicate entries raised ConfigError in
-        # load_config); here we check the *names* match the allowed tool-name
-        # charset and that both timeouts are positive. A botched security setting
-        # is a startup error, never silently ignored.
-        _tool_name_re = re.compile(r"^[A-Za-z0-9_-]+$")
-        for tool_name in self.tool_permission_overrides:
-            if not _tool_name_re.match(tool_name):
-                raise ConfigError(
-                    f"TOOL_PERMISSION_OVERRIDES tool name {tool_name!r} is invalid "
-                    "(only letters, digits, '_', '-' are allowed)"
-                )
+        # Phase 3: tool-security timeouts must be positive. (The MCP-permissions
+        # file is validated in load_config when it is a real, non-blank file.)
         if self.tool_approval_timeout_seconds <= 0:
             raise ConfigError("TOOL_APPROVAL_TIMEOUT_SECONDS must be > 0")
         if self.tool_timeout_seconds <= 0:
@@ -286,13 +305,28 @@ _MCP_SERVER_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 # env at startup; the *name* is validated here).
 _MCP_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # The only fields a server entry may carry. Any other key is rejected — a typo
-# in the config is a startup error, never silently dropped.
-_MCP_SERVER_FIELDS = frozenset({"name", "url", "bearer_token_env", "authentication"})
+# in the config is a startup error, never silently dropped. ``url`` + auth
+# (``bearer_token_env`` / ``authentication``) are http-transport fields;
+# ``command`` / ``args`` / ``env`` / ``cwd`` are stdio-transport fields. The
+# transport itself is named by the optional ``transport`` key ("http"/"stdio",
+# default "http"); which of these apply is decided by that key, not their
+# mere presence.
+_MCP_SERVER_FIELDS = frozenset(
+    {"name", "transport", "url", "command", "args", "env", "cwd", "bearer_token_env", "authentication"}
+)
 # The only fields the optional ``authentication`` object may carry.
 _MCP_AUTH_FIELDS = frozenset({"type", "provider"})
 # ``auth_type`` values; ``oauth`` is the only authenticated kind this phase
 # implements (api_key / basic / custom are out of scope).
 _MCP_AUTH_TYPES = frozenset({"none", "oauth"})
+# ``transport`` values. ``http`` is the default (remote Streamable HTTP);
+# ``stdio`` spawns a local process.
+_MCP_TRANSPORTS = frozenset({"http", "stdio"})
+# A stdio ``command`` — the executable only (args go in ``args``). No shell is
+# ever invoked, so this must be a bare executable name or an absolute/relative
+# path: letters, digits, and ``_ ./ -`` (a leading ``/`` or ``./`` is how a
+# relative/absolute path reads). No whitespace, no metacharacters.
+_MCP_COMMAND_RE = re.compile(r"^[A-Za-z0-9_./-]{1,256}$")
 # A provider id (e.g. "google") — lowercase letters/digits/dashes. Validated
 # here so a typo'd provider fails at startup; *which providers actually exist*
 # is resolved at composition time against the built providers, not here.
@@ -401,18 +435,141 @@ def _validate_mcp_url(url: str, *, allow_insecure_http: bool) -> None:
         raise ConfigError("MCP server URL must not include a query string")
 
 
-def _parse_mcp_servers(raw: str, *, allow_insecure_http: bool) -> tuple[McpServer, ...]:
-    """Parse + strictly validate ``MCP_SERVERS`` into a tuple of :class:`McpServer`.
+def _parse_mcp_stdio_args(entry: dict, *, where: str) -> tuple[str, ...]:
+    """Parse a stdio server's optional ``args`` (a JSON array of strings).
 
-    The value is a JSON *array*; each element is an object with ``name`` (unique,
-    matching the name charset), ``url`` (a safe absolute URL — see
-    :func:`_validate_mcp_url`), and optional ``bearer_token_env`` (an env-var
-    *name* whose value must be present and non-empty at startup). An empty /
-    blank value yields an empty tuple (no MCP servers). Anything malformed —
-    invalid JSON, a non-array, a non-object entry, an unknown field, a bad name
-    or URL, a duplicate name, a malformed env-var name, or a referenced env var
-    that is missing/empty — is a startup :class:`ConfigError`. Error messages
-    name the *server* and the *field*, never a token or the full URL.
+    ``None``/absent → empty tuple. The values are passed verbatim to the child
+    process (no shell, so no expansion) — an empty element or a non-string is a
+    startup :class:`ConfigError`.
+    """
+    args = entry.get("args")
+    if args is None:
+        return ()
+    if not isinstance(args, list):
+        raise ConfigError(f"{where} 'args' must be a JSON array of strings")
+    parsed: list[str] = []
+    for index, value in enumerate(args):
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"{where} 'args[{index}]' must be a non-empty string")
+        parsed.append(value)
+    return tuple(parsed)
+
+
+def _parse_mcp_stdio_env(entry: dict, *, where: str) -> tuple[tuple[str, str], ...]:
+    """Parse a stdio server's optional ``env`` (an object of name → value).
+
+    ``None``/absent → empty tuple. Keys must be valid env-var names and values
+    non-empty strings; the *value* may hold a credential, so a validation error
+    names only the offending **key**, never the value.
+    """
+    env = entry.get("env")
+    if env is None:
+        return ()
+    if not isinstance(env, dict):
+        raise ConfigError(f"{where} 'env' must be a JSON object (env-var name → value)")
+    if not env:
+        raise ConfigError(f"{where} 'env' must not be empty when present")
+    pairs: list[tuple[str, str]] = []
+    for key, value in env.items():
+        if not isinstance(key, str) or not key:
+            raise ConfigError(f"{where} 'env' keys must be non-empty strings")
+        if not _MCP_ENV_NAME_RE.match(key):
+            raise ConfigError(f"{where} 'env' key {key!r} is not a valid env-var name")
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"{where} 'env' value for {key!r} must be a non-empty string")
+        pairs.append((key, value))
+    return tuple(pairs)
+
+
+def _load_mcp_servers_text() -> str:
+    """Return the raw MCP-servers JSON *text* to validate, choosing its source.
+
+    ``MCP_SERVERS_FILE`` (a path, relative to the working directory) is the
+    preferred source for multiple / stdio servers: when set and non-empty, the
+    JSON array is read from that file and the inline ``MCP_SERVERS`` is ignored
+    (the file wins — not an error). When ``MCP_SERVERS_FILE`` is absent/blank the
+    inline ``MCP_SERVERS`` value is used, exactly as before (full backward
+    compatibility). A configured-but-missing or unreadable file, or a
+    file that is blank (0-byte / whitespace-only), is a startup
+    :class:`ConfigError` naming the path — a set-but-empty file must not silently
+    disable servers (an explicit ``[]`` is still valid and means "none").
+    """
+    file_path = os.environ.get("MCP_SERVERS_FILE", "").strip()
+    if file_path:
+        try:
+            text = Path(file_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"cannot read MCP_SERVERS_FILE '{file_path}': {exc.strerror or exc}") from exc
+        if not text.strip():
+            raise ConfigError(
+                f"MCP_SERVERS_FILE '{file_path}' is empty; it must contain a JSON array "
+                'of server objects (use "[]" for none, or unset MCP_SERVERS_FILE)'
+            )
+        return text
+    return os.environ.get("MCP_SERVERS", "")
+
+
+def _load_mcp_permissions_file(enable_tools: bool) -> Path | None:
+    """Resolve ``MCP_PERMISSIONS_FILE`` to a :class:`Path` (or ``None``) and
+    apply the **fail-to-start** gate.
+
+    * Unset / blank → ``None`` (no permissions file; all MCP tools default
+      ``ask``) — never an error.
+    * Set but the file is **missing or blank** → ``Path`` (fine — "no
+      overrides"; the backend seeds it at startup).
+    * Set, a real non-blank file, and it is **malformed** (invalid JSON /
+      non-array / bad entry / duplicate) → :class:`ConfigError`. A botched
+      security setting is never silently ignored (and would otherwise weaken a
+      pinned ``deny`` to ``ask``).
+
+    The malformed check runs only when tools are enabled (with tools off there
+    is no policy to gate, so a stale file must not block startup). The path is
+    CWD-relative by construction (like ``MCP_SERVERS_FILE``); only the offending
+    field/tool is named, never the file's other contents.
+    """
+    raw = os.environ.get("MCP_PERMISSIONS_FILE", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return path
+    except OSError as exc:
+        raise ConfigError(f"cannot read MCP_PERMISSIONS_FILE '{raw}': {exc.strerror or exc}") from exc
+    if text.strip():
+        if not enable_tools:
+            return path
+        try:
+            parse_permissions_json(text)
+        except PermissionsFileError as exc:
+            raise ConfigError(f"invalid MCP_PERMISSIONS_FILE '{raw}': {exc}") from exc
+    return path
+
+
+def _parse_mcp_servers(raw: str, *, allow_insecure_http: bool) -> tuple[McpServer, ...]:
+    """Parse + strictly validate the raw MCP-servers JSON *text* into a tuple of
+    :class:`McpServer`. The text is a JSON *array* (read from ``MCP_SERVERS_FILE``
+    or the inline ``MCP_SERVERS`` — see :func:`_load_mcp_servers_text`); each
+    element is an object with ``name`` (unique, matching the name charset) and an
+    optional ``transport`` (``"http"`` default or ``"stdio"``). The two transports
+    are mutually exclusive in their fields:
+
+    * **http** — ``url`` is required (a safe absolute URL, see
+      :func:`_validate_mcp_url`), plus the optional http-only auth:
+      ``bearer_token_env`` (an env-var *name* whose value must be present and
+      non-empty at startup) and/or ``authentication`` (user-level OAuth).
+    * **stdio** — ``command`` is required (a bare executable name or path, no
+      shell), plus optional ``args`` (array of strings), ``env`` (object), and
+      ``cwd`` (string). ``url`` and any auth must be absent.
+
+    An empty / blank value yields an empty tuple (no MCP servers). Anything
+    malformed — invalid JSON, a non-array, a non-object entry, an unknown field,
+    a bad name, a bad transport, a transport field on the wrong transport, a
+    bad url/command/args/env, a duplicate name, a malformed env-var name, or a
+    referenced env var that is missing/empty — is a startup :class:`ConfigError`.
+    Error messages name the *server* and the *field*, never a token or the full
+    URL.
     """
     text = (raw or "").strip()
     if not text:
@@ -420,7 +577,7 @@ def _parse_mcp_servers(raw: str, *, allow_insecure_http: bool) -> tuple[McpServe
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ConfigError(f"invalid MCP_SERVERS JSON: {exc.msg}") from exc
+        raise ConfigError(f"invalid MCP server configuration JSON: {exc.msg}") from exc
     if not isinstance(data, list):
         raise ConfigError("MCP_SERVERS must be a JSON array of server objects")
 
@@ -447,31 +604,82 @@ def _parse_mcp_servers(raw: str, *, allow_insecure_http: bool) -> tuple[McpServe
             raise ConfigError(f"duplicate MCP server name: {name!r}")
         seen.add(name)
 
-        url = entry.get("url")
-        if not isinstance(url, str) or not url:
-            raise ConfigError(f"{where} is missing a valid 'url' (non-empty string)")
-        _validate_mcp_url(url, allow_insecure_http=allow_insecure_http)
+        transport = entry.get("transport")
+        if transport is None:
+            transport = "http"
+        if not isinstance(transport, str) or transport not in _MCP_TRANSPORTS:
+            raise ConfigError(
+                f"{where} 'transport' must be one of {sorted(_MCP_TRANSPORTS)} (got {transport!r})"
+            )
 
-        token_env = entry.get("bearer_token_env")
-        if token_env is not None:
-            if not isinstance(token_env, str) or not token_env:
-                raise ConfigError(f"{where} 'bearer_token_env' must be a non-empty string (an env-var name)")
-            if not _MCP_ENV_NAME_RE.match(token_env):
-                raise ConfigError(f"{where} 'bearer_token_env' {token_env!r} is not a valid env-var name")
-            # The *value* must exist and be non-empty at startup; the token itself
-            # is read only when the client is built and is never stored on the spec.
-            if not os.environ.get(token_env, "").strip():
-                raise ConfigError(
-                    f"{where} references bearer token env {token_env!r}, which is not set (or is empty)"
+        if transport == "http":
+            # Remote Streamable HTTP — the pre-stdio behaviour, unchanged.
+            url = entry.get("url")
+            if not isinstance(url, str) or not url:
+                raise ConfigError(f"{where} is missing a valid 'url' (non-empty string)")
+            _validate_mcp_url(url, allow_insecure_http=allow_insecure_http)
+            for field in ("command", "args", "env", "cwd"):
+                if entry.get(field) is not None:
+                    raise ConfigError(f"{where} is an http server and must not set '{field}' (a stdio field)")
+            token_env = entry.get("bearer_token_env")
+            if token_env is not None:
+                if not isinstance(token_env, str) or not token_env:
+                    raise ConfigError(f"{where} 'bearer_token_env' must be a non-empty string (an env-var name)")
+                if not _MCP_ENV_NAME_RE.match(token_env):
+                    raise ConfigError(f"{where} 'bearer_token_env' {token_env!r} is not a valid env-var name")
+                # The *value* must exist and be non-empty at startup; the token itself
+                # is read only when the client is built and is never stored on the spec.
+                if not os.environ.get(token_env, "").strip():
+                    raise ConfigError(
+                        f"{where} references bearer token env {token_env!r}, which is not set (or is empty)"
+                    )
+            auth_type, auth_provider = _parse_mcp_authentication(entry, where=where)
+            servers.append(
+                McpServer(
+                    name=name,
+                    transport="http",
+                    url=url,
+                    bearer_token_env=token_env,
+                    auth_type=auth_type,
+                    auth_provider=auth_provider,
                 )
-        auth_type, auth_provider = _parse_mcp_authentication(entry, where=where)
+            )
+            continue
+
+        # transport == "stdio" — spawn a local process.
+        if entry.get("url") is not None:
+            raise ConfigError(f"{where} is a stdio server and must not set 'url' (an http field)")
+        # Auth (bearer / user-level OAuth) is http-only — there is no request
+        # for a spawned process to attach a header to. A credential it needs
+        # belongs in the process 'env' instead.
+        if entry.get("bearer_token_env") is not None or entry.get("authentication") is not None:
+            raise ConfigError(
+                f"{where} is a stdio server and cannot use 'bearer_token_env'/'authentication' "
+                "(put any credential in its 'env')"
+            )
+        command = entry.get("command")
+        if not isinstance(command, str) or not command:
+            raise ConfigError(f"{where} is a stdio server and requires a valid 'command' (non-empty string)")
+        if not _MCP_COMMAND_RE.match(command):
+            raise ConfigError(
+                f"{where} 'command' {command!r} is invalid "
+                "(a bare executable name or path; letters, digits, '_', '.', '/', '-'; no whitespace)"
+            )
+        args = _parse_mcp_stdio_args(entry, where=where)
+        env = _parse_mcp_stdio_env(entry, where=where)
+        cwd = entry.get("cwd")
+        if cwd is not None:
+            if not isinstance(cwd, str) or not cwd:
+                raise ConfigError(f"{where} 'cwd' must be a non-empty string when present")
         servers.append(
             McpServer(
                 name=name,
-                url=url,
-                bearer_token_env=token_env,
-                auth_type=auth_type,
-                auth_provider=auth_provider,
+                transport="stdio",
+                url="",
+                command=command,
+                args=args,
+                env=env,
+                cwd=cwd,
             )
         )
     return tuple(servers)
@@ -484,21 +692,20 @@ def load_config() -> Config:
     provided via env (``OPENAI_*``), kept out of the repo for privacy.
     """
     _load_env()
-    # Phase 3: parse the tool permission overrides up front. A malformed /
-    # illegal / duplicate entry is a ConfigError (startup), never silently ignored.
-    try:
-        tool_permission_overrides = parse_tool_permission_overrides(
-            os.environ.get("TOOL_PERMISSION_OVERRIDES", "")
-        )
-    except ToolPolicyError as exc:
-        raise ConfigError(f"invalid TOOL_PERMISSION_OVERRIDES: {exc}") from exc
+    # Phase 2.1: whether the tool loop is on at all (needed below to decide
+    # whether a malformed MCP-permissions file is a startup error).
+    enable_tools = _parse_bool(os.environ.get("ENABLE_TOOLS", ""), True)
+    # Phase 4.x: the dedicated MCP-tool permission file. A set-but-malformed
+    # file (with tools on) is a ConfigError (fail-to-start); missing/blank is
+    # fine (the backend seeds it at startup). See _load_mcp_permissions_file.
+    mcp_permissions_file = _load_mcp_permissions_file(enable_tools)
     # Phase 4: parse the MCP knobs. The insecure-http opt-in is read first
     # because it gates how strict the per-server URL scheme check is.
     mcp_allow_insecure_http = _parse_bool(os.environ.get("MCP_ALLOW_INSECURE_HTTP", ""), False)
     mcp_connect_timeout_seconds = _parse_float(os.environ.get("MCP_CONNECT_TIMEOUT_SECONDS", ""), 10.0)
     max_mcp_tool_result_chars = _parse_int(os.environ.get("MAX_MCP_TOOL_RESULT_CHARS", ""), 10000)
     mcp_servers = _parse_mcp_servers(
-        os.environ.get("MCP_SERVERS", ""), allow_insecure_http=mcp_allow_insecure_http
+        _load_mcp_servers_text(), allow_insecure_http=mcp_allow_insecure_http
     )
     # Phase 4.x: user-level OAuth for MCP. The callback base URL is optional —
     # unset means OAuth is not configured (no callback server, and ``/mcp auth``
@@ -523,7 +730,7 @@ def load_config() -> Config:
         max_context_messages=_parse_int(os.environ.get("MAX_CONTEXT_MESSAGES", ""), 50),
         max_context_estimated_tokens=_parse_int(os.environ.get("MAX_CONTEXT_ESTIMATED_TOKENS", ""), 24000),
         context_image_estimated_tokens=_parse_int(os.environ.get("CONTEXT_IMAGE_ESTIMATED_TOKENS", ""), 2000),
-        enable_tools=_parse_bool(os.environ.get("ENABLE_TOOLS", ""), True),
+        enable_tools=enable_tools,
         max_tool_iterations=_parse_int(os.environ.get("MAX_TOOL_ITERATIONS", ""), 5),
         max_image_size_mb=_parse_float(os.environ.get("MAX_IMAGE_SIZE_MB", ""), 10.0),
         attachment_storage_path=Path(os.environ.get("ATTACHMENT_STORAGE_PATH", "./data/attachments")),
@@ -531,7 +738,7 @@ def load_config() -> Config:
         max_memory_chars=_parse_int(os.environ.get("MAX_MEMORY_CHARS", ""), 1000),
         max_retrieved_memories=_parse_int(os.environ.get("MAX_RETRIEVED_MEMORIES", ""), 5),
         max_memory_estimated_tokens=_parse_int(os.environ.get("MAX_MEMORY_ESTIMATED_TOKENS", ""), 3000),
-        tool_permission_overrides=tool_permission_overrides,
+        mcp_permissions_file=mcp_permissions_file,
         tool_approval_timeout_seconds=_parse_float(os.environ.get("TOOL_APPROVAL_TIMEOUT_SECONDS", ""), 60.0),
         tool_timeout_seconds=_parse_float(os.environ.get("TOOL_TIMEOUT_SECONDS", ""), 30.0),
         mcp_servers=mcp_servers,

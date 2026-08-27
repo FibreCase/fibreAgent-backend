@@ -1,34 +1,38 @@
-"""Startup discovery + lifecycle for remote MCP Streamable HTTP servers.
+"""Startup discovery + lifecycle for configured MCP servers (Streamable HTTP or stdio).
 
 :class:`McpManager` owns, for the lifetime of the application, one connected
-:class:`mcp.ClientSession` per configured server. At :meth:`start` it connects
-to each server (Streamable HTTP transport → ``initialize`` → ``tools/list``),
-and wraps every discovered tool as an :class:`~.wrapper.McpTool`. At :meth:`close`
-it shuts down every server in one place.
+:class:`mcp.ClientSession` per configured server. At :meth:`start` it brings up
+each server over its transport (Streamable HTTP **or** a spawned stdio process),
+then runs ``initialize`` → ``tools/list``, and wraps every discovered tool as an
+:class:`~.wrapper.McpTool`. At :meth:`close` it shuts down every server in one
+place (for a stdio server, closing its transport tears down the child process).
 
 Design constraints (from the phase-4 spec):
 
-* **Per-server failure isolation** — one server that fails to connect,
-  initialise, or list its tools is marked *unavailable* (with a stable code) and
-  skipped; every other server, and the built-in tools, still come up. The bot
-  must never fail to start because an *optional* MCP server is down.
+* **Per-server failure isolation** — one server that fails to connect (a stdio
+  command that cannot spawn, or an endpoint that is unreachable), initialise, or
+  list its tools is marked *unavailable* (with a stable code) and skipped; every
+  other server, and the built-in tools, still come up. The bot must never fail
+  to start because an *optional* MCP server is down.
 * **Atomic per-server discovery** — a server's tools are all-or-nothing: if any
   one discovered tool's name or ``input_schema`` is invalid (or would collide
   with an already-registered name), *none* of that server's tools are registered
   (the whole server is dropped and marked ``mcp_invalid_tool``).
 * **No reconnect** — this phase does not reconnect. A healthy session that later
-  drops causes a ``call_tool`` to raise, which the wrapper maps to
-  ``mcp_unavailable``; a fresh discovery happens only on the next process start.
+  drops (or a stdio process that exits) causes a ``call_tool`` to raise, which
+  the wrapper maps to ``mcp_unavailable``; a fresh discovery happens only on the
+  next process start.
 
 The manager depends only on the MCP SDK, ``httpx2`` (via the SDK's client
-helper), and :mod:`..config`'s :class:`McpServer`. It knows nothing about
-Telegram, the database, the OpenAI SDK, or ``AgentService`` — it merely yields
-``Tool`` objects for the composition root to register and a safe :meth:`status`
-for the ``/mcp_status`` command.
+helper, http path only), and :mod:`..config`'s :class:`McpServer`. It knows
+nothing about Telegram, the database, the OpenAI SDK, or ``AgentService`` — it
+merely yields ``Tool`` objects for the composition root to register and a safe
+:meth:`status` for the ``/mcp_status`` command.
 
 It logs **only** the server name and a stable code (plus, on an exception, the
 exception *class*). It never logs the full URL, the host, a header, the token,
-a tool's description/schema, the server's instructions, or any error body.
+a stdio ``command``/``args``/``env``/``cwd``, a tool's description/schema, the
+server's instructions, or any error body.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from typing import Any
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+from mcp.client.stdio import StdioServerParameters, stdio_client
 from jsonschema import Draft202012Validator
 
 from ..config import McpServer
@@ -163,13 +168,29 @@ class McpManager:
             return
         stack = contextlib.AsyncExitStack()
         try:
-            http_client = self._build_http_client(spec)
-            await stack.enter_async_context(http_client)
-            # Streamable HTTP transport (connects lazily; the real round-trip is
-            # driven by initialize() below, which we bound with wait_for).
-            streams = await stack.enter_async_context(
-                streamable_http_client(spec.url, http_client=http_client, terminate_on_close=True)
-            )
+            # The only place the two transports diverge: http builds an outbound
+            # client (bearer header / OAuth) and a Streamable HTTP transport;
+            # stdio spawns the operator-configured process. Both yield the same
+            # (read_stream, write_stream) that ClientSession consumes below.
+            if spec.transport == "stdio":
+                streams = await stack.enter_async_context(
+                    stdio_client(
+                        StdioServerParameters(
+                            command=spec.command,
+                            args=list(spec.args),
+                            env=dict(spec.env) or None,
+                            cwd=spec.cwd or None,
+                        )
+                    )
+                )
+            else:
+                http_client = self._build_http_client(spec)
+                await stack.enter_async_context(http_client)
+                # Streamable HTTP transport (connects lazily; the real round-trip
+                # is driven by initialize() below, which we bound with wait_for).
+                streams = await stack.enter_async_context(
+                    streamable_http_client(spec.url, http_client=http_client, terminate_on_close=True)
+                )
             read_stream, write_stream = streams
             session = await stack.enter_async_context(
                 ClientSession(read_stream, write_stream, read_timeout_seconds=self._connect_timeout)

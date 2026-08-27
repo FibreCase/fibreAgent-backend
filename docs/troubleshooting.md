@@ -3,7 +3,7 @@
 | 现象 | 排查 |
 | --- | --- |
 | 启动报 `ConfigError: TELEGRAM_BOT_TOKEN is not set` 等 | `.env` 没加载或变量名为空。确认 `cp .env.example .env` 且填了值；确认在**仓库根目录**运行（`.env` 从当前工作目录读取）。 |
-| 启动报 `ConfigError`（工具/预算/超时/MCP 相关） | 某个安全/预算/MCP 配置不合法：`TOOL_PERMISSION_OVERRIDES` 条目缺 `=`、空工具名、空/非法权限值、重复工具名、工具名含 `[A-Za-z0-9_-]` 之外字符，某个预算/超时为 0/负数/非整数，或 `MCP_SERVERS` 结构非法（非数组、坏 name/url、重复 name、`http://` 未开 `MCP_ALLOW_INSECURE_HTTP`、`bearer_token_env` 指向的变量缺失/为空）。修好再启动——**坏掉的配置不会被静默忽略**（MCP 报错只点名服务器与字段，不回显 token/完整 URL）。 |
+| 启动报 `ConfigError`（工具/预算/超时/MCP 相关） | 某个安全/预算/MCP 配置不合法：`MCP_PERMISSIONS_FILE` 文件**存在但损坏**（非法 JSON、非数组、非对象条目、缺 `tool`、未知字段、非法工具名、非法 `permission`、重复 `tool`——仅当 `ENABLE_TOOLS=true`），某个预算/超时为 0/负数/非整数，或 `MCP_SERVERS` 结构非法（非数组、坏 name、重复 name、非法 `transport`、http 端点 `http://` 未开 `MCP_ALLOW_INSECURE_HTTP`、`bearer_token_env` 指向的变量缺失/为空、stdio 缺 `command` 或 `command` 含非法字符、stdio 的 `args` 非字符串数组/`env` 名值非法、http 与 stdio 字段串用、stdio 上带 `url`/`bearer_token_env`/`authentication`）。修好再启动——**坏掉的配置不会被静默忽略**（MCP 报错只点名服务器与字段，不回显 token/完整 URL/stdio 的 command/args/env/cwd；权限文件报错只点名出错的 tool/字段）。 |
 | Bot 完全不回复 | 确认 `TELEGRAM_ALLOWED_USER_IDS` 里确实有**你的** id（@userinfobot 查）；确认你发的是普通消息或 `/` 命令；看日志是否有 `unauthorized telegram user attempted access`。 |
 | `模型请求超时，请稍后重试。` | LLM 请求超时或网络问题。查看服务端日志的 `llm request timed out` / `llm http error status=...`。可临时调大 `OPENAI_TIMEOUT`。 |
 | `模型服务暂时不可用。` | LLM 返回了 HTTP 错误 / 空回复 / 连接失败。看日志里的 HTTP status；检查 `OPENAI_BASE_URL` 是否写错（常见错误是填了完整 `.../v1/chat/completions`）。 |

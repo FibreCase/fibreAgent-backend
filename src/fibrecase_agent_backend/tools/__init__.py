@@ -49,11 +49,20 @@ from .policy import (
     ToolPermission,
     ToolPolicy,
     ToolPolicyError,
+    FileBackedToolPolicy,
     build_policy,
     parse_permission,
-    parse_tool_permission_overrides,
 )
 from .registry import ToolNotFoundError, ToolRegistry
+from .permissions_file import (
+    PermissionsFileError,
+    atomic_write,
+    load_permissions_file,
+    merge_permissions,
+    parse_permissions_json,
+    reconcile_permissions_file,
+    serialize,
+)
 
 __all__ = [
     "Tool",
@@ -64,9 +73,17 @@ __all__ = [
     "ToolPermission",
     "ToolPolicy",
     "ToolPolicyError",
+    "FileBackedToolPolicy",
     "build_policy",
     "parse_permission",
-    "parse_tool_permission_overrides",
+    # permissions file
+    "PermissionsFileError",
+    "parse_permissions_json",
+    "load_permissions_file",
+    "merge_permissions",
+    "serialize",
+    "atomic_write",
+    "reconcile_permissions_file",
     # approval
     "ApprovalDecision",
     "ApprovalRequest",

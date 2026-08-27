@@ -32,13 +32,14 @@ class Tool(abc.ABC):
     #: JSON-Schema object describing the tool's arguments.
     parameters: dict[str, Any]
 
-    #: The tool's *declared* default permission, before any config override.
+    #: The tool's *declared* default permission, before any override.
     #:
     #: The base default is :attr:`ToolPermission.ASK` — a new tool can never run
     #: bare by accident. A tool that is genuinely safe (the three read-only
     #: built-ins) declares :attr:`ToolPermission.ALLOW` explicitly so it does not
-    #: annoy the owner with an approval prompt on every call. A config override
-    #: (``TOOL_PERMISSION_OVERRIDES``) still wins over this declaration.
+    #: annoy the owner with an approval prompt on every call. For MCP tools, a
+    #: pin in ``MCP_PERMISSIONS_FILE`` still wins over this declaration; the
+    #: built-ins are not in that file, so their declared default is final.
     default_permission: ToolPermission = ToolPermission.ASK
 
     @abc.abstractmethod

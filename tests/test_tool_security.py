@@ -23,7 +23,6 @@ from fibrecase_agent_backend.tools import (
     ToolRegistry,
     build_default_tools,
     build_policy,
-    parse_tool_permission_overrides,
 )
 from fibrecase_agent_backend.tools.audit import ToolAuditEvent
 from fibrecase_agent_backend.tools.base import Tool
@@ -103,7 +102,7 @@ class _FakeApproval:
 # ---------------------------------------------------------------------------
 async def test_deny_tool_is_not_advertised():
     reg = build_default_tools()
-    policy = build_policy(parse_tool_permission_overrides("echo=deny"), registry=reg)
+    policy = build_policy({"echo": ToolPermission.DENY}, registry=reg)
     advertised = policy.advertised_names(set(reg.names()))
     assert "echo" not in advertised
     assert set(advertised) == {"get_current_time", "system_info"}
@@ -115,7 +114,7 @@ async def test_deny_tool_is_not_advertised():
 
 async def test_deny_tool_requested_is_refused_and_audited():
     reg = build_default_tools()
-    policy = build_policy(parse_tool_permission_overrides("echo=deny"), registry=reg)
+    policy = build_policy({"echo": ToolPermission.DENY}, registry=reg)
     auditor = _RecordingAuditor()
     approval = _FakeApproval()
     # The model insists on a denied tool anyway.
@@ -267,7 +266,7 @@ async def test_multiple_calls_in_one_turn_keep_order_under_timeout():
 # ---------------------------------------------------------------------------
 async def test_ask_tool_approved_executes_exactly_once():
     reg = build_default_tools()
-    policy = build_policy(parse_tool_permission_overrides("echo=ask"), registry=reg)
+    policy = build_policy({"echo": ToolPermission.ASK}, registry=reg)
     auditor = _RecordingAuditor()
     approval = _FakeApproval(ApprovalDecision.APPROVED)
     llm = _ScriptedLLM([
@@ -287,7 +286,7 @@ async def test_ask_tool_approved_executes_exactly_once():
 
 async def test_ask_tool_denied_not_executed():
     reg = build_default_tools()
-    policy = build_policy(parse_tool_permission_overrides("echo=ask"), registry=reg)
+    policy = build_policy({"echo": ToolPermission.ASK}, registry=reg)
     auditor = _RecordingAuditor()
     approval = _FakeApproval(ApprovalDecision.DENIED)
     llm = _ScriptedLLM([
@@ -305,7 +304,7 @@ async def test_ask_tool_denied_not_executed():
 
 async def test_ask_tool_expired_not_executed():
     reg = build_default_tools()
-    policy = build_policy(parse_tool_permission_overrides("echo=ask"), registry=reg)
+    policy = build_policy({"echo": ToolPermission.ASK}, registry=reg)
     auditor = _RecordingAuditor()
     approval = _FakeApproval(ApprovalDecision.EXPIRED)
     llm = _ScriptedLLM([

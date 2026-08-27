@@ -20,8 +20,15 @@ always enforced at the point of execution.
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+
+from .permissions_file import PermissionsFileError, load_permissions_file
+
+logger = logging.getLogger(__name__)
 
 
 class ToolPermission(str, Enum):
@@ -49,8 +56,9 @@ class ToolPolicy:
 
     ``default`` is what a tool resolves to when it is not explicitly mapped. It
     is normally the *tool's own declared* ``default_permission`` (base default
-    ``ask``); the composition root builds the policy so that an *override*
-    (``TOOL_PERMISSION_OVERRIDES``) wins, then the tool default, then ``ask``.
+    ``ask``); the composition root builds the policy so that an *override* (from
+    the ``MCP_PERMISSIONS_FILE``, via :class:`FileBackedToolPolicy`) wins, then
+    the tool default, then ``ask``.
     """
 
     default: ToolPermission
@@ -100,51 +108,6 @@ def parse_permission(raw: str) -> ToolPermission:
     return ToolPermission(value)
 
 
-def parse_tool_permission_overrides(raw: str | None) -> dict[str, ToolPermission]:
-    """Parse ``TOOL_PERMISSION_OVERRIDES`` into a name→permission map.
-
-    The value is a comma-separated list of ``<tool>=allow|ask|deny`` pairs, e.g.
-    ``echo=allow,my_risky_tool=deny``. Empty / ``None`` → ``{}`` (use tool
-    defaults).
-
-    Parsing is *strict on purpose*: a mistyped tool name or permission must be a
-    startup ``ConfigError`` — silently ignoring a botched security setting would
-    be a hole. Malformed entries (no ``=``, empty name, bad permission, empty
-    value) all raise :class:`ToolPolicyError`. Duplicate tool names are also an
-    error (a policy is a function of the tool, not a bag of rules).
-    """
-    if not raw or not raw.strip():
-        return {}
-
-    result: dict[str, ToolPermission] = {}
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if "=" not in chunk:
-            raise ToolPolicyError(
-                f"invalid TOOL_PERMISSION_OVERRIDES entry {chunk!r} (expected <tool>=allow|ask|deny)"
-            )
-        name, _, value = chunk.partition("=")
-        name = name.strip()
-        value = value.strip()
-        if not name:
-            raise ToolPolicyError(
-                f"TOOL_PERMISSION_OVERRIDES entry {chunk!r} has an empty tool name"
-            )
-        if not value:
-            raise ToolPolicyError(
-                f"TOOL_PERMISSION_OVERRIDES entry {chunk!r} has an empty permission"
-            )
-        permission = parse_permission(value)
-        if name in result:
-            raise ToolPolicyError(
-                f"duplicate tool in TOOL_PERMISSION_OVERRIDES: {name!r}"
-            )
-        result[name] = permission
-    return result
-
-
 def build_policy(
     overrides: dict[str, ToolPermission],
     *,
@@ -173,3 +136,106 @@ def build_policy(
     for name, perm in overrides.items():
         items.setdefault(name, perm)
     return ToolPolicy.from_items(items, default=default)
+
+
+class FileBackedToolPolicy(ToolPolicy):
+    """A :class:`ToolPolicy` whose overrides are read from a JSON file and
+    **hot-reloaded** — a permission the operator edits in the file takes effect
+    on the very next tool call, with no restart.
+
+    It exposes the same surface the tool loop uses (``resolve`` +
+    ``advertised_names``), but those delegate to a cached *inner*
+    :class:`ToolPolicy` that is rebuilt whenever the file's mtime/size changes.
+    Rebuilding goes through :func:`build_policy`, so the built-in declared
+    defaults (``allow`` for ``get_current_time``/``echo``, ``ask`` for
+    ``system_info``) still flow through unchanged — only the file's MCP-tool
+    entries are overrides on top.
+
+    Reload semantics (all on the calling thread, no background task):
+    * first use — a missing/blank file means "no overrides" (everything resolves
+      to its declared default);
+    * file content changed — re-read and rebuild; a *present-but-malformed* file
+      (invalid JSON / bad entry) keeps the **last-good** inner policy and logs a
+      warning (it must never crash the loop), and the bad version is marked seen
+      so it is not re-parsed — and re-warned — every call;
+    * file deleted — resolves back to all-defaults (ask).
+    """
+
+    def __init__(self, path: str | Path, registry) -> None:
+        # Give the frozen base valid placeholder fields (so its generated
+        # __eq__/__hash__ never touch an unset attribute); the *live* decision
+        # always lives in ``_inner``.
+        super().__init__(default=ToolPermission.ASK, _overrides=frozenset())
+        object.__setattr__(self, "_path", Path(path))
+        object.__setattr__(self, "_registry", registry)
+        object.__setattr__(self, "_inner", None)
+        object.__setattr__(self, "_last_key", None)
+
+    def __repr__(self) -> str:
+        # Safe: the path only, never the override contents.
+        return f"FileBackedToolPolicy(path={str(self._path)!r})"
+
+    def resolve(self, tool_name: str) -> ToolPermission:
+        return self._ensure().resolve(tool_name)
+
+    def advertised_names(self, known: "set[str] | frozenset[str] | list[str]") -> list[str]:
+        return self._ensure().advertised_names(known)
+
+    # ------------------------------------------------------------------ reload
+    def _ensure(self) -> ToolPolicy:
+        self._maybe_reload()
+        assert self._inner is not None  # always set by _maybe_reload
+        return self._inner
+
+    def _maybe_reload(self) -> None:
+        if self._inner is None:
+            self._initial_load()
+            return
+        key = self._stat_key()  # None if the file is now missing/unreadable
+        if key == self._last_key:
+            return  # unchanged (this also covers "still missing")
+        try:
+            entries = load_permissions_file(self._path)  # missing -> []
+        except PermissionsFileError:
+            # Present-but-malformed at runtime: keep last-good, mark this version
+            # seen (no re-parse / re-warn every call), and pick up a fix next time
+            # the file changes again.
+            self._last_key = key
+            logger.warning(
+                "MCP permissions file became invalid; keeping last-known policy",
+                extra={"path": str(self._path)},
+            )
+            return
+        self._last_key = key
+        self._inner = build_policy(self._build_overrides(entries), registry=self._registry)
+
+    def _initial_load(self) -> None:
+        try:
+            entries = load_permissions_file(self._path)  # missing/blank -> []
+        except PermissionsFileError:
+            # Should not happen (config-load already validated a pre-existing
+            # file); be safe and resolve everything to its declared default.
+            logger.warning(
+                "MCP permissions file invalid on first load; using tool defaults",
+                extra={"path": str(self._path)},
+            )
+            entries = []
+        self._last_key = self._stat_key()
+        self._inner = build_policy(self._build_overrides(entries), registry=self._registry)
+
+    def _stat_key(self):
+        """``(st_mtime_ns, st_size)`` for change detection, or ``None`` when the
+        file is missing/unreadable (stat needs only dir execute, so a missing
+        file is the ``None`` case here)."""
+        try:
+            st = os.stat(self._path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _build_overrides(entries: list[dict]) -> dict[str, ToolPermission]:
+        """Map file entries to a name→permission dict, *omitting* unfilled
+        (``""``) entries so ``build_policy`` falls through to each tool's
+        declared default. Entries are already strictly validated upstream."""
+        return {e["tool"]: ToolPermission(e["permission"]) for e in entries if e["permission"] != ""}

@@ -15,6 +15,13 @@ wheels/
 .env.*
 !.env.example
 
+# Per-deployment MCP runtime config (which servers to connect to, and which
+# tool permissions to grant). The app treats a missing file as "none" (no
+# servers / no overrides), so a fresh clone runs without these. The example
+# contents live inline in .env.example / docs/.
+config/mcp_servers.json
+config/mcp_permissions.json
+
 # Local runtime data (SQLite database, etc.) — keep the dir via .gitkeep.
 # This same data/ dir is also the Docker bind-mount source (compose: ./data:/app/data).
 data/*

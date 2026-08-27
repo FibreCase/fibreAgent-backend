@@ -39,7 +39,7 @@ from .mcp.auth import (
 )
 from .telegram.approval import TelegramApprovalBroker
 from .telegram.bot import build_application, compose_startup_hooks, register_command_menu
-from .tools import build_policy
+from .tools import FileBackedToolPolicy, build_policy, reconcile_permissions_file
 from .tools.builtin import build_default_tools
 
 logger = logging.getLogger("main")
@@ -85,13 +85,21 @@ class AgentBackend:
         # Phase 3: the tool-security runtime. All three are built *only* when
         # tools are enabled — with tools off there is nothing to advertise,
         # approve, or audit, so the service stays on the bare phase-one path.
-        #   * policy — resolves each tool to allow/ask/deny (config overrides
-        #     take priority over a tool's declared default).
+        #   * policy — resolves each tool to allow/ask/deny. When
+        #     ``MCP_PERMISSIONS_FILE`` is set this is a *file-backed* policy:
+        #     MCP-tool overrides come from that (backend-maintained, hot-reloaded)
+        #     file, and built-ins always ride their declared defaults. Without
+        #     a file, a plain policy with no overrides (built-in defaults only).
         #   * auditor — the concrete SQLite-backed auditor (fail-closed on the
         #     pre-execution write).
         #   * broker — the in-memory Telegram Approve/Deny provider, also used
         #     by the adapter for the callback + /tool_audit.
-        policy = build_policy(config.tool_permission_overrides, registry=registry) if registry else None
+        if registry is None:
+            policy = None
+        elif config.mcp_permissions_file is not None:
+            policy = FileBackedToolPolicy(config.mcp_permissions_file, registry)
+        else:
+            policy = build_policy({}, registry=registry)
         auditor = RepositoryToolAuditor(self.repository) if registry else None
         broker = TelegramApprovalBroker(self.repository) if registry else None
         self.approval_broker = broker
@@ -251,12 +259,12 @@ class AgentBackend:
         # register their tools into the *same* registry (after the built-ins).
         # This is best-effort by construction — ``start`` never raises, and a
         # failed server is simply marked unavailable — so an unreachable
-        # endpoint can never stop the bot from starting. The policy was already
-        # built; because the tool loop re-resolves every call and re-derives the
-        # advertised schema from ``registry.names()`` on each message, the newly
-        # added MCP tools are picked up automatically (they default to ``ask``,
-        # and any ``TOOL_PERMISSION_OVERRIDES`` entry for their namespaced name
-        # is honoured).
+        # endpoint can never stop the bot from starting. The newly added MCP
+        # tools are picked up automatically: the tool loop re-resolves every
+        # call and re-derives the advertised schema from ``registry.names()`` on
+        # each message, and (when a permission file is configured) the
+        # file-backed policy hot-reloads, so a pinned permission for a namespaced
+        # name is honoured without a restart.
         mcp_tool_count = 0
         if self.mcp_manager is not None and self.registry is not None:
             await self.mcp_manager.start(existing_names=self.registry.names())
@@ -264,6 +272,27 @@ class AgentBackend:
             if discovered:
                 self.registry.add(*discovered)
                 mcp_tool_count = len(discovered)
+        # Phase 4.x: seed/sync the dedicated MCP-permissions file to the current
+        # tool set (backend → file). New tools appear unfilled (default), entries
+        # the operator filled in are preserved, and unfilled entries for tools
+        # that no longer exist are pruned. Runs only when a file is configured;
+        # a failure here is logged and never blocks boot (config-load already
+        # validated a pre-existing file — this is a race guard, and the file is
+        # hot-reloaded on read).
+        if self.config.mcp_permissions_file is not None and self.mcp_manager is not None:
+            try:
+                reconcile_permissions_file(
+                    self.config.mcp_permissions_file, [t.name for t in self.mcp_manager.tools()]
+                )
+            except Exception as exc:
+                # A seed failure never blocks boot; the file is hot-reloaded on
+                # read, so a bad write just means the current run keeps the
+                # last-known permissions. Log only the path + exception class —
+                # never the message (atomic_write already logs I/O failures).
+                logger.error(
+                    "failed to seed MCP permissions file",
+                    extra={"path": str(self.config.mcp_permissions_file), "error": type(exc).__name__},
+                )
         # Phase 4.x: start the minimal OAuth callback server (only when OAuth is
         # configured). It runs as a task on *this* loop, so the callback handler
         # and the Telegram notifier share the polling bot's loop. A failure to

@@ -1,10 +1,11 @@
-"""Phase 4 — remote MCP Streamable HTTP tool provider (config + wrapper + manager).
+"""Phase 4 — MCP tool provider (Streamable HTTP + stdio: config + wrapper + manager).
 
-Covers the startup-side behaviours: strict ``MCP_SERVERS`` validation, the
-namespaced local-name mapping, per-server failure isolation, atomic discovery,
-the bearer-header-from-env contract, the ``status()``/``tools()`` surface, and
-the fact that a pre-2.5 DB needs no migration. No real network, stdio, or
-subprocess is ever touched — the MCP transport/session/http-client are faked.
+Covers the startup-side behaviours: strict ``MCP_SERVERS`` validation (both the
+http and stdio transports), the namespaced local-name mapping, per-server failure
+isolation, atomic discovery, the bearer-header-from-env contract, the
+``status()``/``tools()`` surface, and the fact that a pre-2.5 DB needs no
+migration. No real network, stdio, or subprocess is ever touched — the MCP
+transport/session/http-client (and ``stdio_client``) are all faked.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ def _env(**extra):
 def _load(monkeypatch, **extra):
     for knob in (
         "MCP_SERVERS",
+        "MCP_SERVERS_FILE",
         "MCP_ALLOW_INSECURE_HTTP",
         "MCP_CONNECT_TIMEOUT_SECONDS",
         "MAX_MCP_TOOL_RESULT_CHARS",
@@ -217,6 +219,217 @@ def test_mcp_accepts_valid_numeric_knobs(monkeypatch):
 
 
 # ===========================================================================
+# stdio transport — config validation
+# ===========================================================================
+def test_mcp_parses_stdio_server(monkeypatch):
+    cfg = _load(
+        monkeypatch,
+        MCP_SERVERS=json.dumps(
+            [
+                {
+                    "name": "fs",
+                    "transport": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                    "env": {"FOO": "bar", "MY_SECRET": "topsecret"},
+                    "cwd": "/tmp",
+                }
+            ]
+        ),
+    )
+    assert len(cfg.mcp_servers) == 1
+    s = cfg.mcp_servers[0]
+    assert s.transport == "stdio"
+    assert s.command == "npx"
+    assert s.args == ("-y", "@modelcontextprotocol/server-filesystem", "/tmp")
+    assert s.env == (("FOO", "bar"), ("MY_SECRET", "topsecret"))
+    assert s.cwd == "/tmp"
+    assert s.url == ""
+    assert s.bearer_token_env is None
+    assert s.auth_type == "none"
+    # The env *value* is stored (it is operator config, not a loggable secret in
+    # this phase), but it is never part of any error message (covered below).
+    assert s.command is not None
+
+
+def test_mcp_parses_stdio_server_minimal(monkeypatch):
+    cfg = _load(monkeypatch, MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "python3"}]))
+    s = cfg.mcp_servers[0]
+    assert s.transport == "stdio"
+    assert s.command == "python3"
+    assert s.args == ()
+    assert s.env == ()
+    assert s.cwd is None
+
+
+def test_mcp_stdio_defaults_to_http_without_transport(monkeypatch):
+    # A server with no "transport" key is http and still requires a url — the
+    # pre-stdio behaviour is byte-for-byte unchanged.
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, MCP_SERVERS=json.dumps([{"name": "alpha"}]))
+    cfg = _load(monkeypatch, MCP_SERVERS=json.dumps([{"name": "alpha", "url": "https://a.example/mcp"}]))
+    assert cfg.mcp_servers[0].transport == "http"
+
+
+def test_mcp_stdio_rejects_missing_command(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio"}]))
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["npx --weird", "a b", "rm -rf /", "npx; ls", "npx|ls", "npx&x", "c:\\path\\exe", "npx>out", "npx*"],
+)
+def test_mcp_stdio_rejects_bad_command(monkeypatch, command):
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": command}]))
+
+
+@pytest.mark.parametrize("command", ["python3", "/usr/local/bin/mcp-server", "./local/server", "my-tool-2"])
+def test_mcp_stdio_allows_legal_command(monkeypatch, command):
+    cfg = _load(monkeypatch, MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": command}]))
+    assert cfg.mcp_servers[0].command == command
+
+
+def test_mcp_stdio_rejects_url(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "url": "https://a.example"}]),
+        )
+
+
+def test_mcp_stdio_rejects_bearer_token_env(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps(
+                [{"name": "fs", "transport": "stdio", "command": "npx", "bearer_token_env": "MCP_TOKEN_A"}]
+            ),
+        )
+
+
+def test_mcp_stdio_rejects_oauth_authentication(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps(
+                [
+                    {
+                        "name": "fs",
+                        "transport": "stdio",
+                        "command": "npx",
+                        "authentication": {"type": "oauth", "provider": "google"},
+                    }
+                ]
+            ),
+        )
+
+
+def test_mcp_http_rejects_stdio_fields(monkeypatch):
+    for field in ("command", "args", "env", "cwd"):
+        entry = {"name": "alpha", "url": "https://a.example/mcp", field: "x"}
+        with pytest.raises(ConfigError):
+            _load(monkeypatch, MCP_SERVERS=json.dumps([entry]))
+
+
+def test_mcp_stdio_rejects_bad_transport(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps([{"name": "alpha", "transport": "websocket", "url": "https://a.example"}]),
+        )
+
+
+def test_mcp_stdio_rejects_non_array_args(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "args": "-y"}]))
+
+
+def test_mcp_stdio_rejects_non_string_arg(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "args": ["ok", 1]}]),
+        )
+
+
+def test_mcp_stdio_rejects_empty_arg(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "args": ["ok", ""]}]),
+        )
+
+
+def test_mcp_stdio_rejects_non_object_env(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "env": [1, 2]}]),
+        )
+
+
+def test_mcp_stdio_rejects_bad_env_key(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "env": {"BAD KEY": "v"}}]),
+        )
+
+
+def test_mcp_stdio_rejects_empty_env_value(monkeypatch):
+    with pytest.raises(ConfigError) as exc:
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "env": {"K": ""}}]),
+        )
+    # The error names the key, never the (empty or secret) value.
+    assert "K" in str(exc.value)
+
+
+def test_mcp_stdio_rejects_empty_env_object(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "env": {}}]))
+
+
+def test_mcp_stdio_rejects_empty_cwd(monkeypatch):
+    with pytest.raises(ConfigError):
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps([{"name": "fs", "transport": "stdio", "command": "npx", "cwd": ""}]),
+        )
+
+
+def test_mcp_stdio_env_value_never_in_error(monkeypatch):
+    # A bad *key* in an env that also holds a secret value must not echo the value.
+    with pytest.raises(ConfigError) as exc:
+        _load(
+            monkeypatch,
+            MCP_SERVERS=json.dumps(
+                [{"name": "fs", "transport": "stdio", "command": "npx", "env": {"OK": "supersecret", "BAD KEY": "v"}}]
+            ),
+        )
+    assert "supersecret" not in str(exc.value)
+
+
+def test_mcp_mixed_transports_parse_together(monkeypatch):
+    monkeypatch.setenv("MCP_TOKEN_A", "secret-value-a")
+    cfg = _load(
+        monkeypatch,
+        MCP_SERVERS=json.dumps(
+            [
+                {"name": "alpha", "url": "https://a.example/mcp", "bearer_token_env": "MCP_TOKEN_A"},
+                {"name": "fs", "transport": "stdio", "command": "npx", "args": ["-y", "fs"]},
+            ]
+        ),
+    )
+    assert [s.transport for s in cfg.mcp_servers] == ["http", "stdio"]
+    assert cfg.mcp_servers[0].url == "https://a.example/mcp"
+    assert cfg.mcp_servers[1].command == "npx"
+
+
+# ===========================================================================
 # required #7 (naming) — local_tool_name + is_valid_remote_tool_name
 # ===========================================================================
 def test_local_tool_name_is_namespaced():
@@ -320,7 +533,14 @@ def _patch(monkeypatch, by_server):
         async def __aexit__(self, *exc):
             return False
 
-    current = {"url": None}
+    # Tracks the last transport entry seen, so ``fake_client_session`` can look
+    # the matching session up by url (http) or command (stdio).
+    current = {"url": None, "command": None}
+
+    def _by_server_entry():
+        if current["url"] is not None:
+            return by_server[current["url"]]
+        return by_server[current["command"]]
 
     # ``streamable_http_client`` is a *synchronous* factory returning an async
     # context manager that yields ``(read, write)``. The real SDK's
@@ -335,9 +555,32 @@ def _patch(monkeypatch, by_server):
 
     def fake_streamable(url, http_client=None, terminate_on_close=False):
         current["url"] = url
+        current["command"] = None
 
         class _Streams:
             async def __aenter__(self):
+                return (_Stream(), _Stream())
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Streams()
+
+    # ``stdio_client`` is a *synchronous* factory returning an async context
+    # manager that yields ``(read, write)``. It records the (real)
+    # ``StdioServerParameters`` so tests can assert the command/args/env/cwd the
+    # manager passed through. If the matched ``by_server`` entry carries a
+    # ``"spawn_error"``, entering the CM raises it (a spawn failure).
+    def fake_stdio_client(server, errlog=None):
+        current["command"] = server.command
+        current["url"] = None
+        by_server.setdefault(server.command, {})["opened"] = server
+        spawn_error = by_server[server.command].get("spawn_error")
+
+        class _Streams:
+            async def __aenter__(self):
+                if spawn_error is not None:
+                    raise spawn_error
                 return (_Stream(), _Stream())
 
             async def __aexit__(self, *exc):
@@ -351,18 +594,29 @@ def _patch(monkeypatch, by_server):
         return _Http(headers=headers)
 
     def fake_client_session(read, write, read_timeout_seconds=None):
-        spec = by_server[current["url"]]
-        sess_cls, _ = spec["session"]
+        sess_cls, _ = _by_server_entry()["session"]
         return sess_cls(read, write, read_timeout_seconds=read_timeout_seconds)
 
     monkeypatch.setattr(mgr, "create_mcp_http_client", fake_create_http_client)
     monkeypatch.setattr(mgr, "streamable_http_client", fake_streamable)
+    monkeypatch.setattr(mgr, "stdio_client", fake_stdio_client)
     monkeypatch.setattr(mgr, "ClientSession", fake_client_session)
     return opened_http
 
 
 def _spec(name, url, token_env=None):
     return McpServer(name=name, url=url, bearer_token_env=token_env)
+
+
+def _stdio_spec(name, command, args=(), env=(), cwd=None):
+    return McpServer(
+        name=name,
+        transport="stdio",
+        command=command,
+        args=tuple(args),
+        env=tuple(env),
+        cwd=cwd,
+    )
 
 
 # ===========================================================================
@@ -576,6 +830,129 @@ async def test_one_bad_server_does_not_block_good(monkeypatch):
     assert status["good"]["available"] is True
     assert status["bad"]["available"] is False
     await mgr.close()
+
+
+# ===========================================================================
+# stdio transport — manager (faked stdio_client, no real subprocess)
+# ===========================================================================
+async def test_stdio_server_discovers_tools(monkeypatch):
+    from mcp.client.stdio import StdioServerParameters
+
+    sess, calls = _make_session(
+        list_result=_list_result(_tool_dict("read_file"), _tool_dict("write_file"))
+    )
+    by_server = {"npx": {"session": (sess, calls)}}
+    _patch(monkeypatch, by_server)
+
+    mgr = McpManager(
+        [_stdio_spec("fs", "npx", args=("-y", "@fs/server"), env=(("FOO", "bar"),), cwd="/tmp")],
+        connect_timeout_seconds=5.0,
+        max_result_chars=1000,
+    )
+    await mgr.start()
+    assert calls["initialize"] == 1
+    assert calls["list_tools"] == 1
+    assert [t.name for t in mgr.tools()] == ["mcp_fs__read_file", "mcp_fs__write_file"]
+    assert mgr.total_tools == 2
+    # The manager passed the operator-configured command/args/env/cwd through to
+    # stdio_client (recorded by the fake); no http client was built for it.
+    assert by_server["npx"]["opened"] == StdioServerParameters(
+        command="npx", args=["-y", "@fs/server"], env={"FOO": "bar"}, cwd="/tmp"
+    )
+    await mgr.close()
+
+
+async def test_stdio_and_http_mix_discover_in_order(monkeypatch):
+    http_sess, _ = _make_session(list_result=_list_result(_tool_dict("search")))
+    stdio_sess, _ = _make_session(list_result=_list_result(_tool_dict("local")))
+    _patch(monkeypatch, {
+        "https://a.example/mcp": {"session": (http_sess, {})},
+        "python3": {"session": (stdio_sess, {})},
+    })
+    mgr = McpManager(
+        [_spec("web", "https://a.example/mcp"), _stdio_spec("local", "python3")],
+        connect_timeout_seconds=5.0,
+        max_result_chars=1000,
+    )
+    await mgr.start()
+    assert [t.name for t in mgr.tools()] == ["mcp_web__search", "mcp_local__local"]
+    await mgr.close()
+
+
+async def test_stdio_spawn_failure_isolated(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="mcp")
+    good, _ = _make_session(list_result=_list_result(_tool_dict("search")))
+    _patch(monkeypatch, {
+        "python3": {"session": (good, {}), "spawn_error": OSError("spawn failed")},
+        "https://good.example/mcp": {"session": (good, {}), "spawn_error": None},
+    })
+    mgr = McpManager(
+        [_stdio_spec("badproc", "python3"), _spec("good", "https://good.example/mcp")],
+        connect_timeout_seconds=5.0,
+        max_result_chars=1000,
+    )
+    await mgr.start()
+    status = {s["name"]: s for s in mgr.status()}
+    assert status["badproc"]["available"] is False
+    assert status["good"]["available"] is True
+    assert [t.name for t in mgr.tools()] == ["mcp_good__search"]
+    # The failure is logged with a stable code + the exception class, never the command.
+    assert CODE_CONNECT_FAILED in {r.__dict__.get("code") for r in caplog.records}
+    assert "OSError" in {r.__dict__.get("exception") for r in caplog.records}
+    logged = " ".join(str(r.getMessage()) for r in caplog.records)
+    assert "python3" not in logged  # the command is never echoed
+    await mgr.close()
+
+
+async def test_stdio_status_has_only_safe_fields(monkeypatch):
+    sess, _ = _make_session(list_result=_list_result(_tool_dict("x")))
+    _patch(monkeypatch, {"npx": {"session": (sess, {})}})
+    mgr = McpManager(
+        [_stdio_spec("fs", "npx", args=("-y", "top-secret-arg"), env=(("K", "v"),), cwd="/tmp")],
+        connect_timeout_seconds=5.0,
+        max_result_chars=100,
+    )
+    await mgr.start()
+    for entry in mgr.status():
+        assert set(entry) == {"name", "available", "tool_count"}
+    text = json.dumps(mgr.status())
+    assert "npx" not in text  # no command
+    assert "top-secret-arg" not in text  # no args
+    assert "/tmp" not in text  # no cwd
+    await mgr.close()
+
+
+async def test_stdio_close_is_idempotent_and_tears_down(monkeypatch):
+    calls = {"initialize": 0, "list_tools": 0, "call_tool": [], "exits": 0}
+
+    class _Sess:
+        def __init__(self, read, write, read_timeout_seconds=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            calls["exits"] += 1
+            return False
+
+        async def initialize(self):
+            calls["initialize"] += 1
+            return object()
+
+        async def list_tools(self):
+            calls["list_tools"] += 1
+            return _list_result(_tool_dict("x"))
+
+    _patch(monkeypatch, {"npx": {"session": (_Sess, calls)}})
+    mgr = McpManager([_stdio_spec("fs", "npx")], connect_timeout_seconds=5.0, max_result_chars=100)
+    await mgr.start()
+    await mgr.close()
+    assert calls["exits"] == 1
+    await mgr.close()  # idempotent — no second teardown
+    assert calls["exits"] == 1
 
 
 # ===========================================================================

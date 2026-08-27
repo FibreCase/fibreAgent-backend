@@ -10,7 +10,7 @@ phase-3 gate care about:
 * ``default_permission`` is :attr:`ToolPermission.ASK` **unconditionally** — a
   remote tool is never assumed read-only just because the remote claims it is;
   the owner can still pin any of these to ``allow``/``deny`` via
-  ``TOOL_PERMISSION_OVERRIDES`` on the namespaced local name;
+  ``MCP_PERMISSIONS_FILE`` on the namespaced local name;
 * ``parameters`` is the remote tool's ``input_schema`` mapped through verbatim,
   so it is schema-validated by the *existing* registry gate before any network
   request is made.

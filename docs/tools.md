@@ -36,7 +36,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 ### 1. 策略（allow / ask / deny）
 
-`ToolPermission` 三态。解析顺序：**`TOOL_PERMISSION_OVERRIDES` 覆盖 > 工具自带默认 > （未知名）`ask`**。
+`ToolPermission` 三态。解析顺序：**`MCP_PERMISSIONS_FILE` 覆盖（仅 MCP 工具）> 工具自带默认 > （未知名）`ask`**。内置工具（`get_current_time` / `echo` / `system_info`）不在这个文件里，恒按其声明默认值（`allow` / `allow` / `ask`）运行。
 
 - `allow`：直接执行。
 - `deny`：直接拒绝，且该工具**不再出现在**发给 LLM 的 schema 里（`advertised_names` 会把它剔除）——模型根本看不到它。
@@ -75,7 +75,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 | --- | --- | --- |
 | `ENABLE_TOOLS` | `true` | `false` 时完全退回纯对话（硬降级开关）。 |
 | `MAX_TOOL_ITERATIONS` | `5` | 单条消息内 LLM↔工具最大往返；超过 → `tool_limit`。 |
-| `TOOL_PERMISSION_OVERRIDES` | 空 | 逗号分隔 `<工具名>=allow\|ask\|deny`（如 `echo=deny,my_tool=ask`）。**启动期强校验**：条目缺 `=`、空工具名、空权限、非法权限值、重复工具名，或工具名含 `[A-Za-z0-9_-]` 之外字符，都会 `ConfigError`——坏掉的安全设置**绝不**被静默忽略。 |
+| `MCP_PERMISSIONS_FILE` | 空 | 专用 MCP 工具权限文件（CWD 相对路径的 JSON **数组**，每项 `{ "tool": "mcp_<server>__<remote>", "permission": "allow\|ask\|deny\|"" }`）。**仅列 MCP 工具**，内置工具不在此文件中。由**后端维护**：启动时重同步到当前 MCP 工具集（新工具出现为未填 `""`＝默认；**已填写**的条目永远保留，即使该工具后来消失；**未填写**的消失工具条目被删去），并**热加载**（改动在下次调用即生效，无需重启）。`""`（或缺省）＝用工具默认值。未设置/空文件＝无覆盖（全部 MCP 工具默认 `ask`），非错误；**存在但损坏**的文件＝启动 `ConfigError`（坏掉的安全设置绝不被静默忽略）。 |
 | `TOOL_APPROVAL_TIMEOUT_SECONDS` | `60` | `ask` 工具等待审批的秒数，超时 → `approval_expired`。必须为正。 |
 | `TOOL_TIMEOUT_SECONDS` | `30` | 单个工具最长执行秒数，超时 → `tool_timeout`。必须为正。 |
 
@@ -99,7 +99,7 @@ class MyTool(Tool):
 - **不要**在任何地方写 `if name == "…"` 分支——registry 是唯一分发点。
 - 想给它自定义审批文案，可覆盖 `approval_summary(arguments)`（但**默认**不回显参数；只有你确信安全才展示）。
 
-**MCP / SSH / Docker / Pi** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现远程 Streamable HTTP 服务器的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。SSH / Docker / Pi 仍是待建的同类 provider。
+**MCP / SSH / Docker / Pi** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。SSH / Docker / Pi 仍是待建的同类 provider。
 
 ## 限制
 

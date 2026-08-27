@@ -1,8 +1,9 @@
-"""Tool policy, override parsing, and config wiring (phase 3 — required #1, #2).
+"""Tool policy + config wiring (phase 3 — required #1, #2).
 
 Pure logic: no LLM, no Telegram, no DB. Verifies the permission model, the
-strict override parser, the composition-root ``build_policy`` precedence, and
-that the config knobs fail fast (``ConfigError``) on a botched security setting.
+single-permission parser, the composition-root ``build_policy`` precedence, and
+that the config knobs fail fast (``ConfigError``) on a botched setting. The
+MCP-permissions *file* source is covered in ``tests/test_mcp_permissions_file.py``.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from fibrecase_agent_backend.tools import (
     ToolPolicyError,
     build_default_tools,
     build_policy,
-    parse_tool_permission_overrides,
+    parse_permission,
 )
 from fibrecase_agent_backend.tools.base import Tool
 from fibrecase_agent_backend.tools.registry import ToolRegistry
@@ -62,8 +63,7 @@ def test_build_policy_honours_builtins_and_default_ask():
 
 def test_build_policy_override_beats_default():
     reg = build_default_tools()
-    overrides = parse_tool_permission_overrides("echo=deny")
-    policy = build_policy(overrides, registry=reg)
+    policy = build_policy({"echo": ToolPermission.DENY}, registry=reg)
     assert policy.resolve("echo") is ToolPermission.DENY
     # A non-overridden built-in is unaffected (get_current_time stays allow).
     assert policy.resolve("get_current_time") is ToolPermission.ALLOW
@@ -71,8 +71,7 @@ def test_build_policy_override_beats_default():
 
 def test_build_policy_keeps_unregistered_override():
     reg = build_default_tools()
-    overrides = parse_tool_permission_overrides("future_tool=allow")
-    policy = build_policy(overrides, registry=reg)
+    policy = build_policy({"future_tool": ToolPermission.ALLOW}, registry=reg)
     assert policy.resolve("future_tool") is ToolPermission.ALLOW
 
 
@@ -81,7 +80,7 @@ def test_build_policy_keeps_unregistered_override():
 # ---------------------------------------------------------------------------
 def test_advertised_names_withhold_deny_only():
     reg = build_default_tools()
-    policy = build_policy(parse_tool_permission_overrides("echo=deny"), registry=reg)
+    policy = build_policy({"echo": ToolPermission.DENY}, registry=reg)
     advertised = policy.advertised_names(set(reg.names()))
     assert "echo" not in advertised
     assert "get_current_time" in advertised
@@ -89,36 +88,17 @@ def test_advertised_names_withhold_deny_only():
 
 
 # ---------------------------------------------------------------------------
-# required #2 — strict override parsing (malformed entries raise)
+# required #2 — single-permission parsing (case-insensitive; malformed raises)
 # ---------------------------------------------------------------------------
-def test_parse_empty_overrides_is_empty():
-    assert parse_tool_permission_overrides("") == {}
-    assert parse_tool_permission_overrides(None) == {}
-    assert parse_tool_permission_overrides("   ") == {}
-
-
-def test_parse_valid_overrides():
-    out = parse_tool_permission_overrides("a=allow, b=ask , c=deny")
-    assert out == {"a": ToolPermission.ALLOW, "b": ToolPermission.ASK, "c": ToolPermission.DENY}
-
-
 def test_parse_permission_is_case_insensitive():
-    assert parse_tool_permission_overrides("a=ALLOW")["a"] is ToolPermission.ALLOW
+    assert parse_permission("ALLOW") is ToolPermission.ALLOW
+    assert parse_permission(" Ask ") is ToolPermission.ASK
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        "echo",            # no '='
-        "=allow",          # empty name
-        "echo=",           # empty permission
-        "echo=maybe",      # bad permission
-        "a=allow,a=ask",   # duplicate tool name
-    ],
-)
-def test_parse_invalid_override_raises(raw):
+@pytest.mark.parametrize("raw", ["maybe", "", "  ", "all", "deny " * 0])
+def test_parse_permission_invalid_raises(raw):
     with pytest.raises(ToolPolicyError):
-        parse_tool_permission_overrides(raw)
+        parse_permission(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -140,37 +120,25 @@ def _env(**extra):
 def _load(monkeypatch, **extra):
     # Clear the knobs under test first (a stray .env value must not interfere);
     # then apply the explicit values the test wants.
-    for knob in ("TOOL_PERMISSION_OVERRIDES", "TOOL_APPROVAL_TIMEOUT_SECONDS", "TOOL_TIMEOUT_SECONDS"):
+    for knob in ("MCP_PERMISSIONS_FILE", "TOOL_APPROVAL_TIMEOUT_SECONDS", "TOOL_TIMEOUT_SECONDS"):
         monkeypatch.delenv(knob, raising=False)
     for k, v in _env(**extra).items():
         monkeypatch.setenv(k, v)
     return load_config()
 
 
-def test_config_parses_valid_overrides(monkeypatch):
-    cfg = _load(monkeypatch, TOOL_PERMISSION_OVERRIDES="echo=deny, get_current_time=allow")
-    assert cfg.tool_permission_overrides == {
-        "echo": ToolPermission.DENY,
-        "get_current_time": ToolPermission.ALLOW,
-    }
+def test_config_no_permissions_file_by_default(monkeypatch):
+    # Unset MCP_PERMISSIONS_FILE → no policy file (built-ins ride declared defaults).
+    cfg = _load(monkeypatch)
+    assert cfg.mcp_permissions_file is None
     assert cfg.tool_approval_timeout_seconds == 60.0
     assert cfg.tool_timeout_seconds == 30.0
 
 
-def test_config_rejects_bad_permission(monkeypatch):
-    with pytest.raises(ConfigError):
-        _load(monkeypatch, TOOL_PERMISSION_OVERRIDES="echo=bogus")
-
-
-def test_config_rejects_invalid_tool_name(monkeypatch):
-    # A tool name outside [A-Za-z0-9_-]+ is a startup error, never silently ignored.
-    with pytest.raises(ConfigError):
-        _load(monkeypatch, TOOL_PERMISSION_OVERRIDES="bad name=allow")
-
-
-def test_config_rejects_duplicate_override(monkeypatch):
-    with pytest.raises(ConfigError):
-        _load(monkeypatch, TOOL_PERMISSION_OVERRIDES="echo=allow,echo=deny")
+def test_config_captures_permissions_file_path(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, MCP_PERMISSIONS_FILE=str(tmp_path / "perm.json"))
+    # A set-but-missing file is fine (seeded at startup); the path is captured.
+    assert cfg.mcp_permissions_file == tmp_path / "perm.json"
 
 
 @pytest.mark.parametrize("knob", ["TOOL_APPROVAL_TIMEOUT_SECONDS", "TOOL_TIMEOUT_SECONDS"])
