@@ -23,6 +23,8 @@ from fibrecase_agent_backend.llm.client import LLMResult
 from fibrecase_agent_backend.memory import hash_scope
 from fibrecase_agent_backend.telegram.approval import (
     TelegramApprovalBroker,
+    _arguments_block,
+    _card_text,
     decision_from,
     request_id_from,
 )
@@ -97,14 +99,15 @@ class _FakeUpdate:
         self.effective_user = type("U", (), {"id": user_id})()
 
 
-def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None):
+def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None, arguments=None):
     return ApprovalRequest(
         request_id=request_id,
         conversation_id=5,
         scope=scope,
         tool_name=tool,
-        summary=summary or f"{tool} — Arguments are not shown for your safety.",
+        summary=summary or f"{tool} does a thing.",
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=seconds),
+        arguments=arguments if arguments is not None else {},
     )
 
 
@@ -439,9 +442,9 @@ async def test_prompt_and_callback_data_are_secret_free():
     sent = app.bot.sent[0]
 
     text = sent["text"]
-    # Shows the tool name (allowed) and a safe summary…
+    # Shows the tool name (allowed) and the "what it does" purpose summary…
     assert "risky" in text
-    assert "Arguments are not shown" in text
+    assert "risky does a thing." in text  # the purpose summary is shown
     # …but never the raw scope, the user id, or the chat id.
     assert "telegram:7" not in text
     assert "7" not in text  # no bare user id
@@ -476,7 +479,7 @@ async def test_prompt_is_telegram_html_not_literal_markdown():
     text = sent["text"]
     # Real HTML emphasis is present…
     assert "<b>Tool:</b>" in text
-    assert "<b>Summary:</b>" in text
+    assert "<b>What it does:</b>" in text
     assert "<i>This approval is one-time" in text
     assert "<b>Approve tool call?</b>" in text
     # …and no literal Markdown markers leaked into the body.
@@ -488,7 +491,7 @@ async def test_prompt_is_telegram_html_not_literal_markdown():
     await broker.shutdown()
 
 
-def test_default_approval_summary_does_not_echo_arguments():
+def test_default_approval_summary_is_a_purpose_line():
     class Secrety(Tool):
         name = "secret_tool"
         description = "d"
@@ -497,11 +500,119 @@ def test_default_approval_summary_does_not_echo_arguments():
         async def execute(self, arguments):  # pragma: no cover
             return ""
 
-    # The default summary withholds arguments entirely.
+    # The default summary is a purpose line that names the tool; it does NOT
+    # embed the (validated) arguments — those are shown by the provider as a
+    # separate "Arguments:" block.
     summary = Secrety().approval_summary({"password": "hunter2", "url": "https://x"})
     assert "hunter2" not in summary
     assert "secret_tool" in summary
-    assert "Arguments are not shown" in summary
+
+
+async def test_builtin_summaries_are_complete_and_secret_free():
+    # Every built-in overrides approval_summary with a purpose line that names
+    # what it does (not the generic "Run the … tool." fallback).
+    from fibrecase_agent_backend.tools.builtin import (
+        EchoTool,
+        GetCurrentTimeTool,
+        SystemInfoTool,
+    )
+
+    for tool, fragment in (
+        (GetCurrentTimeTool(), "current local date and time"),
+        (EchoTool(), "Echo a message back"),
+        (SystemInfoTool(), "host name, platform, and Python version"),
+    ):
+        summary = tool.approval_summary({})
+        assert fragment.lower() in summary.lower()
+        # Purpose lines never embed the (argument-free) tool's empty args.
+        assert "hunter2" not in summary
+
+
+async def test_echo_summary_does_not_echo_argument():
+    from fibrecase_agent_backend.tools.builtin import EchoTool
+
+    # Echo's argument is user input that could look like a secret; the summary
+    # shows only the purpose, never the echoed value.
+    summary = EchoTool().approval_summary({"message": "hunter2 / super-secret"})
+    assert "hunter2" not in summary
+    assert "super-secret" not in summary
+    assert "Echo a message back" in summary
+
+
+async def test_mcp_tool_summary_is_a_purpose_line():
+    from fibrecase_agent_backend.mcp.wrapper import McpTool
+
+    class _S:  # minimal fake session; only identity fields are exercised here
+        pass
+
+    tool = McpTool(
+        server_name="alpha",
+        remote_name="get_weather",
+        description="Look up the current weather for a city.",
+        parameters={"type": "object", "properties": {}},
+        session=_S(),
+        max_result_chars=1000,
+    )
+    summary = tool.approval_summary({"city": "secret-city"})
+    # The purpose (remote description) is shown, tagged as a remote tool…
+    assert "Look up the current weather for a city." in summary
+    assert "(🌐Remote)" in summary
+    # …but the (remote) arguments are NOT embedded in the summary — the card
+    # shows them in a separate "Arguments:" block the provider renders. The
+    # server/remote *names* are also not in the summary (they are the tool name,
+    # shown separately on the card).
+    assert "secret-city" not in summary
+    assert "Arguments are not shown" not in summary
+
+
+def test_arguments_block_renders_readable_json_and_omits_when_empty():
+    # No arguments → the whole "Arguments:" section is omitted.
+    assert _arguments_block({}) is None
+
+    # With arguments → readable, pretty-printed JSON in <pre><code>, HTML-escaped.
+    block = _arguments_block({"city": "北京", "lat": 39.9, "ok": True})
+    assert "<b>Arguments:</b>" in block
+    assert "<pre><code>" in block and "</code></pre>" in block
+    assert '"city": "北京"' in block
+    assert '"lat": 39.9' in block
+    assert '"ok": true' in block
+    # Newlines are preserved (readable), not collapsed to one line.
+    assert "\n" in block
+
+    # Argument content cannot inject HTML: a value with markup is escaped.
+    hostile = _arguments_block({"cmd": "</code><b>x</b>"})
+    assert "</code><b>x</b>" not in hostile
+    assert "&lt;/code&gt;&lt;b&gt;x&lt;/b&gt;" in hostile
+
+
+async def test_approval_prompt_shows_arguments_when_present():
+    # End-to-end: a call with arguments shows them as a readable JSON block…
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("ra", arguments={"city": "北京", "days": 3})
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "ra")
+    text = app.bot.sent[0]["text"]
+    assert "<b>Arguments:</b>" in text
+    assert '"city": "北京"' in text
+    assert '"days": 3' in text
+    await broker.shutdown()
+
+
+async def test_approval_prompt_omits_arguments_when_empty():
+    # …and an argument-free call omits the "Arguments:" section entirely.
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("rn", arguments={})  # no-arg tool (e.g. get_current_time)
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "rn")
+    text = app.bot.sent[0]["text"]
+    assert "<b>Arguments:</b>" not in text
+    assert "<pre>" not in text
+    assert "risky does a thing." in text  # the purpose line is still there
+    await broker.shutdown()
 
 
 # ---------------------------------------------------------------------------

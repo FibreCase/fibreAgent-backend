@@ -12,11 +12,15 @@ nothing from Telegram, the OpenAI SDK, or SQLAlchemy.
 
 ``ApprovalRequest`` carries only what a human needs to judge *this one call* —
 an opaque request id, the conversation, a short **hashed** principal identity,
-the tool name, and a **safe summary**. The summary is produced by
-:meth:`Tool.approval_summary` and, by default, reveals *only* the tool name and
-a fixed "arguments not shown" note. A future high-risk tool that must show a
-human what it is about to do is responsible for generating its own reviewed,
-secret-free summary — it must **never** dump raw JSON arguments by default.
+the tool name, a **safe summary**, and the **arguments** to be executed. The
+summary is produced by :meth:`Tool.approval_summary` and describes the tool's
+*purpose* (shown on the card under "What it does:"); it does not need to
+include the arguments, because the provider shows those separately (as a
+readable "Arguments:" block) from ``request.arguments`` — the already
+schema-validated mapping the loop is about to execute. A provider that renders
+the card is responsible for keeping the arguments out of logs, the audit
+table, and any model-facing error text; the loop and auditor enforce that
+independently of the provider.
 """
 
 from __future__ import annotations
@@ -51,6 +55,12 @@ class ApprovalRequest:
     * ``tool_name`` — the tool being approved (shown to the human, verbatim).
     * ``summary`` — the safe, human-readable summary (see :meth:`Tool.approval_summary`).
     * ``expires_at`` — the deadline the provider must enforce.
+    * ``arguments`` — the **already schema-validated** arguments the loop is about
+      to execute with. The provider may show them to the human (e.g. formatted as
+      readable JSON) so they can judge this specific call; the loop only ever
+      gets here *after* JSON-Schema validation, so these are well-formed. The
+      provider must keep them out of logs / the audit table / model-facing error
+      text (those invariants live in the loop and auditor, not here).
     """
 
     request_id: str
@@ -59,6 +69,7 @@ class ApprovalRequest:
     tool_name: str
     summary: str
     expires_at: datetime
+    arguments: dict[str, Any] = field(default_factory=dict)
     # Extra context the provider may need (kept opaque; nothing sensitive).
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -82,10 +93,3 @@ class ToolApprovalProvider(Protocol):
     async def shutdown(self) -> None:
         """Cancel all pending approvals; any waiting caller resolves (EXPIRED)."""
         ...
-
-
-# A fixed, non-instructional note shown when a tool does not supply a custom
-# summary. It deliberately says the arguments are withheld — the human judges
-# the *capability*, not the specific parameters, for any tool that has not opted
-# into a reviewed summary.
-DEFAULT_APPROVAL_SUMMARY = "Arguments are not shown for your safety."

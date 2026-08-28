@@ -30,6 +30,12 @@ class SystemInfoTool(Tool):
         "additionalProperties": False,
     }
 
+    def approval_summary(self, arguments: dict[str, object]) -> str:
+        # This tool takes no arguments and has no side effects, so a fixed
+        # argument-free line fully describes the action (there is nothing to
+        # reveal and no secret to leak).
+        return "Report the host name, platform, and Python version of the process running the agent."
+
     async def execute(self, arguments: dict[str, object]) -> str:
         return json.dumps(
             {

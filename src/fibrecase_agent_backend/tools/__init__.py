@@ -13,7 +13,6 @@ from __future__ import annotations
 from .approval import (
     ApprovalDecision,
     ApprovalRequest,
-    DEFAULT_APPROVAL_SUMMARY,
     ToolApprovalProvider,
 )
 from .audit import (
@@ -88,7 +87,6 @@ __all__ = [
     "ApprovalDecision",
     "ApprovalRequest",
     "ToolApprovalProvider",
-    "DEFAULT_APPROVAL_SUMMARY",
     # audit
     "ToolAuditEvent",
     "ToolAuditor",

@@ -50,7 +50,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 由 `telegram/approval.py::TelegramApprovalBroker` 实现（唯一的 Telegram 知识来源，通过 `ToolApprovalProvider` 协议注入给渠道无关的 loop）：
 
-- 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息只含固定标题、工具名、工具的安全 `summary`（**默认不回显参数**）与过期提示——**不含**任何参数、scope、chat id、密钥。
+- 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息含固定标题、工具名、工具的安全**用途摘要**（`What it does:` 一行——描述工具**做什么**：内置工具各给一句固定的用途描述，MCP 工具展示其 `description`（用途）；摘要**本身**绝不回显参数），**若这次调用有参数**再另有一段 `Arguments:`——把**已 schema 校验**的参数以易读 JSON 展示在 `<pre><code>` 里（无参数则整段省略；参数值经 HTML 转义，无法注入标签）——与过期提示。**参数只出现在这张给主人看的审批卡片上**，卡片本身**不含** scope、chat id、密钥；参数**从不**写入日志、审计表，或面向模型的回退文案。
 - 每个 pending 请求绑定到「**发起者 + 原会话**」：用不可逆的 `hash_scope` 指纹比对发起者（从不持有原始 user id），并要求同一 chat。**其他用户——即使是 allow-list 里的——都收到同样的「已过期/无效」安全答复，且永远不能批准**（不泄露请求是否存在）。
 - **一次性**：首个有效决定即消费；重复点击、未知 id、上个进程留下的陈旧按钮、已过期请求都得到安全的「expired/invalid」，**绝不执行**。
 - **卡片原地收尾**：决定（批准 / 拒绝）或超时后，**同一条**消息（按 `message_id` 定位）被**原地编辑**一次——Approve / Deny 按钮（标为 **✅ Approve** / **❌ Deny**）被移除（空 `InlineKeyboardMarkup([])`，线上序列化为 `{}`，即 Bot API「移除键盘」信号；传 `None` 会被 PTB 丢掉、按钮残留），原来的「This approval is one-time and will expire shortly.」提示行被替换为一个**加粗、带 emoji 的状态词**——`<b>✅ Approved.</b>` / `<b>❌ Denied.</b>` / `<b>⏰ Expired (no decision in time).</b>`（不加 `Status:` 前缀），不再另发一条跟进消息。收尾是 best-effort：编辑失败绝不改变已决定的结果、不抛异常、不发消息。
@@ -91,6 +91,12 @@ class MyTool(Tool):
     default_permission = ToolPermission.ASK   # 有副作用的默认 ask；确认只读无害才 ALLOW
     parameters = {"type": "object", "properties": {...}, "additionalProperties": False}
 
+    def approval_summary(self, arguments) -> str:
+        # 可选：审批卡片「What it does:」一行的用途描述。描述工具**做什么**，
+        # **绝不回显** arguments——卡片会另用 `Arguments:` 一段单独展示参数。
+        # 内置工具与 MCP 工具都已各自提供用途行；不覆盖则用「只点名工具」的通用兜底。
+        return "My tool does X."
+
     async def execute(self, arguments) -> str:
         # 短、可读的字符串；失败时 raise（registry 会转成 {"error": ...} 给模型）
 ```
@@ -98,7 +104,7 @@ class MyTool(Tool):
 然后在 `tools/builtin/__init__.py::build_default_tools()` 里 `registry.add(MyTool())`，或把自己的 `ToolRegistry` 传给 `AgentService`。**这**就是全部改动——registry 负责在 OpenAI schema 里声明它、按名分发它。
 
 - **不要**在任何地方写 `if name == "…"` 分支——registry 是唯一分发点。
-- 想给它自定义审批文案，可覆盖 `approval_summary(arguments)`（但**默认**不回显参数；只有你确信安全才展示）。
+- 想给它自定义审批文案，可覆盖 `approval_summary(arguments)`——写工具**做什么**（用途），**绝不回显 `arguments`**（默认也不回显；内置工具与 MCP 工具都已提供用途行）。
 
 **MCP / SSH / Docker / Pi** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。SSH / Docker / Pi 仍是待建的同类 provider。
 

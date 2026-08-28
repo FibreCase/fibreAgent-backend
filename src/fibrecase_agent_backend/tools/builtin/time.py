@@ -21,6 +21,10 @@ class GetCurrentTimeTool(Tool):
         "additionalProperties": False,
     }
 
+    def approval_summary(self, arguments: dict[str, object]) -> str:
+        # No arguments, no side effects: a fixed purpose line fully describes it.
+        return "Get the current local date and time of the machine running the agent."
+
     async def execute(self, arguments: dict[str, object]) -> str:
         # arguments are ignored on purpose: this tool takes no inputs.
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")

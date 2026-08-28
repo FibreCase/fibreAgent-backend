@@ -47,8 +47,8 @@ stdio: spawn 子进程(command/args/env/cwd)  → stdio 传输   ┤ → ClientS
 - `local_tool_name(server, remote)` → `mcp_<server>__<remote>`。`mcp_` 前缀 + `__` 分隔让两段无歧义，且因服务器名与远程名都取自 `[A-Za-z0-9_-]`，本地名本身也是 registry / 策略 / 审计都能接受的合法 `[A-Za-z0-9_-]+` 工具名。远程名段上限 90 字符，保证本地名不超 `tool_name` 列（`String(128)`）。
 - `McpTool` 是一等 `Tool`：`default_permission = ask`（**无条件**——远程工具绝不因远端声称只读就自动放行；主人仍可在 `MCP_PERMISSIONS_FILE` 里按**命名空间本地名**把某个 pin 成 `allow`/`deny`）。
 - `parameters` 是远端 `input_schema` 原样映射（默认 `{"type":"object","properties":{}}`），因此会被**既有** registry 门在发任何网络请求**之前** schema 校验。
-- `description` 是固定的「Remote tool '<remote>' from the configured MCP server '<server>'」前缀 + 远端描述；**服务器 instructions 永不**出现在这里。
-- `approval_summary` 固定、**不回显参数**（`<本地名> — 参数不显示`）。
+- `description` 是固定的「`(🌐Remote)`」标记前缀 + 远端描述；**服务器 instructions 永不**出现在这里（也不含服务器名 / 远程名——那两段已在本地工具名 `mcp_<server>__<remote>` 里）。
+- `approval_summary` 只返回该工具的 `description`（**用途**——即上面那条前缀 + 远端描述），**绝不回显（远端）参数**。审批卡片在 `What it does:` 一行展示它；（若这次调用有参数）卡片另有一段 `Arguments:`，把**已 schema 校验**的参数以易读 JSON 展示在 `<pre><code>` 里（无参数则整段省略）。参数**只**出现在这张给主人看的审批卡片上——**从不**写入日志、审计表，或面向模型的回退文案。
 
 ## 执行与结果映射
 

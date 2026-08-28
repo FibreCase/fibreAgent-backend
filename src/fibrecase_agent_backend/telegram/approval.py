@@ -25,11 +25,16 @@ Security properties, matching the task spec:
   ``asyncio.Future`` under ``asyncio.wait_for`` — it never blocks the event
   loop, never polls, and performs no I/O beyond the prompt send and the single
   in-place edit that finalises the card once the approval is decided or expires.
-* **Secret-free UI.** The message shows only a fixed title, the tool name, the
-  tool's safe ``summary`` (which by default withholds the arguments), and an
-  expiry hint. When the approval is decided (or times out) the card is edited in
-  place — the (emoji-labelled) Approve/Deny buttons are removed and the hint line
-  is replaced by a bold, emoji-tagged status word (*Approved* / *Denied* /
+* **Secret-free UI.** The message shows only a fixed title, the tool name, a
+  safe "what it does" summary (the tool's purpose), and an expiry hint. When the
+  call carries arguments (already schema-validated by the loop) an "Arguments:"
+  block shows them as readable JSON — the card is owner-only and the arguments
+  are what makes the approve/deny judgment meaningful; an argument-free call
+  omits the block. Arguments are **never** written to logs, the audit table, or
+  model-facing error text (those invariants live in the loop / auditor, not
+  here). When the approval is decided (or times out) the card is edited in place
+  — the (emoji-labelled) Approve/Deny buttons are removed and the hint line is
+  replaced by a bold, emoji-tagged status word (*Approved* / *Denied* /
   *Expired*) — so a live Approve/Deny row never lingers. The callback data
   carries only a version tag, the opaque request id, and the decision — never
   args, scope, chat id, a secret, or the tool name.
@@ -41,8 +46,10 @@ button from a previous run is indistinguishable from an unknown id.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler, ContextTypes
@@ -86,6 +93,49 @@ def _html_escape(text: str) -> str:
     in ``&lt;``/``&gt;`` are not re-escaped.
     """
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _arguments_block(arguments: dict[str, Any]) -> str | None:
+    """The card's ``Arguments:`` section as Telegram HTML, or ``None`` when the
+    call has no arguments (an empty mapping) — in which case the whole section
+    is omitted. The value is the **already schema-validated** arguments
+    formatted as readable, pretty-printed JSON and wrapped in ``<pre><code>``
+    (Telegram's code-block tags, which preserve the newlines). It is escaped so
+    no argument content can form a tag; ``ensure_ascii=False`` keeps non-ASCII
+    (e.g. CJK) values readable instead of ``\\uXXXX``. ``default=str`` is a
+    backstop for any non-JSON value (validated args are JSON-native, so this
+    normally never fires).
+    """
+    if not arguments:
+        return None
+    pretty = json.dumps(arguments, indent=2, ensure_ascii=False, default=str)
+    return f"<b>Arguments:</b>\n<pre><code>{_html_escape(pretty)}</code></pre>"
+
+
+def _card_text(request: ApprovalRequest, footer: str) -> str:
+    """The full Telegram-HTML approval card body, single-sourced for both the
+    initial prompt and the in-place finalisation.
+
+    ``footer`` is the trailing line — the "one-time / will expire" hint on the
+    prompt, or the bold, emoji-tagged status word once decided/expired. Both are
+    fixed, backend-authored HTML and are inserted **verbatim** (never escaped).
+
+    Layout: the fixed title, the tool name, the "What it does" purpose summary,
+    an "Arguments:" block (readable JSON) **only when the call has arguments**,
+    then the footer. Every interpolated *data* value (tool name, summary,
+    arguments) is HTML-escaped so nothing can break the markup or inject a tag.
+    """
+    lines = [
+        _APPROVAL_TITLE,
+        "",
+        f"<b>Tool:</b> {_html_escape(request.tool_name)}",
+        f"<b>What it does:</b> {_html_escape(request.summary)}",
+    ]
+    args_block = _arguments_block(request.arguments)
+    if args_block is not None:
+        lines.append(args_block)
+    lines += ["", footer]
+    return "\n".join(lines)
 
 
 class _Pending:
@@ -289,16 +339,11 @@ class TelegramApprovalBroker:
             ]
         )
         # This message is sent with parse_mode=HTML, so it must be *Telegram HTML*
-        # (<b>/<i>), not Markdown (** / _) — otherwise the markers show literally.
-        # The template is fixed and backend-authored; the two interpolated values
-        # (tool name, summary) are escaped so a future custom summary cannot break
-        # the tag markup or inject HTML.
-        text = (
-            f"{_APPROVAL_TITLE}\n\n"
-            f"<b>Tool:</b> {_html_escape(request.tool_name)}\n"
-            f"<b>Summary:</b> {_html_escape(request.summary)}\n\n"
-            f"{_APPROVAL_HINT}"
-        )
+        # (<b>/<i>/<pre>), not Markdown (** / _) — otherwise the markers show
+        # literally. The template is fixed and backend-authored; every interpolated
+        # value (tool name, summary, arguments) is escaped inside _card_text so a
+        # custom summary or argument content cannot break the markup or inject HTML.
+        text = _card_text(request, _APPROVAL_HINT)
         message = await self._application.bot.send_message(
             chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard
         )
@@ -317,7 +362,8 @@ class TelegramApprovalBroker:
 
         ``status`` is already Telegram-HTML (a fixed, bold, emoji-tagged
         constant) — it is inserted verbatim, **not** escaped, so its ``<b>`` tags
-        render. The only interpolated *data* (tool name, summary) is escaped.
+        render. Every interpolated *data* value (tool name, summary, arguments)
+        is escaped inside :func:`_card_text`.
 
         Passing ``reply_markup=InlineKeyboardMarkup([])`` is what removes the
         keyboard: the empty markup serialises to ``{}`` on the wire (the Bot API
@@ -325,12 +371,7 @@ class TelegramApprovalBroker:
         by PTB entirely and leave the old buttons in place.
         """
         try:
-            text = (
-                f"{_APPROVAL_TITLE}\n\n"
-                f"<b>Tool:</b> {_html_escape(request.tool_name)}\n"
-                f"<b>Summary:</b> {_html_escape(request.summary)}\n\n"
-                f"{status}"
-            )
+            text = _card_text(request, status)
             await self._application.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,

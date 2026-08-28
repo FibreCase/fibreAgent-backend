@@ -160,8 +160,9 @@ async def test_mcp_tool_appears_in_schema_and_defaults_ask():
     names = [t["function"]["name"] for t in tools]
     assert names == ["mcp_alpha__get_weather"]
     assert tools[0]["function"]["parameters"] == {"type": "object", "properties": {}}
-    # The description never includes server instructions — only the fixed prefix.
-    assert "Remote tool 'get_weather' from the configured MCP server 'alpha'" in tools[0]["function"]["description"]
+    # The description is the fixed remote marker + the remote description only —
+    # it never includes server instructions or the server/remote *names*.
+    assert tools[0]["function"]["description"] == "(🌐Remote) remote does a thing"
 
 
 # ===========================================================================
@@ -468,8 +469,12 @@ async def test_mcp_approval_summary_never_echoes_args(caplog):
     approval = _FakeApproval(ApprovalDecision.APPROVED)
     with caplog.at_level(logging.INFO, logger="agent.tools"):
         await run_tool_loop(llm, _ctx(), registry, policy=_policy(), approval_provider=approval, auditor=_RecordingAuditor())
-    # The approval prompt shows the tool + "arguments withheld", never the args.
+    # The approval summary shows the tool's purpose only (never the arguments);
+    # the (remote) arguments ride on the request so the card can show them, but
+    # they are still never written to the logs.
     assert "secret-city" not in approval.requests[0].summary
+    assert "remote does a thing" in approval.requests[0].summary  # purpose shown
+    assert approval.requests[0].arguments == {"city": "secret-city"}  # card shows them
     # Logs never carry the arguments either.
     assert "secret-city" not in caplog.text
 

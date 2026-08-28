@@ -25,6 +25,12 @@ class EchoTool(Tool):
         "additionalProperties": False,
     }
 
+    def approval_summary(self, arguments: dict[str, object]) -> str:
+        # A fixed purpose line. The echo argument is the user's own input and
+        # could be anything (incl. text that looks like secrets), so it is NOT
+        # shown here — only what the tool does.
+        return "Echo a message back to the conversation, verbatim."
+
     async def execute(self, arguments: dict[str, object]) -> str:
         message = arguments.get("message", "")
         return str(message)

@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ..tools import DEFAULT_APPROVAL_SUMMARY, Tool, ToolPermission
+from ..tools import Tool, ToolPermission
 
 logger = logging.getLogger("mcp")
 
@@ -100,25 +100,22 @@ class McpTool(Tool):
         session: Any,
         max_result_chars: int,
     ) -> None:
-        self._server_name = server_name
         self._remote_name = remote_name
         self._session = session
         self._max_result_chars = max_result_chars
         self.name = local_tool_name(server_name, remote_name)
-        # A fixed, remote-independent prefix so the model knows this is a
-        # configured remote tool; the remote description follows. The server's
-        # *instructions* are deliberately never part of this.
-        self.description = (
-            f"Remote tool '{remote_name}' from the configured MCP server "
-            f"'{server_name}'. " + (description or "")
-        ).strip()
+        # A short, remote-invariant marker so the model (and the approval card)
+        # know this is a configured remote tool; the remote description follows.
+        # The server's *instructions* are deliberately never part of this.
+        self.description = f"(🌐Remote) {(description or '')}".strip()
         self.parameters = parameters if isinstance(parameters, dict) and parameters else dict(_DEFAULT_PARAMETERS)
 
     def approval_summary(self, arguments: dict[str, Any]) -> str:
-        # Fixed, argument-free — the base default already satisfies the
-        # "MCP tool <local name>" + "arguments not shown" contract and never
-        # echoes the (remote) arguments. Kept explicit so the intent is obvious.
-        return f"{self.name} — {DEFAULT_APPROVAL_SUMMARY}"
+        # Show the tool's *purpose* (self.description: a fixed remote-invariant
+        # marker plus the server-declared description) — this is the "what it
+        # does" line. The (remote) arguments are shown separately on the card by
+        # the approval provider (as a readable-JSON "Arguments:" block), not here.
+        return self.description
 
     async def execute(self, arguments: dict[str, Any]) -> str:
         """Forward one call to the remote server and return a bounded result.

@@ -16,7 +16,6 @@ from __future__ import annotations
 import abc
 from typing import Any
 
-from .approval import DEFAULT_APPROVAL_SUMMARY
 from .policy import ToolPermission
 
 
@@ -69,13 +68,15 @@ class Tool(abc.ABC):
     def approval_summary(self, arguments: dict[str, Any]) -> str:
         """A safe, human-readable summary of a pending call, for approval.
 
-        The **default deliberately does not echo the arguments** — it only says
-        the tool's name and that arguments are withheld. This is the safe
-        baseline: a human is asked to approve a *capability*, not shown raw,
-        potentially secret-laden parameters. A future high-risk tool that
-        genuinely needs to show a human *what it is about to do* overrides this
-        and must return a **reviewed, secret-free** string — it must never dump
-        ``arguments`` as JSON.
+        Shown on the approval card under a ``What it does:`` line. It should
+        describe the tool's **purpose** so the human can judge the capability.
+        The tool's **arguments** are shown separately on the card (a readable
+        "Arguments:" block the approval provider renders from the
+        already-validated ``arguments``) — so this summary does **not** need to
+        include them and normally does not. The built-ins and the MCP ``McpTool``
+        override this with a purpose line; the **default here** only names the
+        tool (a tool with a richer, reviewed, secret-free purpose line should
+        override it).
         """
-        return f"{self.name} — {DEFAULT_APPROVAL_SUMMARY}"
+        return f"Run the {self.name} tool."
 

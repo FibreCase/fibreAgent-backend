@@ -354,6 +354,7 @@ async def _execute_gated(
             tool_name=name,
             summary=tool.approval_summary(args_for_exec),
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=approval_timeout_seconds),
+            arguments=args_for_exec,
         )
         try:
             decision = await approval.request_approval(request)
