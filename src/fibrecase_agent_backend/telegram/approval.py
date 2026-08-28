@@ -84,6 +84,17 @@ _APPROVAL_DENY_LABEL = "❌ Deny"
 _APPROVAL_APPROVED_STATUS = "<b>✅ Approved.</b>"
 _APPROVAL_DENIED_STATUS = "<b>❌ Denied.</b>"
 _APPROVAL_EXPIRED_STATUS = "<b>⏰ Expired (no decision in time).</b>"
+# The card's Arguments JSON is bounded so the whole prompt stays under Telegram's
+# ~4096-char per-message limit — an over-limit send would raise and fail the
+# approval *closed* (the owner could never Approve it). The budget leaves room
+# for the fixed card chrome (title / tool / purpose / hint) around the JSON.
+# It is applied to the *escaped* text (not the raw JSON) because escaping can
+# inflate a value full of ``& < >`` several-fold.
+_ARGUMENTS_MAX_CHARS = 3700
+# Appended (inside the code block) when the Arguments JSON was truncated —
+# fixed, secret-free, and tells the owner the full arguments were shown only up
+# to the cap (they remain available by re-issuing the call or via exec/edit read).
+_ARGUMENTS_TRUNCATED_MARK = "\n\n[Arguments truncated to fit the message]"
 
 
 def _html_escape(text: str) -> str:
@@ -95,21 +106,43 @@ def _html_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _bound_arguments(pretty: str) -> str:
+    """Escape ``pretty`` and, if the escaped result exceeds
+    :data:`_ARGUMENTS_MAX_CHARS`, truncate it (and append the fixed truncation
+    marker). Truncation is on the *escaped* string so a value full of
+    ``& < >`` cannot inflate the card past the cap; a cut that lands inside an
+    HTML entity is repaired (the partial entity is dropped) so the message is
+    never left with a dangling ``&…`` that Telegram would reject.
+    """
+    escaped = _html_escape(pretty)
+    if len(escaped) <= _ARGUMENTS_MAX_CHARS:
+        return escaped
+    cut = escaped[:_ARGUMENTS_MAX_CHARS]
+    # Drop a trailing partial entity (a '&' that does not end a complete
+    # ``&amp;``/``&lt;``/``&gt;``) so the message stays well-formed HTML.
+    amp = cut.rfind("&")
+    if amp != -1 and not cut[amp:].endswith(("amp;", "lt;", "gt;")):
+        cut = cut[:amp]
+    return cut + _ARGUMENTS_TRUNCATED_MARK
+
+
 def _arguments_block(arguments: dict[str, Any]) -> str | None:
     """The card's ``Arguments:`` section as Telegram HTML, or ``None`` when the
     call has no arguments (an empty mapping) — in which case the whole section
     is omitted. The value is the **already schema-validated** arguments
     formatted as readable, pretty-printed JSON and wrapped in ``<pre><code>``
     (Telegram's code-block tags, which preserve the newlines). It is escaped so
-    no argument content can form a tag; ``ensure_ascii=False`` keeps non-ASCII
-    (e.g. CJK) values readable instead of ``\\uXXXX``. ``default=str`` is a
-    backstop for any non-JSON value (validated args are JSON-native, so this
+    no argument content can form a tag, and **bounded** (see
+    :func:`_bound_arguments`) so the whole card stays under Telegram's
+    single-message limit and is never unapprovable. ``ensure_ascii=False`` keeps
+    non-ASCII (e.g. CJK) values readable instead of ``\\uXXXX``; ``default=str``
+    is a backstop for any non-JSON value (validated args are JSON-native, so this
     normally never fires).
     """
     if not arguments:
         return None
     pretty = json.dumps(arguments, indent=2, ensure_ascii=False, default=str)
-    return f"<b>Arguments:</b>\n<pre><code>{_html_escape(pretty)}</code></pre>"
+    return f"<b>Arguments:</b>\n<pre><code>{_bound_arguments(pretty)}</code></pre>"
 
 
 def _card_text(request: ApprovalRequest, footer: str, *, show_arguments: bool = True) -> str:
@@ -121,13 +154,17 @@ def _card_text(request: ApprovalRequest, footer: str, *, show_arguments: bool = 
     fixed, backend-authored HTML and are inserted **verbatim** (never escaped).
 
     Layout: the fixed title, the tool name, the "What it does" purpose summary,
-    an "Arguments:" block (readable JSON) **only when the call has arguments and
-    ``show_arguments`` is set**, then the footer. The prompt shows the arguments
-    (the owner needs them to judge the call); the in-place finalisation passes
-    ``show_arguments=False`` so the resolved card — with its buttons already
-    removed — drops the Arguments section too. Every interpolated *data* value
-    (tool name, summary, arguments) is HTML-escaped so nothing can break the
-    markup or inject a tag.
+    the argument section **only when ``show_arguments`` is set**, then the footer.
+    The argument section is either the tool's friendly plain-text ``detail``
+    (shown under an ``Action:`` label, when the tool supplies one via
+    :meth:`Tool.approval_detail`) or, otherwise, the generic readable-JSON
+    ``Arguments:`` block — and is omitted for an argument-free call with no
+    detail. The prompt shows it (the owner needs it to judge the call); the
+    in-place finalisation passes ``show_arguments=False`` so the resolved card —
+    with its buttons already removed — drops it too. Every interpolated *data*
+    value (tool name, summary, the arguments/detail) is HTML-escaped and bounded
+    so nothing can break the markup, inject a tag, or overflow Telegram's
+    single-message limit.
     """
     lines = [
         _APPROVAL_TITLE,
@@ -136,9 +173,16 @@ def _card_text(request: ApprovalRequest, footer: str, *, show_arguments: bool = 
         f"<b>What it does:</b> {_html_escape(request.summary)}",
     ]
     if show_arguments:
-        args_block = _arguments_block(request.arguments)
-        if args_block is not None:
-            lines.append(args_block)
+        if request.detail:
+            # The tool provided a friendly, faithful plain-text view of the
+            # arguments (e.g. edit's structured diff). It is HTML-escaped and
+            # bounded exactly like the JSON block, and wrapped in <pre><code> so
+            # its newlines (the exact old_string/new_string) are preserved.
+            block = f"<b>Action:</b>\n<pre><code>{_bound_arguments(request.detail)}</code></pre>"
+        else:
+            block = _arguments_block(request.arguments)
+        if block is not None:
+            lines.append(block)
     lines += ["", footer]
     return "\n".join(lines)
 

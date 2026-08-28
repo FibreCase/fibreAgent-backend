@@ -80,15 +80,19 @@ class AgentBackend:
             timeout=config.openai_timeout,
         )
         # The tool registry is built only when tools are enabled; when disabled
-        # the service degrades to the phase-one single-completion path. The
-        # ``exec`` shell tool is added only when both tools and the exec opt-in
-        # are on (a default deployment stays subprocess-free).
+        # the service degrades to the phase-one single-completion path. The two
+        # state-changing tools are added only when their opt-ins are on (a default
+        # deployment stays subprocess-free and touch-free).
         if config.enable_tools:
             registry = build_default_tools(
                 enable_exec=config.enable_exec_tool,
                 max_exec_output_chars=config.max_exec_tool_result_chars,
                 exec_workdir=config.exec_workdir,
                 exec_policy_deny_patterns=config.exec_policy_deny_patterns,
+                enable_edit=config.enable_edit_tool,
+                edit_workdir=config.edit_workdir,
+                max_edit_string_chars=config.max_edit_string_chars,
+                max_edit_read_chars=config.max_edit_read_chars,
             )
         else:
             registry = None

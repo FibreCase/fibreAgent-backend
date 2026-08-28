@@ -47,6 +47,10 @@ cp .env.example .env
 | `MAX_EXEC_TOOL_RESULT_CHARS` | `exec` 单条命令 stdout / stderr 各自的**尾截断**上限，默认 `8000`。超限时保留**尾部** N 字符并在前置固定标记 `[N chars of earlier output truncated]`（**不是**报错，也不像 MCP/infra 那样按稳定码拒绝——因为这是已被批准命令的直接结果，尾部正是最常看的部分）。`>= 1`；仅在 `ENABLE_EXEC_TOOL=true` 时校验。 |
 | `EXEC_WORKDIR` | `exec` 命令运行的固定目录；空（默认）= 进程当前工作目录。设置时必须是**已存在目录**，否则启动期 `ConfigError`（fail-fast）。仅在 `ENABLE_EXEC_TOOL=true` 时校验。 |
 | `EXEC_POLICY_DENY_PATTERNS` | 追加到 `exec` 静态灾难性命令 denylist 的正则，JSON **字符串数组**，默认空。**add-only**：核心列表（`tools/exec_policy.py` 代码编译、恒生效）不可删，此旋钮只能追加。坏 JSON / 非数组 / 非字符串元素 / 空白元素 / 不合法正则 → 启动期 `ConfigError`（点名数组索引，**从不**回显 pattern 正文）；**始终**校验，即便 `ENABLE_EXEC_TOOL=false`。 |
+| `ENABLE_EDIT_TOOL` | **可选 `edit` 文件编辑工具的开关**，默认 `false`。`false` → 不注册、不广告、默认部署**零文件写入**；`true` + `ENABLE_TOOLS=true` → 注册 `edit`（在 `EDIT_WORKDIR` 内读 / 精确替换，**恒 `ask`**，每次调用需一次性人工审批、`path`/`old_string`/`new_string` 逐字展示）。建议用 `EDIT_WORKDIR` 指定一个明确的编辑根目录。 |
+| `EDIT_WORKDIR` | `edit` 的路径受限根目录。**启用时必填**且必须是**已存在目录**（否则启动期 `ConfigError`，fail-fast）。比 `EXEC_WORKDIR`（可选）更严——限定目录是 `edit` 的安全前提，强制属主显式选择编辑根；`..` 逃逸与指向外部的符号链接在此目录外被拒（任何 I/O 之前）。仅在 `ENABLE_EDIT_TOOL=true` 时校验。 |
+| `MAX_EDIT_STRING_CHARS` | `edit` 的 `replace` 中 `old_string`/`new_string` 各自的长度上限，默认 `2000`。同时烧进参数 schema 的 `maxLength`——既约束模型提案，也把审批卡 `Arguments:` 块压到有界尺寸。`>= 1`；仅在 `ENABLE_EDIT_TOOL=true` 时校验。 |
+| `MAX_EDIT_READ_CHARS` | `edit` 的 `read` 结果内容的**尾截断**上限，默认 `8000`。超限时保留**尾部** N 字符并前置固定标记 `[N chars of earlier output truncated]`（**不是**报错，也不按稳定码拒绝——因为这次读已被人工批准）。`>= 1`；仅在 `ENABLE_EDIT_TOOL=true` 时校验。 |
 | `MAX_IMAGE_SIZE_MB` | 单张 Telegram 图片的最大字节数（MB），默认 `10`。超过则返回「图片过大，暂时无法处理。」，不会发给模型。 |
 | `ATTACHMENT_STORAGE_PATH` | 持久化图片附件 blob 的根目录，默认 `./data/attachments`（相对工作目录，目录按需自动创建）。图片**字节**存在这里（按 SHA-256 内容寻址、去重、原子写入），数据库里只存元数据。Docker 下默认路径落在 `./data` 绑定挂载内，随容器持久化。 |
 | `MAX_MEMORIES_PER_SCOPE` | 每个账号（scope）可保存的记忆条数上限，默认 `200`。超过时 `/remember` 返回「记忆已达上限」提示。 |
@@ -77,6 +81,7 @@ cp .env.example .env
 - OAuth 项：`OAUTH_CALLBACK_BASE_URL` 非空时必须是裸 origin（绝对 `http(s)://` + host、无 userinfo/path/query/fragment/末尾斜杠），否则 `ConfigError`；`OAUTH_CALLBACK_PORT` 须 `1..65535`；`OAUTH_STATE_TTL_SECONDS` 必须 `> 0`。Google client id / secret 缺失**不是**错误——只是 google provider 未配置。
 - Infra 项（phase 5.1）：`INFRA_SSH_CONNECT_TIMEOUT_SECONDS` 必须为正、`MAX_INFRA_TOOL_RESULT_CHARS` 必须 `>= 1`，且 `INFRA_SSH_CONNECT_TIMEOUT_SECONDS <= TOOL_TIMEOUT_SECONDS`（跨项不变量）——违反任一即 `ConfigError`。目标列表的**来源**（`INFRA_SSH_TARGETS_FILE` 设置时优先，否则默认文件 `config/infra_ssh_targets.json` 存在时读它，否则内联 `INFRA_SSH_TARGETS`）与 `MCP_SERVERS_FILE` 同思路：`INFRA_SSH_TARGETS_FILE` 设置了却**不存在 / 不可读 / 为空（0 字节或空白）**同样 `ConfigError`（点名路径，绝不静默禁用 provider；文件里显式 `[]` 表示无目标）；默认文件**存在但为空**同样 `ConfigError`（存在但空不得静默当作「无目标」）。解析出的**结构**在 `load_config` 里强校验：非法 JSON、非数组、非对象条目、坏/重复 `name`、坏 `host`（含 user/port/路径/空白）、非 int 或越界 `port`、坏 `username`、缺失/含 `..`/软链/目录的 key 或 known_hosts 文件（路径**绝对或相对工作目录**均可）、空的 known_hosts、坏/超长 `mounts`/`services`——都 `ConfigError`。报错只点名目标（或其索引）与字段，**从不**回显 host、key 路径、known_hosts 路径或 mount 路径（service/单元名可作为操作者自选的非秘密值出现）。
 - `exec` 项（可选 shell 工具）：`MAX_EXEC_TOOL_RESULT_CHARS` 必须 `>= 1`、`EXEC_WORKDIR` 若设置必须是**已存在目录**——两者**仅当 `ENABLE_EXEC_TOOL=true`** 时校验（沿用「关闭的可选能力不强制其配置」惯例，关闭时设不设置都不影响启动）。`EXEC_POLICY_DENY_PATTERNS` **始终**强校验（即便 `ENABLE_EXEC_TOOL=false`）：非法 JSON、非数组、非字符串元素、空白元素、或不合法的正则 → `ConfigError`（点名数组**索引**，**从不**回显 pattern 正文）。
+- `edit` 项（可选文件编辑工具）：`MAX_EDIT_STRING_CHARS` 与 `MAX_EDIT_READ_CHARS` 都必须 `>= 1`，且 `EDIT_WORKDIR` 必须是**已存在目录**（**必填**，缺省/空白也报错）——三者**仅当 `ENABLE_EDIT_TOOL=true`** 时校验（沿用「关闭的可选能力不强制其配置」惯例，关闭时设不设置都不影响启动）。比 `exec` 严格在 `EDIT_WORKDIR` 上：`EXEC_WORKDIR` 可缺省（=进程 cwd），而 `EDIT_WORKDIR` 因是 `edit` 路径受限的安全前提，启用即强制。
 
 ## System Prompt
 

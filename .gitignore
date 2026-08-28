@@ -32,6 +32,8 @@ config/ssh_known_hosts
 # This same data/ dir is also the Docker bind-mount source (compose: ./data:/app/data).
 data/*
 !data/.gitkeep
+workspace/*
+!workspace/.gitkeep
 
 # Local temporary notes / task specs — not part of the project
 TASK*.md

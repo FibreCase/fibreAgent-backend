@@ -80,3 +80,24 @@ class Tool(abc.ABC):
         """
         return f"Run the {self.name} tool."
 
+    def approval_detail(self, arguments: dict[str, Any]) -> str | None:
+        """An optional, human-friendly view of a pending call's arguments.
+
+        Shown on the approval card **in place of** the generic readable-JSON
+        "Arguments:" block, so a tool whose raw arguments are cold to read (e.g.
+        ``edit``'s ``old_string`` / ``new_string``) can present them as a clear,
+        structured diff. It returns **plain text** — *no* markup: the approval
+        provider HTML-escapes and length-bounds it exactly like the summary, so a
+        value containing markup can't inject a tag and the card can't overflow
+        Telegram's message limit. The default is ``None``: the provider then
+        renders the arguments as the generic pretty-JSON block (the behaviour for
+        every tool that does not override this).
+
+        Two rules, same spirit as :meth:`approval_summary`: keep it **faithful** —
+        show the *real* argument values (whitespace / newlines included), never a
+        lossy paraphrase — so the owner approves exactly what will run; and keep
+        it **secret-free in the log** — the provider only ever puts it on the
+        owner-only card, never in logs, the audit table, or model-facing text.
+        """
+        return None
+

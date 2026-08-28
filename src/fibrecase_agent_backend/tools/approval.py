@@ -61,6 +61,12 @@ class ApprovalRequest:
       gets here *after* JSON-Schema validation, so these are well-formed. The
       provider must keep them out of logs / the audit table / model-facing error
       text (those invariants live in the loop and auditor, not here).
+    * ``detail`` — an optional, human-friendly plain-text view of ``arguments``
+      (see :meth:`Tool.approval_detail`), supplied when a tool wants to present
+      its arguments as a structured diff instead of the generic JSON block. Empty
+      (the default) means "render the arguments as the generic pretty-JSON block";
+      a non-empty value is rendered in its place. It carries the same
+      show-on-card-only / never-in-logs constraint as ``arguments``.
     """
 
     request_id: str
@@ -70,6 +76,8 @@ class ApprovalRequest:
     summary: str
     expires_at: datetime
     arguments: dict[str, Any] = field(default_factory=dict)
+    # Optional friendly argument view (plain text); empty → generic JSON block.
+    detail: str = ""
     # Extra context the provider may need (kept opaque; nothing sensitive).
     metadata: dict[str, Any] = field(default_factory=dict)
 

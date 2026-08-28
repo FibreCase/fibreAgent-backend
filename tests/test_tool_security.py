@@ -97,6 +97,19 @@ class _FakeApproval:
         self.shutdown_called = True
 
 
+class EchoLike(Tool):
+    """A minimal ``ask`` tool that does NOT override ``approval_detail`` — the
+    base default (returns ``None``) is what this test exercises."""
+
+    name = "echo_like"
+    description = "d"
+    default_permission = ToolPermission.ASK
+    parameters = {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}
+
+    async def execute(self, arguments):
+        return str(arguments.get("message", ""))
+
+
 # ---------------------------------------------------------------------------
 # required #3 — deny tool is withheld from the schema and never executed
 # ---------------------------------------------------------------------------
@@ -318,6 +331,59 @@ async def test_ask_tool_expired_not_executed():
     assert "started" not in auditor.types
     assert "approval_expired" in auditor.types
     assert json.loads(llm.calls[1]["messages"][-1]["content"])["error"]["code"] == "approval_expired"
+
+
+async def test_loop_passes_approval_detail_to_request():
+    # The loop calls tool.approval_detail(...) on an ask tool and carries the
+    # result on ApprovalRequest.detail — the channel-agnostic seam for a custom
+    # argument view on the approval card (edit / exec override it; others don't).
+    class DetailTool(Tool):
+        name = "detail_tool"
+        description = "d"
+        default_permission = ToolPermission.ASK
+        parameters = {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}
+
+        def approval_detail(self, arguments):
+            return f"$ {arguments['cmd']}"
+
+        async def execute(self, arguments):
+            return "ok"
+
+    reg = ToolRegistry().add(DetailTool())
+    auditor = _RecordingAuditor()
+    approval = _FakeApproval(ApprovalDecision.APPROVED)
+    llm = _ScriptedLLM([
+        LLMResult(content=None, tool_calls=[_tc("detail_tool", {"cmd": "ls -la"})]),
+        LLMResult(content="done"),
+    ])
+    await run_tool_loop(
+        llm, _ctx(), reg, policy=build_policy({}, registry=reg),
+        auditor=auditor, approval_provider=approval,
+    )
+    assert len(approval.requests) == 1
+    # The tool-provided detail view reaches the request verbatim…
+    assert approval.requests[0].detail == "$ ls -la"
+    # …while the raw (schema-validated) arguments also ride along.
+    assert approval.requests[0].arguments == {"cmd": "ls -la"}
+
+
+async def test_loop_leaves_detail_empty_when_tool_does_not_override():
+    # A tool that does not override approval_detail (the base default returns
+    # None) yields an empty detail — the provider then falls back to the generic
+    # JSON Arguments block. Regression: no crash, no stray detail.
+    reg = ToolRegistry().add(EchoLike())
+    auditor = _RecordingAuditor()
+    approval = _FakeApproval(ApprovalDecision.APPROVED)
+    llm = _ScriptedLLM([
+        LLMResult(content=None, tool_calls=[_tc("echo_like", {"message": "hi"})]),
+        LLMResult(content="done"),
+    ])
+    await run_tool_loop(
+        llm, _ctx(), reg, policy=build_policy({}, registry=reg),
+        auditor=auditor, approval_provider=approval,
+    )
+    assert approval.requests[0].detail == ""
+    assert approval.requests[0].arguments == {"message": "hi"}
 
 
 # ---------------------------------------------------------------------------

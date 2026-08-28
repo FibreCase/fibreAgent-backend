@@ -23,7 +23,10 @@ from fibrecase_agent_backend.llm.client import LLMResult
 from fibrecase_agent_backend.memory import hash_scope
 from fibrecase_agent_backend.telegram.approval import (
     TelegramApprovalBroker,
+    _ARGUMENTS_MAX_CHARS,
+    _ARGUMENTS_TRUNCATED_MARK,
     _arguments_block,
+    _bound_arguments,
     _card_text,
     decision_from,
     request_id_from,
@@ -99,7 +102,7 @@ class _FakeUpdate:
         self.effective_user = type("U", (), {"id": user_id})()
 
 
-def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None, arguments=None):
+def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None, arguments=None, detail=None):
     return ApprovalRequest(
         request_id=request_id,
         conversation_id=5,
@@ -108,6 +111,7 @@ def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", sec
         summary=summary or f"{tool} does a thing.",
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=seconds),
         arguments=arguments if arguments is not None else {},
+        detail=detail if detail is not None else "",
     )
 
 
@@ -583,6 +587,123 @@ def test_arguments_block_renders_readable_json_and_omits_when_empty():
     hostile = _arguments_block({"cmd": "</code><b>x</b>"})
     assert "</code><b>x</b>" not in hostile
     assert "&lt;/code&gt;&lt;b&gt;x&lt;/b&gt;" in hostile
+
+
+def test_bound_arguments_truncates_when_over_cap():
+    # Under the cap → escaped verbatim, no marker.
+    small = _bound_arguments('{"a": 1}')
+    assert small == '{"a": 1}'
+    assert _ARGUMENTS_TRUNCATED_MARK not in small
+
+    # Over the cap → cut to the budget + the fixed marker, never the raw length.
+    big = "x" * (_ARGUMENTS_MAX_CHARS + 500)
+    out = _bound_arguments(big)
+    assert out.startswith(_ARGUMENTS_MAX_CHARS * "x")
+    assert out.endswith(_ARGUMENTS_TRUNCATED_MARK)
+    # The marker is the only thing past the cut, so the result length is bounded.
+    assert len(out) == _ARGUMENTS_MAX_CHARS + len(_ARGUMENTS_TRUNCATED_MARK)
+
+
+def test_bound_arguments_repairs_dangling_entity_at_cut():
+    # Force the cut to land mid-entity: a run of '<' escapes to '&lt;' (4 chars).
+    pad = "<" * 20000  # -> '&lt;' * 20000 in escaped form
+    out = _bound_arguments(pad)
+    # The marker is appended last, so inspect only the truncated content before it.
+    cut = out[: -len(_ARGUMENTS_TRUNCATED_MARK)]
+    # No dangling entity: after the last '&' (if any) comes a complete entity or
+    # the end — never a lone '&' or partial '&l…' that would break Telegram HTML.
+    tail_amp = cut.rfind("&")
+    after = cut[tail_amp:] if tail_amp != -1 else ""
+    assert after in ("", "&amp;", "&lt;", "&gt;")
+    assert out.endswith(_ARGUMENTS_TRUNCATED_MARK)
+
+
+def test_arguments_block_bounded_for_worst_case_edit_replace():
+    # Two strings at the default schema cap: the card must stay under Telegram's
+    # ~4096 single-message limit (so it is approvable). At this size the JSON does
+    # exceed the budget, so it is truncated — bounded, never unapprovable.
+    block = _arguments_block(
+        {"operation": "replace", "path": "f.txt", "old_string": "a" * 2000, "new_string": "b" * 2000}
+    )
+    assert len(block) < 4096
+    assert _ARGUMENTS_TRUNCATED_MARK in block  # the bound engaged at this size
+    assert block.endswith("</code></pre>")  # still well-formed
+
+
+def test_arguments_block_not_truncated_for_typical_edit():
+    # A normal (small) edit shows old_string/new_string in full — no truncation.
+    block = _arguments_block({"operation": "replace", "path": "f.txt", "old_string": "foo", "new_string": "bar"})
+    assert _ARGUMENTS_TRUNCATED_MARK not in block
+    assert '"old_string": "foo"' in block and '"new_string": "bar"' in block
+
+
+def test_detail_shown_under_action_label_and_escaped():
+    # A tool-supplied friendly detail view is shown under an "Action:" label, in
+    # place of the JSON "Arguments:" block, wrapped in a code block.
+    detail = "📄 File: f.txt\n🔁 Operation: replace (replace_all: no)\n── old_string ──\nfoo\n── new_string ──\nbar"
+    req = _request(detail=detail, arguments={"operation": "replace", "path": "f.txt", "old_string": "foo", "new_string": "bar"})
+    text = _card_text(req, "<i>hint</i>")
+    assert "<b>Action:</b>" in text
+    assert "<b>Arguments:</b>" not in text  # the JSON block is *replaced*, not added
+    assert "<pre><code>" in text and "</code></pre>" in text
+    # The exact old/new values are present, newlines preserved (faithful).
+    assert "foo" in text and "bar" in text
+    assert "── old_string ──" in text and "── new_string ──" in text
+
+
+def test_detail_is_html_escaped_and_bounded():
+    # Markup in the detail cannot inject a tag (escaped like the JSON block)…
+    hostile = _card_text(_request(detail='a </code><b>x</b> b', arguments={}), "<i>hint</i>")
+    assert "</code><b>x</b>" not in hostile
+    assert "&lt;/code&gt;&lt;b&gt;x&lt;/b&gt;" in hostile
+    # …and an over-cap detail is truncated to the budget + the fixed marker, so
+    # the card stays approvable (the 4096 bound is shared with the JSON path).
+    big = _card_text(_request(detail="x" * (_ARGUMENTS_MAX_CHARS + 500), arguments={}), "<i>hint</i>")
+    assert big.count(_ARGUMENTS_TRUNCATED_MARK) == 1
+
+
+def test_detail_dropped_on_finalisation():
+    # The friendly detail, like the JSON block, is on the live prompt only: the
+    # in-place finalisation (show_arguments=False) drops it too.
+    detail = "📄 File: f.txt\n🔁 Operation: replace"
+    req = _request(detail=detail, arguments={"path": "f.txt"})
+    prompt = _card_text(req, "<i>hint</i>")
+    final = _card_text(req, "<b>✅ Approved.</b>", show_arguments=False)
+    assert "<b>Action:</b>" in prompt
+    assert "<b>Action:</b>" not in final and "<b>Arguments:</b>" not in final
+
+
+def test_detail_wins_over_json_when_both_present():
+    # A non-empty detail replaces the JSON block even when arguments are also set.
+    req = _request(detail="friendly view", arguments={"a": 1})
+    text = _card_text(req, "<i>hint</i>")
+    assert "<b>Action:</b>" in text
+    assert "friendly view" in text
+    assert '<b>Arguments:</b>' not in text
+    assert '"a": 1' not in text  # the raw JSON is not shown alongside the detail
+
+
+def test_detail_empty_defaults_to_json_block():
+    # detail="" (the default) keeps the existing JSON behaviour for every tool
+    # that does not override approval_detail.
+    req = _request(arguments={"city": "北京", "days": 3})
+    text = _card_text(req, "<i>hint</i>")
+    assert "<b>Arguments:</b>" in text
+    assert "<b>Action:</b>" not in text
+
+
+def test_default_approval_detail_is_none():
+    # The base Tool provides no custom detail view — the provider falls back to
+    # the generic JSON block (asserted at the tool-layer contract).
+    class Plain(Tool):
+        name = "plain"
+        description = "d"
+        parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+
+        async def execute(self, arguments):  # pragma: no cover
+            return ""
+
+    assert Plain().approval_detail({"password": "hunter2"}) is None
 
 
 async def test_approval_prompt_shows_arguments_when_present():

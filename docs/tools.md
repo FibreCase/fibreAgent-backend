@@ -10,14 +10,15 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 | `echo` | `{"message": str}` | `allow` | 回显参数 |
 | `system_info` | 无 | **`ask`**（刻意） | 主机名 / 平台 / Python 版本 |
 | `exec`（**可选**） | `{"command": str}` | **`ask`**（恒） | 跑一条 `/bin/sh -c` 命令，返回 `{exit_code, stdout, stderr}` |
+| `edit`（**可选**） | `{"operation": "read"\|"replace", "path": str, "old_string"? , "new_string"?, "replace_all"?}` | **`ask`**（恒） | 在 `EDIT_WORKDIR` 内读 UTF-8 文件 / 精确替换（`old_string` 唯一或 `replace_all`） |
 
-三个只读工具都只用 stdlib、**只读**、无 subprocess、不碰文件。`get_current_time` 和 `echo` 声明 `allow`（跑起来不打扰）；`system_info` 虽然同样只读，但**当前刻意设为 `ask`** 以便演示审批流程——在 `tools/builtin/system_info.py` 里改回 `ToolPermission.ALLOW` 即恢复免审批。任何**未来**新工具若不声明权限，一律默认 `ask`（不能裸跑）。
+三个只读工具都只用 stdlib、**只读**、无 subprocess、不碰文件。`get_current_time` 和 `echo` 声明 `allow`（跑起来不打扰）；`system_info` 虽然同样只读，但**当前刻意设为 `ask`** 以便演示审批流程——在 `tools/builtin/system_info.py` 里改回 `ToolPermission.ALLOW` 即恢复免审批。任何**未来**新工具若不声明权限，一律默认 `ask`（不能裸跑）。`exec` 和 `edit` 是**仅有的两个状态变更本地能力**，均为**默认关闭的可选**能力，且**恒 `ask`**。
 
 ### `exec`（可选的 shell 工具）
 
-**默认关闭**（`ENABLE_EXEC_TOOL=false`）——不开则不注册、不广告给模型、默认部署仍是"零子进程"。开启后它是唯一会**真正 spawn 子进程**的内置工具，因此是**唯一的状态变更本地能力**，防御纵深（全部在 `execute` 内，loop 不动）：
+**默认关闭**（`ENABLE_EXEC_TOOL=false`）——不开则不注册、不广告给模型、默认部署仍是"零子进程"。开启后它是唯一会**真正 spawn 子进程**的内置工具，也是**通用性最强**的状态变更能力（任意 shell 工作），防御纵深（全部在 `execute` 内，loop 不动）：
 
-- **恒 `ask`**：每次调用都需一次性人工审批，命令**逐字**显示在审批卡的 `Arguments:` 块里（模型无法自批）。
+- **恒 `ask`**：每次调用都需一次性人工审批，命令**逐字**显示在审批卡上（模型无法自批）。`exec` 覆写了可选的 `approval_detail` 钩子，把命令以 **bash 命令块**（`$ <command>`，多行命令换行原样保留）呈现，替换默认的 `Arguments:` JSON——属主读到的是即将执行的那条 shell 行，而不是 `{"command": "…"}`（该视图仍经 HTML 转义 + 长度有界，收尾时与 `Arguments:` 一并移除）。
 - **静态兜底**（`tools/exec_policy.py`）：一组保守的灾难性命令正则（递归 `rm` `/`/`$HOME`、`--no-preserve-root`、fork bomb、`curl`/`wget | sh`、`dd`/`mkfs`/裸写块设备、`shutdown`/`reboot`/`halt`/`init 0/6`、`chmod 777 /`）在 **spawn 之前**拦截——**即便你刚点了批准**也生效（防审批疲劳误批）。它是**兜底不是沙箱**：无法理解意图，故意小而保守。
 - **参数向量 spawn**：`create_subprocess_exec("/bin/sh", "-c", cmd, …)`，**绝不** `shell=True`。
 - **进程组杀**：`start_new_session=True` 让 `sh -c` 及所有子孙同处一个进程组；超时/取消时整组 `SIGKILL`（不留孤儿）。
@@ -25,6 +26,24 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 - **只回模型**：命令与 stdout/stderr **永不进日志、永不进审计表**。
 
 > 无沙箱 / 无降权 / 无 cgroup / seccomp：一条被批准命令的爆炸半径 = bot 运行账号。建议**不以 root 运行**、用 `EXEC_WORKDIR` 指向 scratch 目录。
+
+### `edit`（可选的文件编辑工具）
+
+**默认关闭**（`ENABLE_EDIT_TOOL=false`）——不开则不注册、不广告给模型、默认部署仍是"零文件写入"。`exec` 是"跑任意命令"的**通用**能力；`edit` 是**更窄、更可控**的"读 / 精确改一个文本文件"能力——模型无需拼 shell 就能安全地读文件和做最小 diff 式编辑。两种操作（`operation` 判别字段，`required = [operation, path]`、`additionalProperties: false`）：
+
+- **`read`**：读 `path` 指向的 UTF-8 文本文件，返回其内容（尾截断到 `MAX_EDIT_READ_CHARS`）。
+- **`replace`**：把文件里唯一出现的 `old_string` 替换为 `new_string`（`old_string` 须**恰好出现一次**，除非 `replace_all`；`new_string` 可为空串 = 删除该片段）。无模糊匹配、无整文件重写。
+
+防御纵深（全部在 `execute` 内，loop 不动）：
+
+- **恒 `ask`**：每次调用都需一次性人工审批，`path` / `old_string` / `new_string` **逐字**显示在审批卡上（模型无法自批）。`edit` 覆写了可选的 `approval_detail` 钩子，用一段**结构化的 `Action:` 块**（`📄 File:` + `🔁 Operation:` + `── old_string ──` / `── new_string ──` 逐字展示）替换默认的 `Arguments:` JSON——`old`/`new` 的**换行/空白原样保留**，便于属主精确比对将要匹配与替换的内容（该视图仍经 HTML 转义 + 长度有界，收尾时与 `Arguments:` 一并移除）。
+- **路径受限（核心安全属性）**：`path` 解析（含 `..` 与**符号链接**）后必须落在 `EDIT_WORKDIR` 内，否则**在任何读/写之前**即被拒（`edit_path_escape`）——`../` 逃逸、指向 root 外的绝对路径、指向外部的符号链接都逃不出去，**即便你刚点了批准**也读不写不出。正因如此 `EDIT_WORKDIR` 启用时**必填**（须为已存在目录，config 拒绝无它启动）。
+- **原子写**：新内容先写入**同目录** temp（`fsync` + `os.replace`），中途被杀不留半截文件（与附件存储、MCP 权限文件同一惯例）。
+- **输出/参数有界**：`read` 内容尾截断到 `MAX_EDIT_READ_CHARS`（加 `[N chars … truncated]` 标记，**不是**报错）；`old_string`/`new_string` 各自受 `MAX_EDIT_STRING_CHARS` 约束，且**同时**烧进参数 schema 的 `maxLength`——约束模型提案，也约束审批卡尺寸。
+- **只回模型**：路径、文件内容、old/new 串**永不进日志、永不进审计表**（审计表结构上只存名字 / 稳定码 / 延迟 + hash scope）。
+- **稳定码**：`edit_path_escape` / `edit_file_not_found` / `edit_not_a_file` / `edit_read_failed` / `edit_invalid_op` / `edit_not_found` / `edit_not_unique` / `edit_write_failed`——全部**返回**（非抛出），让具体码到达模型。
+
+> 有意**不做**：整文件写入 / 追加 / 移动 / 复制 / 删除 / 建目录（删除等状态变更交给 `exec`）。`edit` 只改它被批准的那一个文件里的精确片段。
 
 ## 工具调用循环
 
@@ -64,7 +83,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 由 `telegram/approval.py::TelegramApprovalBroker` 实现（唯一的 Telegram 知识来源，通过 `ToolApprovalProvider` 协议注入给渠道无关的 loop）：
 
-- 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息含固定标题、工具名、工具的安全**用途摘要**（`What it does:` 一行——描述工具**做什么**：内置工具各给一句固定的用途描述，MCP 工具展示其 `description`（用途）；摘要**本身**绝不回显参数），**若这次调用有参数**再另有一段 `Arguments:`——把**已 schema 校验**的参数以易读 JSON 展示在 `<pre><code>` 里（无参数则整段省略；参数值经 HTML 转义，无法注入标签）——与过期提示。**参数只出现在这张给主人看的审批卡片上**，卡片本身**不含** scope、chat id、密钥；参数**从不**写入日志、审计表，或面向模型的回退文案。
+- 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息含固定标题、工具名、工具的安全**用途摘要**（`What it does:` 一行——描述工具**做什么**：内置工具各给一句固定的用途描述，MCP 工具展示其 `description`（用途）；摘要**本身**绝不回显参数），**若这次调用有参数**再另有一段参数视图——默认把**已 schema 校验**的参数以易读 JSON 展示在 `Arguments:` 的 `<pre><code>` 里（无参数且无详情则整段省略；值经 HTML 转义，无法注入标签）；工具若覆写可选的 `approval_detail` 钩子（如 `edit`），则改以它返回的**结构化纯文本**展示在 `Action:` 块里（同样转义 + 有界、`<pre><code>` 保留换行）——与过期提示。**参数/详情只出现在这张给主人看的审批卡片上**，卡片本身**不含** scope、chat id、密钥；参数**从不**写入日志、审计表，或面向模型的回退文案。
 问题- 每个 pending 请求绑定到「**发起者 + 原会话**」：用不可逆的 `hash_scope` 指纹比对发起者（从不持有原始 user id），并要求同一 chat。**其他用户——即使是 allow-list 里的——都收到同样的「已过期/无效」安全答复，且永远不能批准**（不泄露请求是否存在）。
 - **一次性**：首个有效决定即消费；重复点击、未知 id、上个进程留下的陈旧按钮、已过期请求都得到安全的「expired/invalid」，**绝不执行**。
 - **卡片原地收尾**：决定（批准 / 拒绝）或超时后，**同一条**消息（按 `message_id` 定位）被**原地编辑**一次——Approve / Deny 按钮（标为 **✅ Approve** / **❌ Deny**）被移除（空 `InlineKeyboardMarkup([])`，线上序列化为 `{}`，即 Bot API「移除键盘」信号；传 `None` 会被 PTB 丢掉、按钮残留），原来的「This approval is one-time and will expire shortly.」提示行被替换为一个**加粗、带 emoji 的状态词**——`<b>✅ Approved.</b>` / `<b>❌ Denied.</b>` / `<b>⏰ Expired (no decision in time).</b>`（不加 `Status:` 前缀），**`Arguments:` 段也一并移除**（按钮已消失，收尾卡片只保留标题、工具名、用途摘要与状态词），不再另发一条跟进消息。收尾是 best-effort：编辑失败绝不改变已决定的结果、不抛异常、不发消息。
@@ -97,6 +116,10 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 | `MAX_EXEC_TOOL_RESULT_CHARS` | `8000` | `exec` 单条命令 stdout/stderr 的尾截断上限（超限加 `[N chars … truncated]` 标记，**不是**报错）。`>= 1`；仅在开启时校验。 |
 | `EXEC_WORKDIR` | 空（=进程 cwd） | `exec` 命令运行的固定目录；设置时须为**已存在目录**（否则启动 `ConfigError`）。仅在开启时校验。 |
 | `EXEC_POLICY_DENY_PATTERNS` | 空 | 追加到静态灾难性命令 denylist 的正则（JSON 字符串数组，**add-only**，核心列表不可删）。坏 JSON / 非字符串元素 / 不合法正则 = 启动 `ConfigError`（**始终**校验，即便工具关闭）。 |
+| `ENABLE_EDIT_TOOL` | `false` | **可选 `edit` 文件编辑工具的开关**。`false`（默认）→ 不注册、不广告、默认部署零文件写入；`true` + `ENABLE_TOOLS=true` → 注册 `edit`（恒 `ask`）。 |
+| `EDIT_WORKDIR` | 无 | `edit` 的路径受限根目录；**启用时必填**且须为**已存在目录**（否则启动 `ConfigError`）——这是该工具的安全前提，强制属主显式选择编辑根。仅在开启时校验。 |
+| `MAX_EDIT_STRING_CHARS` | `2000` | `replace` 的 `old_string`/`new_string` 各自长度上限；同时烧进参数 schema 的 `maxLength`（约束模型提案 + 审批卡尺寸）。`>= 1`；仅在开启时校验。 |
+| `MAX_EDIT_READ_CHARS` | `8000` | `read` 结果内容的**尾截断**上限（超限加 `[N chars … truncated]` 标记，**不是**报错）。`>= 1`；仅在开启时校验。 |
 
 ## 加一个工具
 
@@ -111,9 +134,18 @@ class MyTool(Tool):
 
     def approval_summary(self, arguments) -> str:
         # 可选：审批卡片「What it does:」一行的用途描述。描述工具**做什么**，
-        # **绝不回显** arguments——卡片会另用 `Arguments:` 一段单独展示参数。
+        # **绝不回显** arguments——卡片会另用参数视图单独展示参数。
         # 内置工具与 MCP 工具都已各自提供用途行；不覆盖则用「只点名工具」的通用兜底。
         return "My tool does X."
+
+    def approval_detail(self, arguments) -> str | None:
+        # 可选：当原始 JSON 参数不易读时，返回一段**忠实**的纯文本参数视图（可含换行），
+        # 卡片用它**替换** `Arguments:` JSON、改以 `Action:` 块展示。必须是纯文本（无标记）
+        # ——provider 会 HTML 转义 + 长度有界并放进 <pre><code>（保留换行）；**逐字**展示
+        # 真实参数值，不要有损改写。默认返回 None → 用通用 JSON 块（MCP/echo/… 均不覆盖）。
+        # 已用它覆写的内置工具：`exec`（命令以 `$ <command>` bash 块呈现）、
+        # `edit`（old/new 串以结构化 diff 呈现）。
+        return None
 
     async def execute(self, arguments) -> str:
         # 短、可读的字符串；失败时 raise（registry 会转成 {"error": ...} 给模型）
@@ -124,7 +156,7 @@ class MyTool(Tool):
 - **不要**在任何地方写 `if name == "…"` 分支——registry 是唯一分发点。
 - 想给它自定义审批文案，可覆盖 `approval_summary(arguments)`——写工具**做什么**（用途），**绝不回显 `arguments`**（默认也不回显；内置工具与 MCP 工具都已提供用途行）。
 
-**MCP / SSH / Docker / Pi / `exec`** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。**只读 SSH 观测（phase 5.1）也已按此模式接入**（见下）。**可选的 `exec`**（`ENABLE_EXEC_TOOL=true`）是本库第一个真正 spawn 子进程的内置工具——subprocess 同样封装在工具内部、恒 `ask`（见上）。Docker / Pi 仍是待建的同类 provider。
+**MCP / SSH / Docker / Pi / `exec` / `edit`** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络 / 文件 I/O 都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。**只读 SSH 观测（phase 5.1）也已按此模式接入**（见下）。**可选的 `exec`**（`ENABLE_EXEC_TOOL=true`）是本库第一个真正 spawn 子进程的内置工具——subprocess 同样封装在工具内部、恒 `ask`（见上）。**可选的 `edit`**（`ENABLE_EDIT_TOOL=true`）是第二个状态变更内置工具——文件 I/O 封装在工具内部、路径受限、恒 `ask`（见上）。Docker / Pi 仍是待建的同类 provider。
 
 ## 只读基础设施观测（SSH，phase 5.1）
 
@@ -140,7 +172,7 @@ class MyTool(Tool):
 
 ## 限制
 
-- 本地内置仅 3 个只读工具（`get_current_time` / `echo` / `system_info`）+ **可选的 `exec`**（**默认关闭**；开启后是唯一的状态变更本地能力，恒 `ask`、静态 denylist 兜底、进程组杀、输出尾截断，命令与 stdout/stderr 永不入日志/审计表）。**SSH 只读观测（phase 5.1）** 是固定的 host / disk / service 三个无参工具（严格只读，默认 `allow`、无需每次审批），**不含** shell、任意命令/路径/主机/服务、写操作、持久连接或自动重连；**Docker / Pi 等其它状态变更工具仍未建**（有意为之）——`exec` 已覆盖了通用 shell 工作，但仍是**无沙箱**的（爆炸半径 = bot 运行账号）。
+- 本地内置仅 3 个只读工具（`get_current_time` / `echo` / `system_info`）+ **两个默认关闭的可选状态变更工具**：`exec`（`ENABLE_EXEC_TOOL=true`；恒 `ask`、静态 denylist 兜底、进程组杀、输出尾截断，命令与 stdout/stderr 永不入日志/审计表）与 `edit`（`ENABLE_EDIT_TOOL=true`；恒 `ask`、`EDIT_WORKDIR` 路径受限防 `../` 与符号链接逃逸、精确替换、原子写，路径/文件内容/old/new 串永不入日志/审计表）。**SSH 只读观测（phase 5.1）** 是固定的 host / disk / service 三个无参工具（严格只读，默认 `allow`、无需每次审批），**不含** shell、任意命令/路径/主机/服务、写操作、持久连接或自动重连；**Docker / Pi 等其它状态变更工具仍未建**（有意为之）——`exec` 已覆盖通用 shell 工作、`edit` 已覆盖受限的读/精确改，但两者都**无沙箱**（`exec` 爆炸半径 = bot 运行账号；`edit` 被限在 `EDIT_WORKDIR` 内）。
 - 工具的**完整 transcript 不落库**（无 `tool_calls`/`tool` 消息持久化），无法逐条回放；只有元数据审计。
 - 审批与 pending 状态是**内存态**：进程重启即丢，旧按钮等同未知 id（安全，不会误执行）。
 - 参数校验发生在执行前（`jsonschema`）；但工具**内部**仍要自己防御外部输入。

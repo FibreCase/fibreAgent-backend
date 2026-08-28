@@ -220,6 +220,23 @@ class Config:
     exec_workdir: str | None = None
     exec_policy_deny_patterns: tuple = field(default_factory=tuple)
 
+    # Edit file tool. ``enable_edit_tool`` is an explicit opt-in (default off) —
+    # when off, ``edit`` is never registered or advertised. When on it is the
+    # second state-changing built-in (always ``ask``): it reads or precisely
+    # edits a UTF-8 text file. ``edit_workdir`` is the *root the file operations
+    # are confined to* (every path must resolve inside it, symlinks included) —
+    # unlike ``exec_workdir`` it is **required** when enabled, because the
+    # confinement is the tool's core safety property (a missing/misconfigured
+    # root would defeat the confinement, so the tool refuses to start).
+    # ``max_edit_string_chars`` bounds one ``old_string``/``new_string`` (it also
+    # caps the approval card's Arguments block); ``max_edit_read_chars``
+    # tail-truncates a ``read`` result (exec-style marker, not an error).
+    # ``edit`` always defaults to ``ask``: every call is human-approved.
+    enable_edit_tool: bool = False
+    edit_workdir: str | None = None
+    max_edit_string_chars: int = 2000
+    max_edit_read_chars: int = 8000
+
     log_level: str = "INFO"
     log_color: str = "auto"  # "auto" | "true" | "false" — see logging_setup
     system_prompt_override: str | None = field(default=None)
@@ -305,6 +322,17 @@ class Config:
                 raise ConfigError("MAX_EXEC_TOOL_RESULT_CHARS must be >= 1")
             if self.exec_workdir is not None and not Path(self.exec_workdir).is_dir():
                 raise ConfigError("EXEC_WORKDIR must be an existing directory")
+        # Edit tool: validated only when enabled. Unlike exec, the working
+        # directory is *required* when on — the confinement root is the tool's
+        # core safety property, so a missing root refuses to start rather than
+        # fall back to an unrestricted (or the process) cwd.
+        if self.enable_edit_tool:
+            if not self.edit_workdir or not Path(self.edit_workdir).is_dir():
+                raise ConfigError("EDIT_WORKDIR must be set to an existing directory when the edit tool is enabled")
+            if self.max_edit_string_chars < 1:
+                raise ConfigError("MAX_EDIT_STRING_CHARS must be >= 1")
+            if self.max_edit_read_chars < 1:
+                raise ConfigError("MAX_EDIT_READ_CHARS must be >= 1")
 
     @property
     def max_image_size_bytes(self) -> int:
@@ -1204,6 +1232,13 @@ def load_config() -> Config:
     max_exec_tool_result_chars = _parse_int(os.environ.get("MAX_EXEC_TOOL_RESULT_CHARS", ""), 8000)
     exec_workdir = os.environ.get("EXEC_WORKDIR", "").strip() or None
     exec_policy_deny_patterns = _parse_exec_deny_patterns(os.environ.get("EXEC_POLICY_DENY_PATTERNS", ""))
+    # Edit file tool (opt-in, mirrors the exec knobs). The confinement root is
+    # read the same way as exec_workdir; the two numeric caps default to the
+    # same values the tool uses to build its parameter schema / read truncation.
+    enable_edit_tool = _parse_bool(os.environ.get("ENABLE_EDIT_TOOL", ""), False)
+    edit_workdir = os.environ.get("EDIT_WORKDIR", "").strip() or None
+    max_edit_string_chars = _parse_int(os.environ.get("MAX_EDIT_STRING_CHARS", ""), 2000)
+    max_edit_read_chars = _parse_int(os.environ.get("MAX_EDIT_READ_CHARS", ""), 8000)
     return Config(
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         allowed_user_ids=_parse_user_ids(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")),
@@ -1241,6 +1276,10 @@ def load_config() -> Config:
         max_exec_tool_result_chars=max_exec_tool_result_chars,
         exec_workdir=exec_workdir,
         exec_policy_deny_patterns=exec_policy_deny_patterns,
+        enable_edit_tool=enable_edit_tool,
+        edit_workdir=edit_workdir,
+        max_edit_string_chars=max_edit_string_chars,
+        max_edit_read_chars=max_edit_read_chars,
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         log_color=_normalize_log_color(os.environ.get("LOG_COLOR", "")),
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,

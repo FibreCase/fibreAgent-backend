@@ -5,8 +5,9 @@ This is the one *state-changing* built-in tool. It runs ``/bin/sh -c <command>``
 plus stdout / stderr. It is **off by default** (``ENABLE_EXEC_TOOL``) so the
 default deployment stays subprocess-free, and it always declares
 ``ToolPermission.ASK`` — every call needs a one-time human Approve before it
-runs. The full ``command`` string is shown verbatim on the approval card (the
-standard ``Arguments:`` block), so the owner sees exactly what will run.
+runs. The full ``command`` string is shown verbatim on the approval card (as a
+bash command block via :meth:`ExecTool.approval_detail`), so the owner sees
+exactly what will run.
 
 Defence in depth (in this order, all *inside* ``execute`` — the tool loop is
 untouched):
@@ -136,9 +137,25 @@ class ExecTool(Tool):
 
     def approval_summary(self, arguments: dict[str, Any]) -> str:
         # Fixed and argument-free. The full command is already shown in the
-        # card's separate "Arguments:" block, so it is deliberately NOT echoed
+        # card's separate "Action:" block, so it is deliberately NOT echoed
         # here (secret-free convention).
         return "Run an arbitrary shell command (full shell: /bin/sh -c). Requires approval."
+
+    def approval_detail(self, arguments: dict[str, Any]) -> str | None:
+        """A human-friendly view of this call for the approval card.
+
+        Shown in place of the generic JSON ``Arguments:`` block (see
+        :meth:`Tool.approval_detail`). ``exec``'s only argument is the command,
+        so this renders it as a **bash command block** — the exact command
+        verbatim under a ``$`` prompt — so the owner reads precisely the shell
+        line that will run rather than ``{"command": "…"}``. Plain text, no
+        markup: the provider HTML-escapes and length-bounds it and wraps it in a
+        code block (which keeps a multi-line command's newlines intact).
+        """
+        command = arguments.get("command")
+        if not isinstance(command, str):
+            return None
+        return f"$ {command}"
 
     async def execute(self, arguments: dict[str, Any]) -> str:
         command = arguments["command"]
