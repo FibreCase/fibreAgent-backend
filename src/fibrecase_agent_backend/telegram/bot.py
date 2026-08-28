@@ -44,6 +44,7 @@ from telegram.ext import (
 from ..agent.service import AgentError, AgentService, _user_safe_for
 from ..config import Config
 from ..database.repository import ConversationRepository
+from ..infrastructure import local_tool_name
 from ..mcp.auth.models import OAuthError
 from .markdown import to_telegram_html, to_telegram_html_chunks
 from .media import MediaError, normalize_message
@@ -72,6 +73,7 @@ _COMMANDS: list[tuple[str, str]] = [
     ("tool_audit", "Show tool audit log"),
     ("mcp_status", "Show remote MCP tool status"),
     ("mcp", "Show MCP servers / start OAuth login"),
+    ("infra_status", "Show configured infra targets"),
     ("help", "Show this help"),
 ]
 
@@ -564,6 +566,53 @@ async def cmd_mcp_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# read-only infrastructure observation status (phase 5.1)
+# ---------------------------------------------------------------------------
+async def cmd_infra_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/infra_status — show which read-only infrastructure targets are configured.
+
+    Read-only and non-mutating: it renders only the **configuration** set from
+    the in-memory :class:`~..config.Config` at startup — each target's *name* and
+    its three fixed, argument-free, read-only tool names (which run without a
+    per-call approval). It does **not** connect over SSH, refresh anything, probe
+    reachability, or call the LLM or any target. The reply shows **only** the
+    target name and the local tool names; it never exposes a host, port, username,
+    key path, known_hosts path, mount path, service name, or any command — and it
+    draws **no** conclusion about whether a target is reachable (that is unknown
+    until a tool is run). An unauthorised sender is ignored silently, exactly
+    like every other command.
+    """
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    config: Config = context.application.bot_data["config"]
+
+    # No targets configured, or tools disabled → the provider is off.
+    if not getattr(config, "enable_tools", True) or not config.infra_ssh_targets:
+        await _send_long(chat, "**Infrastructure:** disabled")
+        return
+
+    lines = ["**Infrastructure observation targets (read-only):**", ""]
+    for target in config.infra_ssh_targets:
+        tool_names = ", ".join(
+            f"`{local_tool_name(target.name, obs)}`"
+            for obs in ("host_status", "disk_status", "service_status")
+        )
+        lines.append(f"**{target.name}** — configured (3 tools, read-only): {tool_names}")
+    lines += [
+        "",
+        f"**Total configured tools:** {len(config.infra_ssh_targets) * 3}",
+        "",
+        "(Configured only — this shows nothing about reachability; a status is "
+        "read only when the corresponding tool is actually called.)",
+    ]
+    # None of the above exposes a host, port, username, key path, known_hosts
+    # path, mount path, service name, or command — only the target name and the
+    # (operator-named) local tool names.
+    await _send_long(chat, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # MCP status + user-level OAuth (phase 4.x)
 # ---------------------------------------------------------------------------
 async def cmd_mcp(update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -863,6 +912,9 @@ def build_application(
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("tool_audit", cmd_tool_audit))
     application.add_handler(CommandHandler("mcp_status", cmd_mcp_status))
+    # Phase 5.1: read-only view of the configured infrastructure observation
+    # targets (config metadata only — no SSH / LLM / reachability).
+    application.add_handler(CommandHandler("infra_status", cmd_infra_status))
     # Phase 4.x: MCP status + user-level OAuth login. ``/mcp auth <server>`` is
     # the single ``/mcp`` command with an ``auth`` argument (Telegram treats it
     # as one command), so it is dispatched inside ``cmd_mcp`` — there is no

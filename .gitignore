@@ -21,6 +21,12 @@ wheels/
 # contents live inline in .env.example / docs/.
 config/mcp_servers.json
 config/mcp_permissions.json
+config/infra_ssh_targets.json
+
+# SSH credential files referenced by infra_ssh_targets.json (private key +
+# known_hosts pin) — operator secrets, never committed (key-only, host-key-pinned).
+config/id_*
+config/ssh_known_hosts
 
 # Local runtime data (SQLite database, etc.) — keep the dir via .gitkeep.
 # This same data/ dir is also the Docker bind-mount source (compose: ./data:/app/data).

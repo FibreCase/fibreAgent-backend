@@ -21,6 +21,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - 通过 **Telegram Bot**（long polling）对话；用 **OpenAI 兼容** LLM 生成回复。
 - **工具调用 + 工具安全**：`allow`/`ask`/`deny` 策略 → JSON Schema 校验 → 需要时的一次性 Telegram 人工审批 → 单工具超时 → 只记元数据的 append-only 审计（`/tool_audit` 查看，绝不显示参数/结果）。
 - **远程 MCP 工具（Streamable HTTP + stdio 本地进程）**：启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并注册进同一个 registry（`mcp_<server>__<remote>`、默认 `ask`），因此**完全复用**上面的工具安全边界——MCP 只是又一个工具 provider，`/mcp_status` 只读查看状态。
+- **只读基础设施观测（SSH）**：对运维配置的 SSH 目标，各产出三个**固定、无参、只读**工具（主机 / 挂载磁盘 / systemd 服务状态，`infra_<target>__host_status` 等；严格只读，默认 `allow` 无需每次审批），经主机密钥固定、纯 key 的短命 AsyncSSH 连接取状态——注册进同一个 registry，**完全复用**上面的工具安全边界；模型无法指任何 host/path/service/command，`/infra_status` 只读显示已配置的目标与工具（不连接、不探活）。
 - **MCP 用户级 OAuth（per Telegram user）**：`/mcp auth <server>` 给**你**一个第三方 OAuth 登录按钮（首个实现：Google），凭据按 Telegram user 绑定、自动刷新 access token，后续 MCP 调用自动带上你自己的 token；`/new` 与重启都**不**影响登录状态。
 - **图片输入 + 持久化**：照片（可带说明文字）base64 内联交给模型，并以内容寻址 blob 落盘（SHA-256 去重、原子写入），重启后仍在窗口内时重新入窗。
 - **上下文预算管理**：消息数窗口之上再有一道模型无关的估算 token 预算，必要时把历史图片降级为纯文本，绝不让超长请求打爆端点。
@@ -61,6 +62,7 @@ uv run python -m fibrecase_agent_backend
 | `/mcp` | 只读查看 MCP 服务器状态，并显示**你本人**在各 OAuth 服务器上的登录状态 |
 | `/mcp auth <server>` | 为你的账号发起第三方 OAuth 登录（如 `gcal` → Google 日历），返回一个**登录按钮**（无需复制 URL）；凭据绑定到你的 Telegram user，自动刷新 |
 | `/mcp_status` | 只读查看已配置远程 MCP 服务器状态（available/unavailable、工具数、总数）；不发起连接、不显示 URL/token |
+| `/infra_status` | 只读查看已配置的 SSH 观测目标及其三个工具（read-only）；不连接、不探活、不显示 host/路径 |
 | `/help` | 列出帮助 |
 
 其它任何文字消息都会作为对话发给 Agent。完整说明见 [Telegram 接入与命令](docs/telegram.md)。
@@ -95,8 +97,8 @@ uv run python -m fibrecase_agent_backend
 
 ## 当前开发状态
 
-已在 Telegram 上跑通的最小个人 Agent backend。**能做的**：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio 本地进程，默认 `ask` 审批）+ **MCP 用户级 OAuth**（仅 http 传输，per Telegram user 凭据、自动刷新、`/new` 与重启不影响登录态）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。**有意不做**：内置仅 3 个只读工具（无 shell/文件/联网/SSH）、图片仅本地磁盘仅照片、估算是模型无关的保守值非计费 token、记忆是显式 + 纯词法（跨语言召回弱）、OAuth 仅 http 传输 + 用户级（无群组/共享/多账号切换，无 Web 面板）。
+已在 Telegram 上跑通的最小个人 Agent backend。**能做的**：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio 本地进程，默认 `ask` 审批）+ **MCP 用户级 OAuth**（仅 http 传输，per Telegram user 凭据、自动刷新、`/new` 与重启不影响登录态）、**只读基础设施观测（SSH）**（每个目标三个固定无参只读工具：主机/磁盘/systemd 服务状态，严格只读默认 `allow`、无需每次审批，复用完整工具安全边界）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。**有意不做**：本地内置仅 3 个只读工具 + SSH 观测仅固定的 host/disk/service 三个无参工具（无 shell、任意命令/路径/主机/服务、文件、联网扫描、Docker、任何状态变更工具）、图片仅本地磁盘仅照片、估算是模型无关的保守值非计费 token、记忆是显式 + 纯词法（跨语言召回弱）、OAuth 仅 http 传输 + 用户级（无群组/共享/多账号切换，无 Web 面板）。
 
-**下一步（建议顺序）**：只读基础设施观测（SSH，phase 5.1）；新的 `ContentPart` 类型（File / Audio / Video / Sticker，复用同一套附件存储）；有副作用的本地工具（SSH / Docker / Pi）以 Tool Provider 接入同一接口，默认进 `ask` 审批。
+**下一步（建议顺序）**：新的 `ContentPart` 类型（File / Audio / Video / Sticker，复用同一套附件存储）；有副作用的本地工具（Docker / Pi）以 Tool Provider 接入同一接口，默认进 `ask` 审批。
 
 完整版（含逐条能力、限制、未涉及清单）见 [当前开发状态](docs/status.md)。

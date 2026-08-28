@@ -39,6 +39,22 @@ def _no_dotenv(monkeypatch):
     monkeypatch.setattr(_config_module, "load_dotenv", lambda *a, **k: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_default_infra_targets_file(monkeypatch):
+    """Never let the *default* infra-SSH-targets file leak into config tests.
+
+    ``load_config`` reads ``config/infra_ssh_targets.json`` (a well-known default
+    path, like ``config/system_prompt.txt``) whenever ``INFRA_SSH_TARGETS_FILE`` is
+    unset. A developer's real file (with real targets) must not be parsed during
+    unrelated config tests. Pointing the default at a path that does not exist makes
+    the default read a no-op, so those tests fall back to the inline
+    ``INFRA_SSH_TARGETS`` exactly as before. ``test_infra_config.py`` restores a
+    concrete default-path value (into its own ``tmp_path``) when it actually wants
+    to exercise the default-file path — an inner fixture override wins.
+    """
+    monkeypatch.setattr(_config_module, "_INFRA_TARGETS_DEFAULT_FILE", "_no_default_infra_targets.json")
+
+
 @pytest.fixture
 async def repo():
     """An in-memory SQLite-backed repository with a fresh schema per test."""

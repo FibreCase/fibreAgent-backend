@@ -106,11 +106,23 @@ class MyTool(Tool):
 - **不要**在任何地方写 `if name == "…"` 分支——registry 是唯一分发点。
 - 想给它自定义审批文案，可覆盖 `approval_summary(arguments)`——写工具**做什么**（用途），**绝不回显 `arguments`**（默认也不回显；内置工具与 MCP 工具都已提供用途行）。
 
-**MCP / SSH / Docker / Pi** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。SSH / Docker / Pi 仍是待建的同类 provider。
+**MCP / SSH / Docker / Pi** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。**只读 SSH 观测（phase 5.1）也已按此模式接入**（见下）；Docker / Pi 仍是待建的同类 provider。
+
+## 只读基础设施观测（SSH，phase 5.1）
+
+`infrastructure/` 包是又一个 **Tool Provider**（与 MCP 同类）：对每个运维配置的 SSH 目标，产出**三个固定、无参、只读**工具——`infra_<target>__host_status` / `__disk_status` / `__service_status`（主机 / 已配置挂载点磁盘 / 已配置 systemd 服务 状态）。目标须为 **Linux + systemd**。
+
+- **与内置工具、MCP 工具同一 registry、同一 gate**：三个工具都声明 `default_permission = allow`（严格只读，与 `get_current_time` / `echo` 一样**无需每次审批**；主人仍可 pin 成 `deny`），因此每次被调用都走完整执行边界（策略 → JSON Schema 校验 → fail-closed 预审计 → 单工具超时 → 审计；因默认 `allow`，一次性 Telegram 审批步被跳过）。模型**无法**指任何 host / path / service / command——工具无参，远程命令是**代码常量**（模板），唯一插值的是启动期已严格校验并 shell 引号转义的 `mounts` / `services`。
+- **连接是短命的、密钥锁定**：`asyncssh` **惰性**导入（仅在被调用的工具真要连接时），每个被调用的工具开一条**主机密钥固定**（`known_hosts=显式文件`，永不 `None`/自动接受）、**仅密钥**（`client_keys=[私钥]`、SSH agent 关闭、密码/键盘交互关闭）的连接，命令跑完即关闭（即便被取消也关闭）。无持久连接、无自动重连。
+- **输出被解析、绝不回显**：stdout 走严格解析器（缺字段 / 重复字段 / 非法数字 / 多余字段 / 记录集不符 → 解析失败）；任何失败——连接/认证/主机密钥失败、非零退出、stderr 有输出、畸形/空/超大的结果——都映射到三个稳定、不回显的码：`infra_unavailable` / `infra_invalid_response` / `infra_result_too_large`。目标的 host、私钥路径、known_hosts 路径、用户名、mount 路径、命令、stdout/stderr **绝不**回给模型、进日志或审计表（告警只带工具名 + 稳定码 + 异常**类**，永不带异常正文）。
+- **启动不触网**：构建工具是纯字符串工作，不校验连接；SSH 只在被调用的工具里发生。`/infra_status` 只读显示**已配置**的目标名 + 其三个工具名 + 总数（read-only），**不**连接、**不**探活、**不**调 LLM，且明确「不显示任何可达性结论」。host / port / 用户名 / key 路径 / known_hosts 路径 / mount / service / command **绝不**出现在其输出里。
+- **默认关闭**：无目标（`INFRA_SSH_TARGETS` 空，且默认文件 `config/infra_ssh_targets.json` 不存在、`INFRA_SSH_TARGETS_FILE` 未设置）或 `ENABLE_TOOLS=false` 时不建 provider、永不发起 SSH 连接、`asyncssh` 甚至不被导入。
+
+详见 [配置](configuration.md) 的 `INFRA_SSH_TARGETS` / `INFRA_SSH_CONNECT_TIMEOUT_SECONDS` / `MAX_INFRA_TOOL_RESULT_CHARS`。
 
 ## 限制
 
-- 仅 3 个只读内置；无 shell / 文件读写 / 联网扫描 / SSH / Docker / 任何状态变更工具（有意为之）。
+- 本地内置仅 3 个只读；**SSH 只读观测（phase 5.1）** 是固定的 host / disk / service 三个无参工具（严格只读，默认 `allow`、无需每次审批），**不含** shell、任意命令/路径/主机/服务、写操作、持久连接或自动重连；**Docker / Pi / 任何状态变更工具仍未建**（有意为之）。
 - 工具的**完整 transcript 不落库**（无 `tool_calls`/`tool` 消息持久化），无法逐条回放；只有元数据审计。
 - 审批与 pending 状态是**内存态**：进程重启即丢，旧按钮等同未知 id（安全，不会误执行）。
 - 参数校验发生在执行前（`jsonschema`）；但工具**内部**仍要自己防御外部输入。

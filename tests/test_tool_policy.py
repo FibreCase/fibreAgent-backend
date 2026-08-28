@@ -149,6 +149,6 @@ def test_config_rejects_nonpositive_timeout(monkeypatch, knob, val):
 
 
 def test_config_parses_custom_timeouts(monkeypatch):
-    cfg = _load(monkeypatch, TOOL_APPROVAL_TIMEOUT_SECONDS="12", TOOL_TIMEOUT_SECONDS="0.5")
+    cfg = _load(monkeypatch, TOOL_APPROVAL_TIMEOUT_SECONDS="12", TOOL_TIMEOUT_SECONDS="20")
     assert cfg.tool_approval_timeout_seconds == 12.0
-    assert cfg.tool_timeout_seconds == 0.5
+    assert cfg.tool_timeout_seconds == 20.0

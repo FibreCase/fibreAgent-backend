@@ -27,6 +27,7 @@ from .database.audit import RepositoryToolAuditor
 from .database.oauth import OAuthStorageImpl
 from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
+from .infrastructure import build_infra_tools
 from .llm.client import OpenAIClient
 from .logging_setup import configure_logging
 from .mcp import McpManager
@@ -131,6 +132,25 @@ class AgentBackend:
             )
             if (config.enable_tools and config.mcp_servers)
             else None
+        )
+        # Phase 5.1: read-only infrastructure observation over SSH. Built **only**
+        # when tools are enabled *and* at least one target is configured — with no
+        # targets there is nothing to observe, so no tools are built and (because
+        # the provider lazy-imports asyncssh) no SSH machinery is loaded. Like the
+        # MCP tools, the infra tools are not registered here: they are ``add``ed
+        # to the *same* registry in ``_post_init`` (after the built-ins and MCP),
+        # so they ride the existing phase-3 gate exactly like a built-in. Each is
+        # a *local* read-only tool that declares ``allow`` (strictly read-only, so
+        # it runs without a per-call approval, like ``get_current_time``/``echo``);
+        # the declared default is final.
+        self.infra_tools = (
+            build_infra_tools(
+                config.infra_ssh_targets,
+                connect_timeout_seconds=config.infra_ssh_connect_timeout_seconds,
+                max_result_chars=config.max_infra_tool_result_chars,
+            )
+            if (config.enable_tools and config.infra_ssh_targets)
+            else []
         )
         self.service = AgentService(
             self.repository,
@@ -272,6 +292,22 @@ class AgentBackend:
             if discovered:
                 self.registry.add(*discovered)
                 mcp_tool_count = len(discovered)
+        # Phase 5.1: register the read-only infrastructure tools, after the
+        # built-ins and MCP. This is a startup, collision-checked registration:
+        # the infra names (``infra_<target>__<obs>``) are disjoint from the
+        # built-ins and the MCP ``mcp_`` namespace, so a collision can only come
+        # from a target name colliding with an already-registered name. A
+        # duplicate is a startup ConfigError — the names are operator-chosen and
+        # non-secret, so echoing one in the error is safe (never the
+        # host/path/key, which are not in the tool name). No SSH connection is
+        # opened here; a tool is reached only when it is called and passes the gate.
+        infra_tool_count = 0
+        if self.registry is not None and self.infra_tools:
+            try:
+                self.registry.add(*self.infra_tools)
+                infra_tool_count = len(self.infra_tools)
+            except ValueError as exc:
+                raise ConfigError(f"cannot register infrastructure tools: {exc}") from exc
         # Phase 4.x: seed/sync the dedicated MCP-permissions file to the current
         # tool set (backend → file). New tools appear unfilled (default), entries
         # the operator filled in are preserved, and unfilled entries for tools
@@ -311,6 +347,7 @@ class AgentBackend:
                 "tools_enabled": self.config.enable_tools,
                 "tools": self.registry.names() if self.registry else [],
                 "mcp_tools": mcp_tool_count,
+                "infra_tools": infra_tool_count,
             },
         )
 

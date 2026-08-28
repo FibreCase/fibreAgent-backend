@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
+    "asyncssh>=2.21.0,<3",
     "jsonschema>=4.21.1",
     "mcp==2.1.0",
     "openai>=3.3.1",

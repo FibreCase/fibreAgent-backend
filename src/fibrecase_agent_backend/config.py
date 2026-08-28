@@ -7,6 +7,7 @@ OpenAI API key) come *only* from the environment and must never be committed.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -74,6 +75,43 @@ def _load_env() -> None:
     # Load an uncommitted .env from the current working directory. Existing
     # environment variables always take precedence over values in the file.
     load_dotenv(override=False)
+
+
+@dataclass(frozen=True)
+class InfraSshTarget:
+    """One validated, operator-configured SSH observation target (phase 5.1).
+
+    This is a *read-only observation* endpoint, not a control one: the backend
+    may only run the provider's fixed host/disk/service status commands over a
+    host-key-pinned, key-only SSH connection. There is deliberately no password,
+    keyboard-interactive, agent, forwarding, or SFTP field — those cannot be
+    expressed here, so they cannot be enabled.
+
+    ``host`` is a hostname or an IPv4/IPv6 *literal* (validated at parse time,
+    never carrying a userinfo/port/path). ``private_key_path`` and
+    ``known_hosts_path`` are paths — **absolute, or relative to the working
+    directory** — to *existing, readable, non-symlink* regular files the operator
+    mounts read-only (e.g. a Docker secret, or a local ``config/id_…`` /
+    ``config/ssh_known_hosts``); both are validated to exist at startup so a
+    botched key/known_hosts setup fails fast instead of surfacing as a runtime
+    ``infra_unavailable``.
+
+    ``mounts`` / ``services`` are the *only* paths and unit names the disk /
+    service tools may observe — fixed at config time, never reachable from the
+    model, chat input, or tool arguments. The values live only in this process's
+    memory; they are never logged, never written to a file, and never echoed to
+    the model, the approval card, the audit table, or ``/infra_status`` (those
+    see only ``name`` + a stable code).
+    """
+
+    name: str
+    host: str
+    port: int
+    username: str
+    private_key_path: str
+    known_hosts_path: str
+    mounts: tuple[str, ...]
+    services: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -147,6 +185,23 @@ class Config:
     oauth_callback_port: int = 8090
     oauth_state_ttl_seconds: float = 600.0
 
+    # Phase 5.1: read-only infrastructure observation over SSH. ``infra_ssh_targets``
+    # is the parsed, validated list, read from the JSON array in the **default**
+    # ``config/infra_ssh_targets.json`` when that file is present, from the explicit
+    # ``INFRA_SSH_TARGETS_FILE`` when set (which wins over both the default file and
+    # the inline value; a set-but-missing/blank file is a ConfigError), or from the
+    # inline ``INFRA_SSH_TARGETS`` when no file is present; empty means no
+    # infrastructure provider (and no SSH connection is ever opened). Each tool it
+    # yields is a *local* ``ask`` tool (like the built-ins) that rides the whole
+    # phase-3 gate.
+    # ``infra_ssh_connect_timeout_seconds`` must be ``<= tool_timeout_seconds``
+    # (it bounds connect + handshake *inside* the loop's per-call timeout);
+    # ``max_infra_tool_result_chars`` bounds the normalised text a single infra
+    # tool may return to the model (over it → ``infra_result_too_large``).
+    infra_ssh_targets: tuple = field(default_factory=tuple)
+    infra_ssh_connect_timeout_seconds: float = 10.0
+    max_infra_tool_result_chars: int = 8000
+
     log_level: str = "INFO"
     log_color: str = "auto"  # "auto" | "true" | "false" — see logging_setup
     system_prompt_override: str | None = field(default=None)
@@ -211,6 +266,18 @@ class Config:
             raise ConfigError("OAUTH_CALLBACK_PORT must be a port in 1..65535")
         if self.oauth_state_ttl_seconds <= 0:
             raise ConfigError("OAUTH_STATE_TTL_SECONDS must be > 0")
+        # Phase 5.1: infra knobs. The connect/handshake timeout must fit *inside*
+        # the loop's per-call tool timeout (the whole SSH call is wrapped in
+        # TOOL_TIMEOUT_SECONDS, so a longer connect timeout could never fire).
+        if self.infra_ssh_connect_timeout_seconds <= 0:
+            raise ConfigError("INFRA_SSH_CONNECT_TIMEOUT_SECONDS must be > 0")
+        if self.infra_ssh_connect_timeout_seconds > self.tool_timeout_seconds:
+            raise ConfigError(
+                "INFRA_SSH_CONNECT_TIMEOUT_SECONDS must be <= TOOL_TIMEOUT_SECONDS "
+                "(the SSH connect/handshake runs inside the per-call tool timeout)"
+            )
+        if self.max_infra_tool_result_chars < 1:
+            raise ConfigError("MAX_INFRA_TOOL_RESULT_CHARS must be >= 1")
 
     @property
     def max_image_size_bytes(self) -> int:
@@ -509,6 +576,59 @@ def _load_mcp_servers_text() -> str:
     return os.environ.get("MCP_SERVERS", "")
 
 
+# Default location of the infra-SSH-targets file (CWD-relative, like
+# ``config/system_prompt.txt``), consulted when ``INFRA_SSH_TARGETS_FILE`` is not
+# set. A module global so tests can monkeypatch it to a per-test path (keeping the
+# developer's real ``config/infra_ssh_targets.json`` out of unrelated config tests).
+_INFRA_TARGETS_DEFAULT_FILE = "config/infra_ssh_targets.json"
+
+
+def _load_infra_targets_text() -> str:
+    """Return the raw infra-SSH-targets JSON *text* to validate, choosing its source.
+
+    Source selection (the same file-over-inline idea as ``MCP_SERVERS_FILE``, with a
+    well-known **default path** so the common single-file setup needs no env var):
+
+    * ``INFRA_SSH_TARGETS_FILE`` **set** (a path, CWD-relative) — it is the strict
+      source of truth and **wins** over both the default file and the inline
+      ``INFRA_SSH_TARGETS`` (both ignored). A set-but-**missing** or **blank**
+      (0-byte / whitespace-only) file is a startup :class:`ConfigError` naming the
+      path — an operator who pointed the provider at a file must not silently get
+      "no targets" (an explicit ``[]`` in the file is still valid and means none).
+    * ``INFRA_SSH_TARGETS_FILE`` **unset** — the **default file**
+      (:data:`_INFRA_TARGETS_DEFAULT_FILE`, ``config/infra_ssh_targets.json``) is
+      used **when it exists**; a present-but-**blank** default file is a
+      :class:`ConfigError`. When the default file is **absent**, it falls back to
+      the inline ``INFRA_SSH_TARGETS`` value, exactly as before (so inline-only
+      config keeps working and the default-off case needs no file).
+    """
+    explicit = os.environ.get("INFRA_SSH_TARGETS_FILE", "").strip()
+    if explicit:
+        try:
+            text = Path(explicit).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"cannot read INFRA_SSH_TARGETS_FILE '{explicit}': {exc.strerror or exc}") from exc
+        if not text.strip():
+            raise ConfigError(
+                f"INFRA_SSH_TARGETS_FILE '{explicit}' is empty; it must contain a JSON array "
+                'of target objects (use "[]" for none, or unset INFRA_SSH_TARGETS_FILE)'
+            )
+        return text
+    default_path = Path(_INFRA_TARGETS_DEFAULT_FILE)
+    if default_path.exists():
+        try:
+            text = default_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"cannot read default infra targets file '{_INFRA_TARGETS_DEFAULT_FILE}': {exc.strerror or exc}") from exc
+        if not text.strip():
+            raise ConfigError(
+                f"default infra targets file '{_INFRA_TARGETS_DEFAULT_FILE}' is empty; it must contain a "
+                'JSON array of target objects (use "[]" for none, or remove the file)'
+            )
+        return text
+    return os.environ.get("INFRA_SSH_TARGETS", "")
+
+
 def _load_mcp_permissions_file(enable_tools: bool) -> Path | None:
     """Resolve ``MCP_PERMISSIONS_FILE`` to a :class:`Path` (or ``None``) and
     apply the **fail-to-start** gate.
@@ -685,6 +805,289 @@ def _parse_mcp_servers(raw: str, *, allow_insecure_http: bool) -> tuple[McpServe
     return tuple(servers)
 
 
+# ---------------------------------------------------------------------------
+# Phase 5.1: read-only infrastructure observation over SSH
+# ---------------------------------------------------------------------------
+# A target name is the same charset as an MCP server name (a lowercase,
+# tool-namespace fragment) because it is embedded in the namespaced local tool
+# name ``infra_<target>__<observation>``.
+_INFRA_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+# An SSH login name: letter or underscore start, then letters/digits/dot/underscore/dash.
+_INFRA_USERNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+# A systemd unit name: the conservative set systemd itself accepts for the
+# common ``.service``/`.socket`/... forms we observe.
+_INFRA_SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
+# ``..`` is rejected in a path by checking each *segment* against this — a
+# trailing/interior dot is allowed for a mount point (e.g. ``/volume1``) but a
+# ``..`` segment is a traversal and must never reach a command.
+_INFRA_MAX_TARGETS = 16
+_INFRA_MAX_MOUNTS = 32
+_INFRA_MAX_SERVICES = 32
+_INFRA_MOUNT_MAX_LEN = 256
+_INFRA_SERVICE_MAX_LEN = 128
+# The only fields a target entry may carry. Any other key is a startup error —
+# notably a password, ``password_env``, keyboard-interactive, agent, forwarding,
+# or SFTP field is *not* in this set, so it is refused, never silently dropped.
+_INFRA_TARGET_FIELDS = frozenset(
+    {"name", "host", "port", "username", "private_key_path", "known_hosts_path", "mounts", "services"}
+)
+
+
+def _validate_infra_host(host: str, *, where: str) -> None:
+    """Raise :class:`ConfigError` unless ``host`` is a safe SSH destination.
+
+    Accepts a hostname or an IPv4/IPv6 *literal* — never a form with a userinfo,
+    an embedded port, or a path (``user@host``, ``host:22``, ``host/path`` are
+    all refused). The host is an operator secret-adjacent endpoint and is never
+    echoed in the error (only the field is named).
+    """
+    if not isinstance(host, str) or not host:
+        raise ConfigError(f"{where} is missing a valid 'host' (non-empty string)")
+    if any(ch.isspace() for ch in host):
+        raise ConfigError(f"{where} 'host' must not contain whitespace")
+    if host.startswith("["):
+        # A bare IPv6 literal may be bracketed (``[::1]``) for direct use.
+        inner = host
+        if inner.endswith("]") and len(inner) > 2:
+            inner = inner[1:-1]
+        else:
+            raise ConfigError(f"{where} 'host' is an invalid IPv6 literal")
+        if ":" not in inner:
+            raise ConfigError(f"{where} 'host' is an invalid IPv6 literal")
+        try:
+            ipaddress.IPv6Address(inner)
+        except ipaddress.AddressValueError as exc:
+            raise ConfigError(f"{where} 'host' is an invalid IPv6 literal: {type(exc).__name__}") from exc
+        return
+    # No userinfo, no trailing path, no explicit port.
+    if "@" in host:
+        raise ConfigError(f"{where} 'host' must not embed a username")
+    if host.startswith("/") or host.startswith("."):
+        raise ConfigError(f"{where} 'host' must not be a path")
+    if ":" in host:
+        # A single colon is a legal (if rare) hostname label, but an IPv6 literal
+        # without brackets is unambiguous — accept it, otherwise refuse (a colon
+        # here is most likely a stray ``:port``).
+        if host.count(":") == 1:
+            raise ConfigError(f"{where} 'host' must not include a port (set 'port' separately)")
+        # Multiple colons → try an IPv6 literal.
+        try:
+            ipaddress.IPv6Address(host)
+        except ipaddress.AddressValueError as exc:
+            raise ConfigError(f"{where} 'host' is not a valid hostname or IPv6 literal: {type(exc).__name__}") from exc
+        return
+    if host.count(".") > 4:
+        raise ConfigError(f"{where} 'host' is not a valid hostname")
+    # Hostname label charset check (RFC-952/1123-ish): alphanumeric + hyphen,
+    # labels must not start/end with a hyphen.
+    for label in host.split("."):
+        if not label:
+            raise ConfigError(f"{where} 'host' has an empty hostname label")
+        if label.startswith("-") or label.endswith("-"):
+            raise ConfigError(f"{where} 'host' has a malformed hostname label")
+        if not re.fullmatch(r"[A-Za-z0-9-]+", label):
+            raise ConfigError(f"{where} 'host' has an invalid hostname label")
+    # An IPv4 literal is also accepted (it passes the hostname-label check).
+
+
+def _validate_infra_file(path: str, *, where: str, field: str, require_nonempty: bool) -> None:
+    """Raise :class:`ConfigError` unless ``path`` is a safe, existing credential file.
+
+    ``field`` is the JSON field name (``private_key_path`` / ``known_hosts_path``)
+    for the error message. The path may be **absolute or relative to the working
+    directory** (the same convention as ``SYSTEM_PROMPT_PATH`` /
+    ``ATTACHMENT_STORAGE_PATH`` / the MCP/infra config files — the app is run from
+    the repo root, so ``config/id_…`` works). It must have **no ``~``** (no
+    expansion — the value is used verbatim) and **no ``..`` segment**, and it must
+    point at an *existing, readable, non-symlink regular file*. A symlink,
+    directory, or missing file is a startup error so a botched key/known_hosts
+    mount fails fast. The path itself is **never** echoed in the error (it is
+    secret-adjacent) — only the field name is.
+    """
+    if not isinstance(path, str) or not path:
+        raise ConfigError(f"{where} is missing a valid '{field}' (non-empty string)")
+    if path.startswith("~"):
+        raise ConfigError(f"{where} '{field}' must not contain a '~' (no expansion)")
+    p = Path(path)
+    if ".." in p.parts:
+        raise ConfigError(f"{where} '{field}' must not contain a '..' path segment")
+    try:
+        if p.is_symlink():
+            raise ConfigError(f"{where} '{field}' must not be a symbolic link")
+        if not p.is_file():
+            raise ConfigError(f"{where} '{field}' must point at an existing regular file")
+        if not os.access(p, os.R_OK):
+            raise ConfigError(f"{where} '{field}' must be a readable file")
+        if require_nonempty and os.path.getsize(p) == 0:
+            raise ConfigError(f"{where} '{field}' must not be an empty file")
+    except ConfigError:
+        raise
+    except OSError as exc:
+        raise ConfigError(f"{where} '{field}' is not a usable file: {exc.strerror or exc}") from exc
+
+
+def _parse_infra_mounts(entry: dict, *, where: str) -> tuple[str, ...]:
+    """Parse a target's ``mounts`` (a non-empty JSON array of absolute POSIX paths).
+
+    Each entry must be an absolute POSIX path with no ``..`` segment, at most
+    ``_INFRA_MOUNT_MAX_LEN`` chars. Entries are de-duplicated (order-preserving)
+    and the list must stay within ``[1, _INFRA_MAX_MOUNTS]``. A validation error
+    names the field and index — **never** the path value (a mount path is an
+    operator filesystem detail that must not leak into a startup error).
+    """
+    raw = entry.get("mounts")
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(f"{where} 'mounts' must be a non-empty JSON array of absolute paths")
+    if len(raw) > _INFRA_MAX_MOUNTS:
+        raise ConfigError(f"{where} 'mounts' may contain at most {_INFRA_MAX_MOUNTS} entries")
+    seen: set[str] = set()
+    out: list[str] = []
+    for index, value in enumerate(raw):
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"{where} 'mounts[{index}]' must be a non-empty string")
+        if value.startswith("~"):
+            raise ConfigError(f"{where} 'mounts[{index}]' must be an absolute path (no '~')")
+        if not value.startswith("/"):
+            raise ConfigError(f"{where} 'mounts[{index}]' must be an absolute POSIX path")
+        if ".." in value.split("/"):
+            raise ConfigError(f"{where} 'mounts[{index}]' must not contain a '..' segment")
+        if len(value) > _INFRA_MOUNT_MAX_LEN:
+            raise ConfigError(f"{where} 'mounts[{index}]' exceeds {_INFRA_MOUNT_MAX_LEN} characters")
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    if not out:
+        raise ConfigError(f"{where} 'mounts' must contain at least one distinct path")
+    return tuple(out)
+
+
+def _parse_infra_services(entry: dict, *, where: str) -> tuple[str, ...]:
+    """Parse a target's ``services`` (a non-empty JSON array of systemd unit names).
+
+    Each entry must match :data:`_INFRA_SERVICE_RE` and stay within
+    ``_INFRA_SERVICE_MAX_LEN`` chars. De-duplicated (order-preserving), bounded by
+    ``[1, _INFRA_MAX_SERVICES]``. The offending unit *name* **is** echoed (it is an
+    operator-chosen unit, not a secret); an index is included for a type error.
+    """
+    raw = entry.get("services")
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(f"{where} 'services' must be a non-empty JSON array of systemd unit names")
+    if len(raw) > _INFRA_MAX_SERVICES:
+        raise ConfigError(f"{where} 'services' may contain at most {_INFRA_MAX_SERVICES} entries")
+    seen: set[str] = set()
+    out: list[str] = []
+    for index, value in enumerate(raw):
+        if not isinstance(value, str) or not value:
+            raise ConfigError(f"{where} 'services[{index}]' must be a non-empty string")
+        if len(value) > _INFRA_SERVICE_MAX_LEN:
+            raise ConfigError(f"{where} 'services[{index}]' exceeds {_INFRA_SERVICE_MAX_LEN} characters")
+        if not _INFRA_SERVICE_RE.match(value):
+            raise ConfigError(
+                f"{where} 'services' entry {value!r} is not a valid systemd unit name "
+                "(letters, digits, '_', '.', '@', '-')"
+            )
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    if not out:
+        raise ConfigError(f"{where} 'services' must contain at least one distinct unit")
+    return tuple(out)
+
+
+def _parse_infra_targets(raw: str) -> tuple[InfraSshTarget, ...]:
+    """Parse + strictly validate the raw infra-SSH-targets JSON *text*.
+
+    The text is a JSON *array* of target objects, resolved from the **default**
+    ``config/infra_ssh_targets.json`` when present, the explicit
+    ``INFRA_SSH_TARGETS_FILE`` when set (winning over both), or the inline
+    ``INFRA_SSH_TARGETS`` when no file is present (see
+    :func:`_load_infra_targets_text`); each
+    carries exactly the :data:`_INFRA_TARGET_FIELDS` fields. An empty / blank
+    value yields an empty tuple (no infrastructure provider). Anything malformed
+    — invalid JSON, a non-array, a non-object entry, an unknown field, a bad/duplicate
+    name, a bad host/port/username, a missing/unsafe key or known_hosts path, or an
+    empty / over-long ``mounts`` / ``services`` — is a startup :class:`ConfigError`.
+
+    Error messages name the *target* (once its name is known) or its *index*, and
+    the *field* — **never** a host, the key path, the known_hosts path, a
+    credential, or a mount path. The file *existence* checks mean a botched secret
+    mount fails at startup rather than at the first tool call.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"invalid INFRA_SSH_TARGETS configuration JSON: {exc.msg}") from exc
+    if not isinstance(data, list):
+        raise ConfigError("INFRA_SSH_TARGETS must be a JSON array of target objects")
+    if len(data) > _INFRA_MAX_TARGETS:
+        raise ConfigError(f"INFRA_SSH_TARGETS may contain at most {_INFRA_MAX_TARGETS} targets")
+
+    targets: list[InfraSshTarget] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(data):
+        where = f"target #{index + 1}"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where} in INFRA_SSH_TARGETS must be a JSON object")
+        unknown = set(entry) - _INFRA_TARGET_FIELDS
+        if unknown:
+            raise ConfigError(f"{where} has unknown field(s): {', '.join(sorted(unknown))}")
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise ConfigError(f"{where} is missing a valid 'name' (non-empty string)")
+        where = f"target {name!r}"
+        if not _INFRA_NAME_RE.match(name):
+            raise ConfigError(
+                f"{where} name must match [a-z][a-z0-9_-]{{0,31}} "
+                "(lowercase start; lowercase letters, digits, '_', '-')"
+            )
+        if name in seen:
+            raise ConfigError(f"duplicate infrastructure target name: {name!r}")
+        seen.add(name)
+
+        _validate_infra_host(entry.get("host"), where=where)
+        host = entry["host"]
+
+        port = entry.get("port")
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ConfigError(f"{where} 'port' must be an integer in 1..65535")
+
+        username = entry.get("username")
+        if not isinstance(username, str) or not _INFRA_USERNAME_RE.match(username):
+            raise ConfigError(
+                f"{where} 'username' must match [A-Za-z_][A-Za-z0-9_.-]{{0,31}}"
+            )
+
+        _validate_infra_file(entry.get("private_key_path"), where=where, field="private_key_path", require_nonempty=False)
+        private_key_path = entry["private_key_path"]
+        # The known_hosts file must also be non-empty — an empty pin is the same
+        # as no pin, and no pin is exactly what we must never fall back to.
+        _validate_infra_file(entry.get("known_hosts_path"), where=where, field="known_hosts_path", require_nonempty=True)
+        known_hosts_path = entry["known_hosts_path"]
+
+        mounts = _parse_infra_mounts(entry, where=where)
+        services = _parse_infra_services(entry, where=where)
+
+        targets.append(
+            InfraSshTarget(
+                name=name,
+                host=host,
+                port=port,
+                username=username,
+                private_key_path=private_key_path,
+                known_hosts_path=known_hosts_path,
+                mounts=mounts,
+                services=services,
+            )
+        )
+    return tuple(targets)
+
+
 def load_config() -> Config:
     """Build a validated :class:`Config` from the environment.
 
@@ -718,6 +1121,23 @@ def load_config() -> Config:
         _validate_oauth_callback_base(oauth_callback_base_url)
     oauth_callback_port = _parse_int(os.environ.get("OAUTH_CALLBACK_PORT", ""), 8090)
     oauth_state_ttl_seconds = _parse_float(os.environ.get("OAUTH_STATE_TTL_SECONDS", ""), 600.0)
+    # Phase 5.1: read-only infrastructure observation over SSH. All three knobs
+    # are read (the numeric ones feed the ``__post_init__`` cross-knob check);
+    # the targets are parsed the same way ``mcp_servers`` is — unconditionally —
+    # so a configured target set is always validated. The target source is the
+    # **default** ``config/infra_ssh_targets.json`` when that file is present, or
+    # the explicit ``INFRA_SSH_TARGETS_FILE`` when set (which wins over the
+    # default and the inline value; a set-but-missing/blank file is a
+    # ConfigError), or the inline ``INFRA_SSH_TARGETS`` when no file is present —
+    # see _load_infra_targets_text. Because the target parse checks that the
+    # private-key / known_hosts files exist, this is a startup error only when
+    # the resolved target set is non-empty (empty = no provider, no credential
+    # check, no error — mirroring empty ``MCP_SERVERS``).
+    infra_ssh_connect_timeout_seconds = _parse_float(
+        os.environ.get("INFRA_SSH_CONNECT_TIMEOUT_SECONDS", ""), 10.0
+    )
+    max_infra_tool_result_chars = _parse_int(os.environ.get("MAX_INFRA_TOOL_RESULT_CHARS", ""), 8000)
+    infra_ssh_targets = _parse_infra_targets(_load_infra_targets_text())
     return Config(
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         allowed_user_ids=_parse_user_ids(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")),
@@ -748,6 +1168,9 @@ def load_config() -> Config:
         oauth_callback_base_url=oauth_callback_base_url,
         oauth_callback_port=oauth_callback_port,
         oauth_state_ttl_seconds=oauth_state_ttl_seconds,
+        infra_ssh_targets=infra_ssh_targets,
+        infra_ssh_connect_timeout_seconds=infra_ssh_connect_timeout_seconds,
+        max_infra_tool_result_chars=max_infra_tool_result_chars,
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         log_color=_normalize_log_color(os.environ.get("LOG_COLOR", "")),
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,
