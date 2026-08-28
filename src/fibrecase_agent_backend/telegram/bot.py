@@ -115,7 +115,7 @@ def split_into_chunks(text: str, limit: int = CHUNK_SIZE) -> list[str]:
     return chunks
 
 
-async def _send_long(chat: Chat, text: str) -> None:
+async def _send_long(chat: Chat, text: str, *, reply_to_message_id: int | None = None) -> None:
     """Send the model reply to ``chat``, rendering its Markdown to HTML.
 
     The reply is split into tag-balanced chunks (a code block never dangles
@@ -124,18 +124,28 @@ async def _send_long(chat: Chat, text: str) -> None:
     the model emits something outside our supported subset — that one chunk is
     re-sent as **plain text** so the user still gets the content. Other chunks
     keep their formatting.
+
+    ``reply_to_message_id`` (when given) makes the **first** chunk a Telegram
+    *Reply* quoting that message, so the answer visibly references the user's
+    message it is answering. Only the first chunk carries it — the remaining
+    chunks follow normally, so the user's message is quoted once, not every
+    chunk.
     """
+    first = True
     for chunk in to_telegram_html_chunks(text, limit=CHUNK_SIZE):
         if not chunk.html:
             continue
+        reply_kwargs = {"reply_to_message_id": reply_to_message_id} if (first and reply_to_message_id is not None) else {}
+        first = False
         try:
-            await chat.send_message(text=chunk.html, parse_mode=ParseMode.HTML)
+            await chat.send_message(text=chunk.html, parse_mode=ParseMode.HTML, **reply_kwargs)
         except BadRequest:
             # Unparseable HTML for this chunk: deliver it verbatim instead.
             logger.warning("html parse failed for a chunk; falling back to plain text")
             for plain in split_into_chunks(chunk.text, limit=CHUNK_SIZE):
                 if plain:
-                    await chat.send_message(text=plain)
+                    await chat.send_message(text=plain, **reply_kwargs)
+                    reply_kwargs = {}
         except TelegramError:
             # Non-parse errors (FloodWait, timeouts): let the caller's
             # TelegramError handling / on_error log it, as before.
@@ -739,7 +749,11 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not reply:
         return
     try:
-        await _send_long(chat, reply)
+        # The final answer quotes the user's message (Telegram Reply) so it
+        # visibly references what it is answering. Only this last reply carries
+        # the reference — command acks, the typing keep-alive, and intermediate
+        # sends do not.
+        await _send_long(chat, reply, reply_to_message_id=message.message_id)
     except TelegramError:
         logger.error("failed to send reply", extra={"conversation_id": conversation_id}, exc_info=True)
 

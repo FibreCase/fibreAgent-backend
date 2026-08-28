@@ -21,6 +21,7 @@ from fibrecase_agent_backend import __version__
 from fibrecase_agent_backend.telegram.bot import (
     CHUNK_SIZE,
     _is_authorized,
+    _send_long,
     cmd_context,
     cmd_forget,
     cmd_help,
@@ -562,6 +563,57 @@ async def test_handle_message_falls_back_to_plain_on_bad_request():
     second = send.await_args_list[1].kwargs
     assert second.get("parse_mode") in (None, "Text")  # not HTML
     assert second["text"] == "**bold** `code`"  # original markdown, verbatim
+
+
+# ---------------------------------------------------------------------------
+# Telegram Reply: the final answer quotes the user's message (and only it)
+# ---------------------------------------------------------------------------
+async def test_handle_message_final_answer_replies_to_user_message():
+    # The model's final answer quotes the user's message (Telegram Reply), so it
+    # visibly references what it is answering.
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = _FakeService(reply="hi back")
+    app.bot_data["config"] = _FakeConfig()
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await handle_message(update, context)
+    # The user's message had message_id 1 (see _make); the reply quotes it.
+    assert send.await_count == 1
+    assert send.await_args.kwargs["reply_to_message_id"] == 1
+
+
+async def test_command_reply_is_not_a_reply_to_user_message():
+    # Command acks are not "answers" to a user's question — they must NOT carry
+    # a Telegram Reply (only the final LLM answer does).
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/help", allowed=(1,))
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_help(update, context)
+    assert send.await_count >= 1
+    for call in send.await_args_list:
+        assert "reply_to_message_id" not in call.kwargs
+
+
+async def test_send_long_replies_only_first_chunk():
+    # A long reply is chunked: only the FIRST chunk quotes the user's message;
+    # the rest follow normally, so the user's message is quoted once, not per chunk.
+    chat = Chat(id=1, type="private")
+    # Blank-line-separated paragraphs → several chunks (contiguous single
+    # newlines would stay one atomic block and not split).
+    long_text = "A paragraph here.\n\n" * 400  # ~7600 chars > CHUNK_SIZE
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await _send_long(chat, long_text, reply_to_message_id=7)
+    assert send.await_count >= 2  # prove it actually chunked
+    assert send.await_args_list[0].kwargs.get("reply_to_message_id") == 7  # first chunk quotes it
+    for call in send.await_args_list[1:]:  # …the others do not
+        assert "reply_to_message_id" not in call.kwargs
+
+
+async def test_send_long_no_reply_when_id_is_none():
+    # Without a reply id, no chunk carries a Telegram Reply (the old behaviour).
+    chat = Chat(id=1, type="private")
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await _send_long(chat, "hi there")
+    assert "reply_to_message_id" not in send.await_args.kwargs
 
 
 # ---------------------------------------------------------------------------
