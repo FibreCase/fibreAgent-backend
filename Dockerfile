@@ -16,6 +16,44 @@
 
 FROM python:3.14-slim
 
+# ---------------------------------------------------------------------------
+# base tools layer — kept FIRST so source edits never bust this cache
+# ---------------------------------------------------------------------------
+# A small set of commonly-expected command-line tools on top of the slim image,
+# plus ca-certificates (system TLS) and the unprivileged "agent" user.
+#
+# Putting the `apt-get` install + `useradd` in the very first layer means this
+# step is rebuilt only when THIS list changes — not on every source edit.
+# Previously the apt step ran *after* `COPY . .`, so any code change invalidated
+# it (and re-ran the slow apt install on every build). `--no-install-recommends`
+# keeps the image slim. The tools are for interactive use and for the opt-in
+# `exec` shell tool; they are NOT required by the app itself (the app is pure
+# Python and needs only the venv below).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        jq \
+        less \
+        nano \
+        file \
+        tree \
+        unzip \
+        zip \
+        rsync \
+        iproute2 \
+        dnsutils \
+        netcat-openbsd \
+        openssh-client \
+        procps \
+        htop \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --user-group --uid 10001 --shell /usr/sbin/nologin agent
+
+# ---------------------------------------------------------------------------
+# project environment — uv + the exact locked deps
+# ---------------------------------------------------------------------------
 # uv (from PyPI, pinned to the lockfile generator) installs Python *and* the
 # exact locked deps. UV_PROJECT_ENVIRONMENT pins uv to a dedicated venv, so the
 # interpreter never clashes with the system one and the console script lands in
@@ -38,14 +76,8 @@ RUN uv sync --frozen --no-dev
 # ---------------------------------------------------------------------------
 # runtime
 # ---------------------------------------------------------------------------
-# Small hardening: no leftover apt cache, run as an unprivileged user.
-# --user-group guarantees the "agent" group exists (independent of the image's
-# /etc/default/useradd) so the chown below never fails.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --user-group --uid 10001 --shell /usr/sbin/nologin agent
-
+# Small hardening: no leftover apt cache (already pruned in the tools layer
+# above), run as an unprivileged user.
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
