@@ -16,6 +16,8 @@ from typing import Any
 
 import pytest
 
+from telegram import InlineKeyboardMarkup
+
 from fibrecase_agent_backend.agent.service import AgentService
 from fibrecase_agent_backend.llm.client import LLMResult
 from fibrecase_agent_backend.memory import hash_scope
@@ -40,12 +42,27 @@ USER_A = 7
 # ---------------------------------------------------------------------------
 # fakes
 # ---------------------------------------------------------------------------
+class _FakeMessage:
+    """A sent-message stand-in carrying the id the card is edited by."""
+
+    def __init__(self, message_id):
+        self.message_id = message_id
+
+
 class _FakeBot:
     def __init__(self):
         self.sent: list[dict[str, Any]] = []
+        self.edited: list[dict[str, Any]] = []
+        self._next_id = 1
 
     async def send_message(self, chat_id, text, **kwargs):
-        self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
+        message = _FakeMessage(self._next_id)
+        self._next_id += 1
+        self.sent.append({"chat_id": chat_id, "message_id": message.message_id, "text": text, **kwargs})
+        return message
+
+    async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+        self.edited.append({"chat_id": chat_id, "message_id": message_id, "text": text, **kwargs})
 
 
 class _FakeApp:
@@ -91,6 +108,10 @@ def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", sec
     )
 
 
+_approve_label = "✅ Approve"
+_deny_label = "❌ Deny"
+
+
 def _callback_data(sent, button_text):
     """The callback_data of the named button on the first sent keyboard."""
     keyboard = sent["reply_markup"]
@@ -125,8 +146,8 @@ async def test_approve_executes_exactly_once():
     # The prompt went to the *original* chat with Approve + Deny buttons.
     sent = app.bot.sent[0]
     assert sent["chat_id"] == CHAT_A
-    approve = _callback_data(sent, "Approve")
-    deny = _callback_data(sent, "Deny")
+    approve = _callback_data(sent, _approve_label)
+    deny = _callback_data(sent, _deny_label)
     assert approve != deny
 
     # The owner (same user + chat) clicks Approve.
@@ -143,10 +164,150 @@ async def test_deny_click_does_not_execute():
     req = _request("r2")
     task = asyncio.create_task(broker.request_approval(req))
     await _await_pending(broker, "r2")
-    deny = _callback_data(app.bot.sent[0], "Deny")
+    deny = _callback_data(app.bot.sent[0], _deny_label)
     await broker.handle_callback(_FakeUpdate(deny, CHAT_A, USER_A), None)
     assert await task == ApprovalDecision.DENIED
     assert "r2" not in broker._pending
+
+
+# ---------------------------------------------------------------------------
+# the card is finalised in place: buttons removed + hint replaced by a status
+# ---------------------------------------------------------------------------
+def _edited_text(edited):
+    return edited[0]["text"] if edited else ""
+
+
+async def test_approved_card_is_finalised_in_place():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("ra", tool="risky")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "ra")
+
+    prompt = app.bot.sent[0]
+    # The prompt's buttons carry an emoji label…
+    button_texts = [btn.text for row in prompt["reply_markup"].inline_keyboard for btn in row]
+    assert _approve_label in button_texts
+    assert _deny_label in button_texts
+    approve = _callback_data(prompt, _approve_label)
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+
+    # The original card carried the live Approve/Deny buttons and the hint…
+    assert prompt["reply_markup"].inline_keyboard
+    assert "<i>This approval is one-time" in prompt["text"]
+
+    # …and after the decision the SAME message is edited once in place: the
+    # buttons are gone (empty keyboard) and the hint is replaced by a status.
+    assert len(app.bot.edited) == 1
+    edit = app.bot.edited[0]
+    assert edit["chat_id"] == CHAT_A
+    assert edit["message_id"] == prompt["message_id"]  # same card, not a new message
+    assert edit["reply_markup"] == InlineKeyboardMarkup([])
+    assert edit["parse_mode"] == "HTML"
+    text = _edited_text(app.bot.edited)
+    # Bold, emoji-tagged status word — no "Status:" label, no old hint.
+    assert "<b>✅ Approved.</b>" in text
+    assert "Status:" not in text
+    assert "<i>This approval is one-time" not in text
+    # Still secret-free after the edit: tool name shown, no ids/scope.
+    assert "risky" in text
+    assert "telegram:" not in text and "100" not in text and "7" not in text
+
+
+async def test_denied_card_is_finalised_in_place():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("rb")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "rb")
+    deny = _callback_data(app.bot.sent[0], _deny_label)
+    await broker.handle_callback(_FakeUpdate(deny, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.DENIED
+
+    assert len(app.bot.edited) == 1
+    assert app.bot.edited[0]["reply_markup"] == InlineKeyboardMarkup([])
+    assert "<b>❌ Denied.</b>" in _edited_text(app.bot.edited)
+
+
+async def test_timeout_finalises_card_as_expired():
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("rc", seconds=0.05)
+    task = asyncio.create_task(broker.request_approval(req))
+    # No click: the wait expires on its own and the card closes as "Expired".
+    assert await task == ApprovalDecision.EXPIRED
+
+    assert len(app.bot.edited) == 1
+    edit = app.bot.edited[0]
+    assert edit["message_id"] == app.bot.sent[0]["message_id"]
+    assert edit["reply_markup"] == InlineKeyboardMarkup([])
+    text = _edited_text(app.bot.edited)
+    assert "<b>⏰ Expired (no decision in time).</b>" in text
+    assert "<i>This approval is one-time" not in text
+
+
+async def test_decision_posts_no_follow_up_message():
+    # The redesign replaces the separate follow-up with an in-place edit, so a
+    # decision must NOT send a second prompt message to the chat.
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("rd")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "rd")
+    approve = _callback_data(app.bot.sent[0], _approve_label)
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+
+    assert len(app.bot.sent) == 1  # only the original prompt, no follow-up
+    assert len(app.bot.edited) == 1  # …the card is instead edited once
+
+
+async def test_finalise_edit_failure_does_not_change_decision():
+    # A bot that can't edit (message too old / already edited) must not break the
+    # approval: the decision is returned as-is and no exception escapes.
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+
+    class _NoEditBot(_FakeBot):
+        async def edit_message_text(self, *a, **k):
+            raise RuntimeError("edit boom")
+
+    app = _FakeApp()
+    app.bot = _NoEditBot()
+    broker.bind_application(app)
+    req = _request("re")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "re")
+    approve = _callback_data(app.bot.sent[0], _approve_label)
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+    assert app.bot.edited == []  # the failed edit was swallowed
+
+
+async def test_finalise_is_skipped_when_no_message_id():
+    # If the send result carries no message_id (defensive), we still resolve the
+    # approval — we just can't (and must not) edit a card we can't identify.
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+
+    class _NoIdBot(_FakeBot):
+        async def send_message(self, chat_id, text, **kwargs):
+            self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
+            return None  # no .message_id
+
+    app = _FakeApp()
+    app.bot = _NoIdBot()
+    broker.bind_application(app)
+    req = _request("rf")
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "rf")
+    approve = _callback_data(app.bot.sent[0], _approve_label)
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+    assert app.bot.edited == []
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +341,7 @@ async def test_repeat_click_is_rejected():
     req = _request("r5")
     task = asyncio.create_task(broker.request_approval(req))
     await _await_pending(broker, "r5")
-    approve = _callback_data(app.bot.sent[0], "Approve")
+    approve = _callback_data(app.bot.sent[0], _approve_label)
 
     # First click resolves the request.
     await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
@@ -213,7 +374,7 @@ async def test_expired_deadline_is_rejected():
     req = _request("r6", seconds=-1)  # already in the past
     task = asyncio.create_task(broker.request_approval(req))
     await _await_pending(broker, "r6")
-    approve = _callback_data(app.bot.sent[0], "Approve")
+    approve = _callback_data(app.bot.sent[0], _approve_label)
     await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
     # The deadline check fires before the button is honoured → expired.
     assert await task == ApprovalDecision.EXPIRED
@@ -238,7 +399,7 @@ async def test_other_allowlisted_user_cannot_approve():
     req = _request("r7")
     task = asyncio.create_task(broker.request_approval(req))
     await _await_pending(broker, "r7")
-    approve = _callback_data(app.bot.sent[0], "Approve")
+    approve = _callback_data(app.bot.sent[0], _approve_label)
 
     # A *different* (but allow-listed) user clicks in the same chat.
     other = _FakeUpdate(approve, CHAT_A, 999)
@@ -257,7 +418,7 @@ async def test_other_chat_cannot_approve():
     req = _request("r8")
     task = asyncio.create_task(broker.request_approval(req))
     await _await_pending(broker, "r8")
-    approve = _callback_data(app.bot.sent[0], "Approve")
+    approve = _callback_data(app.bot.sent[0], _approve_label)
 
     # Same user, but the callback arrives from a different chat id.
     other = _FakeUpdate(approve, CHAT_A + 1, USER_A)

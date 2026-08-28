@@ -23,11 +23,16 @@ Security properties, matching the task spec:
   request all yield a safe "expired/invalid" result and never execute.
 * **Bounded wait, no busy-poll.** ``request_approval`` awaits an
   ``asyncio.Future`` under ``asyncio.wait_for`` — it never blocks the event
-  loop, never polls, and performs no I/O beyond the one transport send.
+  loop, never polls, and performs no I/O beyond the prompt send and the single
+  in-place edit that finalises the card once the approval is decided or expires.
 * **Secret-free UI.** The message shows only a fixed title, the tool name, the
   tool's safe ``summary`` (which by default withholds the arguments), and an
-  expiry hint. The callback data carries only a version tag, the opaque request
-  id, and the decision — never args, scope, chat id, a secret, or the tool name.
+  expiry hint. When the approval is decided (or times out) the card is edited in
+  place — the (emoji-labelled) Approve/Deny buttons are removed and the hint line
+  is replaced by a bold, emoji-tagged status word (*Approved* / *Denied* /
+  *Expired*) — so a live Approve/Deny row never lingers. The callback data
+  carries only a version tag, the opaque request id, and the decision — never
+  args, scope, chat id, a secret, or the tool name.
 
 Pending approvals are **in-memory only**: a process restart drops them, so an old
 button from a previous run is indistinguishable from an unknown id.
@@ -57,10 +62,21 @@ _DECISION_DENY = "d"
 # Sent with parse_mode=HTML, so the emphasis uses Telegram's HTML tags (<b>/<i>)
 # — NOT Markdown — or the markup would be displayed literally, un-rendered.
 _APPROVAL_TITLE = "<b>Approve tool call?</b>"
+_APPROVAL_HINT = "<i>This approval is one-time and will expire shortly.</i>"
 _APPROVAL_EXPIRED_TEXT = "This approval has expired or is no longer valid."
-_APPROVAL_UNKNOWN_TEXT = "This approval is no longer valid."
 _APPROVAL_APPROVED_TEXT = "Approved."
 _APPROVAL_DENIED_TEXT = "Denied."
+# Button labels — the emoji makes each action legible at a glance.
+_APPROVAL_APPROVE_LABEL = "✅ Approve"
+_APPROVAL_DENY_LABEL = "❌ Deny"
+# Card status lines for the *in-place* edit that finalises the card once the
+# approval is decided or expires: they replace the "<i>This approval is one-time…</i>"
+# hint line (with the buttons removed). A single bold, emoji-tagged word — no
+# "Status:" label — fixed and secret-free (tool name is escaped; no args, scope,
+# chat id, or secret).
+_APPROVAL_APPROVED_STATUS = "<b>✅ Approved.</b>"
+_APPROVAL_DENIED_STATUS = "<b>❌ Denied.</b>"
+_APPROVAL_EXPIRED_STATUS = "<b>⏰ Expired (no decision in time).</b>"
 
 
 def _html_escape(text: str) -> str:
@@ -150,7 +166,7 @@ class TelegramApprovalBroker:
         # Present the prompt. A send failure means the human never sees it —
         # clean up and fail closed.
         try:
-            await self._send_approval_message(chat_id, request.request_id, request)
+            message_id = await self._send_approval_message(chat_id, request.request_id, request)
         except Exception:
             self._pending.pop(request.request_id, None)
             if not future.done():
@@ -167,6 +183,20 @@ class TelegramApprovalBroker:
             # The request is over (decided, expired, or cancelled): it is
             # consumed and can never be resolved again.
             self._pending.pop(request.request_id, None)
+
+        # Finalise the card in place: strip the Approve/Deny buttons and replace
+        # the "one-time / will expire" hint with the outcome. Every resolution
+        # path (valid click, void, shutdown, timeout) funnels through this
+        # ``wait_for``, so this is the single point that closes the card. It is
+        # best-effort — a failed edit never changes the decision returned above.
+        if message_id is not None:
+            if decision is ApprovalDecision.APPROVED:
+                status = _APPROVAL_APPROVED_STATUS
+            elif decision is ApprovalDecision.DENIED:
+                status = _APPROVAL_DENIED_STATUS
+            else:
+                status = _APPROVAL_EXPIRED_STATUS
+            await self._finalize_message(chat_id, message_id, request, status)
 
         logger.info(
             "tool approval resolved",
@@ -186,18 +216,14 @@ class TelegramApprovalBroker:
         decision = self._resolve(data, principal_hash, chat_id)
         # Always answer the callback so the button spinner stops, with a safe,
         # non-revealing message. A foreign/stale/expired click gets the same
-        # "no longer valid" text as a real expiry — no existence leak.
+        # "no longer valid" text as a real expiry — no existence leak. The card
+        # itself is finalised in place by the waiting ``request_approval`` (see
+        # ``_finalize_message``) — no separate follow-up message is posted.
         reply = self._callback_reply(decision)
         try:
             await query.answer(reply)
         except Exception:
             logger.warning("approval: could not answer callback", exc_info=True)
-        if decision is ApprovalDecision.APPROVED:
-            await self._notify(chat_id, request_id_from(data), _APPROVAL_APPROVED_TEXT)
-        elif decision is ApprovalDecision.DENIED:
-            await self._notify(chat_id, request_id_from(data), _APPROVAL_DENIED_TEXT)
-        else:
-            await self._notify(chat_id, request_id_from(data), _APPROVAL_UNKNOWN_TEXT)
 
     def _resolve(self, data: str, principal_hash: str | None, chat_id: int | None):
         """Bind-check and consume a callback; return the decision (or a safe error).
@@ -247,13 +273,18 @@ class TelegramApprovalBroker:
         self._pending.pop(request_id, None)
 
     # -- helpers ------------------------------------------------------------
-    async def _send_approval_message(self, chat_id: int, request_id: str, request: ApprovalRequest) -> None:
-        """Send the fixed, secret-free approval prompt with Approve/Deny buttons."""
+    async def _send_approval_message(self, chat_id: int, request_id: str, request: ApprovalRequest) -> int | None:
+        """Send the fixed, secret-free approval prompt with Approve/Deny buttons.
+
+        Returns the sent message's ``message_id`` (so the card can be edited in
+        place later), or ``None`` if the send result does not carry one (the
+        prompt still went out; in-place finalisation is then skipped).
+        """
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("Approve", callback_data=f"{_CALLBACK_VERSION}:{request_id}:{_DECISION_APPROVE}"),
-                    InlineKeyboardButton("Deny", callback_data=f"{_CALLBACK_VERSION}:{request_id}:{_DECISION_DENY}"),
+                    InlineKeyboardButton(_APPROVAL_APPROVE_LABEL, callback_data=f"{_CALLBACK_VERSION}:{request_id}:{_DECISION_APPROVE}"),
+                    InlineKeyboardButton(_APPROVAL_DENY_LABEL, callback_data=f"{_CALLBACK_VERSION}:{request_id}:{_DECISION_DENY}"),
                 ]
             ]
         )
@@ -266,18 +297,49 @@ class TelegramApprovalBroker:
             f"{_APPROVAL_TITLE}\n\n"
             f"<b>Tool:</b> {_html_escape(request.tool_name)}\n"
             f"<b>Summary:</b> {_html_escape(request.summary)}\n\n"
-            f"<i>This approval is one-time and will expire shortly.</i>"
+            f"{_APPROVAL_HINT}"
         )
-        await self._application.bot.send_message(
+        message = await self._application.bot.send_message(
             chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard
         )
+        # ``message`` is a telegram.Message in production; tests use a fake whose
+        # ``message_id`` we read defensively so a missing attribute is not fatal.
+        return getattr(message, "message_id", None)
 
-    async def _notify(self, chat_id: int, request_id: str, text: str) -> None:
-        """Post a short follow-up to the chat (best-effort; never raises)."""
+    async def _finalize_message(self, chat_id: int, message_id: int, request: ApprovalRequest, status: str) -> None:
+        """Edit the approval card in place once the approval is decided/expired.
+
+        Removes the Approve/Deny buttons and replaces the "one-time / will
+        expire" hint line with a short, bold, emoji-tagged status word
+        (Approved / Denied / Expired), so no live buttons linger after the moment
+        they could no longer be pressed. Best-effort: a failed edit never raises
+        and never changes the decision.
+
+        ``status`` is already Telegram-HTML (a fixed, bold, emoji-tagged
+        constant) — it is inserted verbatim, **not** escaped, so its ``<b>`` tags
+        render. The only interpolated *data* (tool name, summary) is escaped.
+
+        Passing ``reply_markup=InlineKeyboardMarkup([])`` is what removes the
+        keyboard: the empty markup serialises to ``{}`` on the wire (the Bot API
+        "remove the inline keyboard" signal), whereas ``None`` would be dropped
+        by PTB entirely and leave the old buttons in place.
+        """
         try:
-            await self._application.bot.send_message(chat_id=chat_id, text=text)
+            text = (
+                f"{_APPROVAL_TITLE}\n\n"
+                f"<b>Tool:</b> {_html_escape(request.tool_name)}\n"
+                f"<b>Summary:</b> {_html_escape(request.summary)}\n\n"
+                f"{status}"
+            )
+            await self._application.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([]),
+            )
         except Exception:
-            logger.debug("approval: follow-up message failed", exc_info=True)
+            logger.debug("approval: could not finalise approval card", exc_info=True)
 
     def _callback_reply(self, decision) -> str:
         if decision is ApprovalDecision.APPROVED:
