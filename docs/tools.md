@@ -2,15 +2,29 @@
 
 Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，循环插在 `AgentService` 与 `LLM Client` 之间。Phase 2.1 建了工具运行时；Phase 3 在**同一个 loop 前面**加了一道统一的执行边界（策略 → 校验 → 审批 → 超时 → 审计），把「谁允许这个工具、参数合不合法、要不要人点一下、卡多久、记不记账」从工具本身里抽出来。
 
-## 三个只读内置工具
+## 内置工具
 
 | 工具 | 参数 | 默认权限 | 作用 |
 | --- | --- | --- | --- |
 | `get_current_time` | 无 | `allow` | 当前本地时间 |
 | `echo` | `{"message": str}` | `allow` | 回显参数 |
 | `system_info` | 无 | **`ask`**（刻意） | 主机名 / 平台 / Python 版本 |
+| `exec`（**可选**） | `{"command": str}` | **`ask`**（恒） | 跑一条 `/bin/sh -c` 命令，返回 `{exit_code, stdout, stderr}` |
 
-三者都只用 stdlib、**只读**、无 subprocess、不碰文件。`get_current_time` 和 `echo` 声明 `allow`（跑起来不打扰）；`system_info` 虽然同样只读，但**当前刻意设为 `ask`** 以便演示审批流程——在 `tools/builtin/system_info.py` 里改回 `ToolPermission.ALLOW` 即恢复免审批。任何**未来**新工具若不声明权限，一律默认 `ask`（不能裸跑）。
+三个只读工具都只用 stdlib、**只读**、无 subprocess、不碰文件。`get_current_time` 和 `echo` 声明 `allow`（跑起来不打扰）；`system_info` 虽然同样只读，但**当前刻意设为 `ask`** 以便演示审批流程——在 `tools/builtin/system_info.py` 里改回 `ToolPermission.ALLOW` 即恢复免审批。任何**未来**新工具若不声明权限，一律默认 `ask`（不能裸跑）。
+
+### `exec`（可选的 shell 工具）
+
+**默认关闭**（`ENABLE_EXEC_TOOL=false`）——不开则不注册、不广告给模型、默认部署仍是"零子进程"。开启后它是唯一会**真正 spawn 子进程**的内置工具，因此是**唯一的状态变更本地能力**，防御纵深（全部在 `execute` 内，loop 不动）：
+
+- **恒 `ask`**：每次调用都需一次性人工审批，命令**逐字**显示在审批卡的 `Arguments:` 块里（模型无法自批）。
+- **静态兜底**（`tools/exec_policy.py`）：一组保守的灾难性命令正则（递归 `rm` `/`/`$HOME`、`--no-preserve-root`、fork bomb、`curl`/`wget | sh`、`dd`/`mkfs`/裸写块设备、`shutdown`/`reboot`/`halt`/`init 0/6`、`chmod 777 /`）在 **spawn 之前**拦截——**即便你刚点了批准**也生效（防审批疲劳误批）。它是**兜底不是沙箱**：无法理解意图，故意小而保守。
+- **参数向量 spawn**：`create_subprocess_exec("/bin/sh", "-c", cmd, …)`，**绝不** `shell=True`。
+- **进程组杀**：`start_new_session=True` 让 `sh -c` 及所有子孙同处一个进程组；超时/取消时整组 `SIGKILL`（不留孤儿）。
+- **输出尾截断**：stdout / stderr 各自截到 `MAX_EXEC_TOOL_RESULT_CHARS`，超限加固定 `[N chars … truncated]` 标记（**不是**报错——因为这是已被批准命令的直接结果，尾部正是跑完最想看的部分）。非零退出码**也算成功运行**，以 JSON 返回供模型判断。
+- **只回模型**：命令与 stdout/stderr **永不进日志、永不进审计表**。
+
+> 无沙箱 / 无降权 / 无 cgroup / seccomp：一条被批准命令的爆炸半径 = bot 运行账号。建议**不以 root 运行**、用 `EXEC_WORKDIR` 指向 scratch 目录。
 
 ## 工具调用循环
 
@@ -79,6 +93,10 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 | `MCP_PERMISSIONS_FILE` | 空 | 专用 MCP 工具权限文件（CWD 相对路径的 JSON **数组**，每项 `{ "tool": "mcp_<server>__<remote>", "permission": "allow\|ask\|deny\|"" }`）。**仅列 MCP 工具**，内置工具不在此文件中。由**后端维护**：启动时重同步到当前 MCP 工具集（新工具出现为未填 `""`＝默认；**已填写**的条目永远保留，即使该工具后来消失；**未填写**的消失工具条目被删去），并**热加载**（改动在下次调用即生效，无需重启）。`""`（或缺省）＝用工具默认值。未设置/空文件＝无覆盖（全部 MCP 工具默认 `ask`），非错误；**存在但损坏**的文件＝启动 `ConfigError`（坏掉的安全设置绝不被静默忽略）。 |
 | `TOOL_APPROVAL_TIMEOUT_SECONDS` | `60` | `ask` 工具等待审批的秒数，超时 → `approval_expired`。必须为正。 |
 | `TOOL_TIMEOUT_SECONDS` | `30` | 单个工具最长执行秒数，超时 → `tool_timeout`。必须为正。 |
+| `ENABLE_EXEC_TOOL` | `false` | **可选 `exec` shell 工具的开关**。`false`（默认）→ 不注册、不广告、默认部署零子进程；`true` + `ENABLE_TOOLS=true` → 注册 `exec`（恒 `ask`）。 |
+| `MAX_EXEC_TOOL_RESULT_CHARS` | `8000` | `exec` 单条命令 stdout/stderr 的尾截断上限（超限加 `[N chars … truncated]` 标记，**不是**报错）。`>= 1`；仅在开启时校验。 |
+| `EXEC_WORKDIR` | 空（=进程 cwd） | `exec` 命令运行的固定目录；设置时须为**已存在目录**（否则启动 `ConfigError`）。仅在开启时校验。 |
+| `EXEC_POLICY_DENY_PATTERNS` | 空 | 追加到静态灾难性命令 denylist 的正则（JSON 字符串数组，**add-only**，核心列表不可删）。坏 JSON / 非字符串元素 / 不合法正则 = 启动 `ConfigError`（**始终**校验，即便工具关闭）。 |
 
 ## 加一个工具
 
@@ -106,7 +124,7 @@ class MyTool(Tool):
 - **不要**在任何地方写 `if name == "…"` 分支——registry 是唯一分发点。
 - 想给它自定义审批文案，可覆盖 `approval_summary(arguments)`——写工具**做什么**（用途），**绝不回显 `arguments`**（默认也不回显；内置工具与 MCP 工具都已提供用途行）。
 
-**MCP / SSH / Docker / Pi** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。**只读 SSH 观测（phase 5.1）也已按此模式接入**（见下）；Docker / Pi 仍是待建的同类 provider。
+**MCP / SSH / Docker / Pi / `exec`** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。**只读 SSH 观测（phase 5.1）也已按此模式接入**（见下）。**可选的 `exec`**（`ENABLE_EXEC_TOOL=true`）是本库第一个真正 spawn 子进程的内置工具——subprocess 同样封装在工具内部、恒 `ask`（见上）。Docker / Pi 仍是待建的同类 provider。
 
 ## 只读基础设施观测（SSH，phase 5.1）
 
@@ -122,7 +140,7 @@ class MyTool(Tool):
 
 ## 限制
 
-- 本地内置仅 3 个只读；**SSH 只读观测（phase 5.1）** 是固定的 host / disk / service 三个无参工具（严格只读，默认 `allow`、无需每次审批），**不含** shell、任意命令/路径/主机/服务、写操作、持久连接或自动重连；**Docker / Pi / 任何状态变更工具仍未建**（有意为之）。
+- 本地内置仅 3 个只读工具（`get_current_time` / `echo` / `system_info`）+ **可选的 `exec`**（**默认关闭**；开启后是唯一的状态变更本地能力，恒 `ask`、静态 denylist 兜底、进程组杀、输出尾截断，命令与 stdout/stderr 永不入日志/审计表）。**SSH 只读观测（phase 5.1）** 是固定的 host / disk / service 三个无参工具（严格只读，默认 `allow`、无需每次审批），**不含** shell、任意命令/路径/主机/服务、写操作、持久连接或自动重连；**Docker / Pi 等其它状态变更工具仍未建**（有意为之）——`exec` 已覆盖了通用 shell 工作，但仍是**无沙箱**的（爆炸半径 = bot 运行账号）。
 - 工具的**完整 transcript 不落库**（无 `tool_calls`/`tool` 消息持久化），无法逐条回放；只有元数据审计。
 - 审批与 pending 状态是**内存态**：进程重启即丢，旧按钮等同未知 id（安全，不会误执行）。
 - 参数校验发生在执行前（`jsonschema`）；但工具**内部**仍要自己防御外部输入。

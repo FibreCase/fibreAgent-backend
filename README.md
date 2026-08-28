@@ -97,7 +97,9 @@ uv run python -m fibrecase_agent_backend
 
 ## 当前开发状态
 
-已在 Telegram 上跑通的最小个人 Agent backend。**能做的**：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio 本地进程，默认 `ask` 审批）+ **MCP 用户级 OAuth**（仅 http 传输，per Telegram user 凭据、自动刷新、`/new` 与重启不影响登录态）、**只读基础设施观测（SSH）**（每个目标三个固定无参只读工具：主机/磁盘/systemd 服务状态，严格只读默认 `allow`、无需每次审批，复用完整工具安全边界）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。**有意不做**：本地内置仅 3 个只读工具 + SSH 观测仅固定的 host/disk/service 三个无参工具（无 shell、任意命令/路径/主机/服务、文件、联网扫描、Docker、任何状态变更工具）、图片仅本地磁盘仅照片、估算是模型无关的保守值非计费 token、记忆是显式 + 纯词法（跨语言召回弱）、OAuth 仅 http 传输 + 用户级（无群组/共享/多账号切换，无 Web 面板）。
+已在 Telegram 上跑通的最小个人 Agent backend。**能做的**：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio 本地进程，默认 `ask` 审批）+ **MCP 用户级 OAuth**（仅 http 传输，per Telegram user 凭据、自动刷新、`/new` 与重启不影响登录态）、**只读基础设施观测（SSH）**（每个目标三个固定无参只读工具：主机/磁盘/systemd 服务状态，严格只读默认 `allow`、无需每次审批，复用完整工具安全边界）、**可选的 shell `exec` 工具**（**默认关闭**，`ENABLE_EXEC_TOOL=true` 开启；`/bin/sh -c` 完整 shell，每次调用必须人工审批、命令逐字展示，另有静态危险命令兜底）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。**有意不做**：本地内置 3 个只读工具 + **默认关闭的可选 `exec`** + SSH 观测仅固定的 host/disk/service 三个无参工具（无内置文件/联网扫描/Docker；`exec` 是唯一的状态变更本地能力，见下方安全说明）、图片仅本地磁盘仅照片、估算是模型无关的保守值非计费 token、记忆是显式 + 纯词法（跨语言召回弱）、OAuth 仅 http 传输 + 用户级（无群组/共享/多账号切换，无 Web 面板）。
+
+> **关于 `exec`（安全说明）**：`exec` 是首个会在宿主机上**真正 spawn 子进程**的能力，**默认关闭**——不开则仍是"零子进程"。开启后 Agent 可在**逐次人工审批**下执行任意 shell 工作（装软件、改文件、管服务）。风险：一条被误批的命令，其爆炸半径 = bot 运行账号（若以 root 运行则整机）；`exec` 的静态 denylist 是**兜底而非沙箱**（只挡一批灾难性命令，无法理解意图）。缓解：逐次 `ask` 审批（命令逐字可见）+ 静态 denylist 兜底 + 超时/取消时**整棵子进程组被杀**（不留孤儿）+ 输出尾截断 + 命令与 stdout/stderr **永不进日志/审计表**。建议 bot **不以 root 运行**，并用 `EXEC_WORKDIR` 指定一个 scratch 目录。
 
 **下一步（建议顺序）**：新的 `ContentPart` 类型（File / Audio / Video / Sticker，复用同一套附件存储）；有副作用的本地工具（Docker / Pi）以 Tool Provider 接入同一接口，默认进 `ask` 审批。
 

@@ -202,6 +202,24 @@ class Config:
     infra_ssh_connect_timeout_seconds: float = 10.0
     max_infra_tool_result_chars: int = 8000
 
+    # Exec shell tool. ``enable_exec_tool`` is an explicit opt-in (default off)
+    # that keeps the default deployment subprocess-free — when off, ``exec`` is
+    # never registered, never advertised, and its other knobs are not validated
+    # (mirroring how the infra/MCP optional providers are config-gated, not
+    # on-by-default). When on, ``max_exec_tool_result_chars`` tail-truncates one
+    # command's stdout/stderr (unlike MCP/infra, exec *truncates* rather than
+    # erroring, because the exact command was already human-approved);
+    # ``exec_workdir`` is the fixed CWD a command runs in (``None`` = the
+    # process cwd) and must be an existing directory; ``exec_policy_deny_patterns``
+    # is the operator's add-only list of catastrophic-command regexes layered on
+    # top of the core denylist (the core list is compiled in code and always
+    # active — it cannot be removed, only extended). ``exec`` always defaults to
+    # ``ask``: every call is human-approved before it runs (CLAUDE.md).
+    enable_exec_tool: bool = False
+    max_exec_tool_result_chars: int = 8000
+    exec_workdir: str | None = None
+    exec_policy_deny_patterns: tuple = field(default_factory=tuple)
+
     log_level: str = "INFO"
     log_color: str = "auto"  # "auto" | "true" | "false" — see logging_setup
     system_prompt_override: str | None = field(default=None)
@@ -278,6 +296,15 @@ class Config:
             )
         if self.max_infra_tool_result_chars < 1:
             raise ConfigError("MAX_INFRA_TOOL_RESULT_CHARS must be >= 1")
+        # Exec tool: validated only when enabled, so the default (off) deploy
+        # never requires its knobs — consistent with the other optional
+        # providers. The deny patterns are compiled at load (fail-closed); here
+        # we guard the numeric cap and the fixed working directory.
+        if self.enable_exec_tool:
+            if self.max_exec_tool_result_chars < 1:
+                raise ConfigError("MAX_EXEC_TOOL_RESULT_CHARS must be >= 1")
+            if self.exec_workdir is not None and not Path(self.exec_workdir).is_dir():
+                raise ConfigError("EXEC_WORKDIR must be an existing directory")
 
     @property
     def max_image_size_bytes(self) -> int:
@@ -1088,6 +1115,38 @@ def _parse_infra_targets(raw: str) -> tuple[InfraSshTarget, ...]:
     return tuple(targets)
 
 
+def _parse_exec_deny_patterns(raw: str) -> tuple[str, ...]:
+    """Parse ``EXEC_POLICY_DENY_PATTERNS`` — an add-only JSON array of regex strings.
+
+    Unset/blank/``[]`` → ``()`` (core denylist only). Strict and fail-closed: a
+    non-array, a non-string element, or a pattern that does not compile is a
+    startup ``ConfigError`` — a bad pattern must never be silently dropped
+    (that would *weaken* the backstop). The patterns are stored as raw strings;
+    they are compiled into the tool's denylist by ``compile_denylist`` at
+    construction, so compilation is also covered here for fail-fast. Error text
+    names only the offending index — never the pattern body.
+    """
+    text = raw.strip()
+    if not text:
+        return ()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ConfigError("EXEC_POLICY_DENY_PATTERNS must be a JSON array of regex strings") from None
+    if not isinstance(data, list):
+        raise ConfigError("EXEC_POLICY_DENY_PATTERNS must be a JSON array of regex strings")
+    out: list[str] = []
+    for i, pat in enumerate(data):
+        if not isinstance(pat, str) or not pat.strip():
+            raise ConfigError(f"EXEC_POLICY_DENY_PATTERNS[{i}] must be a non-empty regex string")
+        try:
+            re.compile(pat)
+        except re.error:
+            raise ConfigError(f"EXEC_POLICY_DENY_PATTERNS[{i}] is not a valid regex") from None
+        out.append(pat)
+    return tuple(out)
+
+
 def load_config() -> Config:
     """Build a validated :class:`Config` from the environment.
 
@@ -1138,6 +1197,13 @@ def load_config() -> Config:
     )
     max_infra_tool_result_chars = _parse_int(os.environ.get("MAX_INFRA_TOOL_RESULT_CHARS", ""), 8000)
     infra_ssh_targets = _parse_infra_targets(_load_infra_targets_text())
+    # Exec shell tool. The opt-in flag is read first (it gates the numeric
+    # validation in __post_init__); the deny patterns are always parsed so a
+    # configured-but-bad list fails at startup even before the tool is built.
+    enable_exec_tool = _parse_bool(os.environ.get("ENABLE_EXEC_TOOL", ""), False)
+    max_exec_tool_result_chars = _parse_int(os.environ.get("MAX_EXEC_TOOL_RESULT_CHARS", ""), 8000)
+    exec_workdir = os.environ.get("EXEC_WORKDIR", "").strip() or None
+    exec_policy_deny_patterns = _parse_exec_deny_patterns(os.environ.get("EXEC_POLICY_DENY_PATTERNS", ""))
     return Config(
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         allowed_user_ids=_parse_user_ids(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")),
@@ -1171,6 +1237,10 @@ def load_config() -> Config:
         infra_ssh_targets=infra_ssh_targets,
         infra_ssh_connect_timeout_seconds=infra_ssh_connect_timeout_seconds,
         max_infra_tool_result_chars=max_infra_tool_result_chars,
+        enable_exec_tool=enable_exec_tool,
+        max_exec_tool_result_chars=max_exec_tool_result_chars,
+        exec_workdir=exec_workdir,
+        exec_policy_deny_patterns=exec_policy_deny_patterns,
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         log_color=_normalize_log_color(os.environ.get("LOG_COLOR", "")),
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,
