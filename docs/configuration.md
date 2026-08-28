@@ -21,10 +21,10 @@ cp .env.example .env
 | `SYSTEM_PROMPT_PATH` | system prompt 文件路径，默认 `config/system_prompt.txt`。 |
 | `SYSTEM_PROMPT` | 可选：内联 system prompt，**若设置则覆盖文件**。 |
 | `MAX_CONTEXT_MESSAGES` | context 中携带的**最近 N 条消息**（消息数，不是 token 数），默认 `50`，另加一条 system 消息。 |
-| `MAX_CONTEXT_ESTIMATED_TOKENS` | 一次请求（system + 选中的历史 + 当前消息）的**估算** token 预算上限，默认 `24000`。这是一个**模型无关的保守估算**——不是 provider 计费 token，也不做模型专用 tokenization——与 `MAX_CONTEXT_MESSAGES` 共同约束 context。超预算时按「完整历史 turn、从新到旧」选取，必要时把历史图片降级为纯文本（不读取、不发送该图）。 |
+| `MAX_CONTEXT_ESTIMATED_TOKENS` | 一次请求（system + 选中的历史 + 当前消息）的**估算** token 预算上限，默认 `200000`。这是一个**模型无关的保守估算**——不是 provider 计费 token，也不做模型专用 tokenization——与 `MAX_CONTEXT_MESSAGES` 共同约束 context。超预算时按「完整历史 turn、从新到旧」选取，必要时把历史图片降级为纯文本（不读取、不发送该图）。 |
 | `CONTEXT_IMAGE_ESTIMATED_TOKENS` | 估算中每张保留在 context 中的图片的成本，默认 `2000`。 |
 | `ENABLE_TOOLS` | 是否启用工具调用循环，默认 `true`。设为 `false` 时完全退回纯对话行为（不传 tools、不做任何工具相关持久化）。 |
-| `MAX_TOOL_ITERATIONS` | 单条消息内 LLM↔工具的最大往返次数，默认 `5`。超过则返回一条通用的「工具调用次数过多」提示。 |
+| `MAX_TOOL_ITERATIONS` | 单条消息内 LLM↔工具的最大往返次数，默认 `20`。超过则返回一条通用的「工具调用次数过多」提示。 |
 | `TOOL_APPROVAL_TIMEOUT_SECONDS` | 对 `ask` 策略工具，等待 Telegram 审批（`Approve`/`Deny`）的秒数，超时则按「审批已过期」处理，默认 `60`。必须为正数。 |
 | `TOOL_TIMEOUT_SECONDS` | 单个工具调用的最长执行秒数；超时即取消该工具并回给模型「工具超时」，默认 `30`。必须为正数。 |
 | `MCP_SERVERS` | 可选：MCP（**远程 Streamable HTTP** + **本地 stdio**）服务器列表，JSON **数组**。默认空 = 不建 MCP 客户端、永不发起任何 MCP 连接/子进程。每个对象含 `name`（`[a-z][a-z0-9_-]{0,31}`，唯一）+ `transport`（`"http"` 默认 \| `"stdio"`）。**http**（需 `url`）：`url` 为绝对 `https://`（含 host，**不含** userinfo/fragment/query）；`bearer_token_env` 是**环境变量名**（不是 token 本身），值须非空，启动时读作 `Authorization: Bearer` 头；`authentication` 可选 `{ "type": "none"\|"oauth", "provider"?: "google" }`——**与 `bearer_token_env` 互斥**（同设即 `ConfigError`），`oauth` 须带非空 `provider`，`none` 不得带 `provider`；http 条目**不得**带 `command`/`args`/`env`/`cwd`。**stdio**（需 `command`）：`command` 为可执行名或路径（字母/数字/`_ . / -`，**不**经 shell）；`args` 为字符串数组（**原样**传递，无 glob/`$VAR` 展开）；`env` 为「合法环境变量名 → 非空字符串」对象；`cwd` 为路径；stdio 条目**不得**带 `url` / `bearer_token_env` / `authentication`（凭据放在 `env`）。发现的工具命名为 `mcp_<server>__<remote>`，默认 `ask`（可用 `MCP_PERMISSIONS_FILE` 按命名空间名覆盖）。**启动期强校验**，任何违规都是 `ConfigError`。多服务器 / stdio 建议改用 `MCP_SERVERS_FILE`（单独 JSON 文件，优先于本内联值）。 |

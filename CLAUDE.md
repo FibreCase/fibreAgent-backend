@@ -28,7 +28,7 @@ Phase 2.1 adds, on top of the same layered design, a **tool-calling runtime** (e
 - A provider-/channel-agnostic `tools/` package: `Tool` interface, `ToolRegistry` (register / OpenAI-schema / execute-by-name), and three safe built-ins (`get_current_time`, `echo`, `system_info` — stdlib-only, no subprocess).
 - `agent/tool_loop.py::run_tool_loop()`: call LLM → if `tool_calls`, run each via the registry and feed `tool` results back → repeat until a final text answer or `MAX_TOOL_ITERATIONS` is hit.
 - `OpenAIClient.complete()` now accepts `tools=` and surfaces `tool_calls` on the result; `AgentService` drives the loop and persists **only** the user turn + final assistant turn (intermediate tool turns are not stored).
-- Two new config knobs: `ENABLE_TOOLS` (degrades fully to Phase 1 when `false`) and `MAX_TOOL_ITERATIONS` (default `5`).
+- Two new config knobs: `ENABLE_TOOLS` (degrades fully to Phase 1 when `false`) and `MAX_TOOL_ITERATIONS` (default `20`).
 
 Phase 2.2 (Multimodal Input Foundation) lets **Telegram photos** (with or without a caption) reach the LLM, on top of the same layers, without touching the tool runtime. It introduces a **channel-independent content model** that every future input channel (web UI, camera, …) will normalise into:
 
@@ -51,7 +51,7 @@ Phase 2.4 (Attachment-Aware Context Management) adds a **conservative, model-agn
 - `agent/context.py` is the single owner of context selection and stays **pure Python** (no Telegram, OpenAI SDK, SQLAlchemy, filesystem, or `AttachmentStore`). It gains a deterministic estimator (`estimate_text_cost` / `estimate_parts_cost` / `message_cost`: per-message envelope = 4 units, CJK codepoint = 1, contiguous ASCII = ceil(n/4), other Unicode = 1, each retained image = `CONTEXT_IMAGE_ESTIMATED_TOKENS`) and `plan_context()`, which — **before any attachment blob is read** — selects complete conversation turns (a `user` message + its following `assistant` messages; anomalous rows group safely) so the request fits **both** `MAX_CONTEXT_MESSAGES` and the token budget.
 - Selection priority is fixed: system always kept; the **current user request always kept and its images never downgraded**; history as complete turns newest-first; a turn whose full (image) form won't fit is **downgraded to text-only** (its images are dropped and *never read from disk* — the caption/reply stay); if the text-only form also won't fit, stop (never reach past a newer turn); output is chronological with system first.
 - `AgentService` builds lightweight `TurnCandidate`s (role/text/message id/attachment metadata — **no bytes**), calls the planner, and only **after** planning rehydrates the *selected* attachments. Downgraded / unselected turns go out as plain text or are omitted; their blobs are never read. When `system + current` alone exceed the budget it raises a user-safe `AgentError(category="context_limit")` and **does not call the LLM** (the user's text and already-persisted image are kept, matching other failure paths).
-- Two new config knobs: `MAX_CONTEXT_ESTIMATED_TOKENS` (default `24000`) and `CONTEXT_IMAGE_ESTIMATED_TOKENS` (default `2000`). The estimate is explicitly **not** a provider billing token count and there is no model-specific tokenizer or capability table — if the endpoint still reports context-length overflow, the existing safe `http_error` path handles it.
+- Two new config knobs: `MAX_CONTEXT_ESTIMATED_TOKENS` (default `200000`) and `CONTEXT_IMAGE_ESTIMATED_TOKENS` (default `2000`). The estimate is explicitly **not** a provider billing token count and there is no model-specific tokenizer or capability table — if the endpoint still reports context-length overflow, the existing safe `http_error` path handles it.
 
 Phase 2.5 (Explicit Long-Term Memory) adds a **minimal, controllable, cross-`/new`/restart** long-term memory on top of the already-budgeted context. The owner *explicitly* saves discrete facts via `/remember`; subsequent normal text messages deterministically retrieve relevant memories (pure lexical search — no embeddings, no external service, no FTS5, no new third-party deps) and inject them as a clearly-marked, non-instructional "user-provided reference material" message. It is an **auditable SQLite memory foundation** — *not* RAG/vector DB, *not* model auto-extraction. On the same layers, still without touching the tool runtime:
 
@@ -118,7 +118,7 @@ Two non-obvious rules:
 
 Two tool-calling knobs (phase 2.1):
 - **`ENABLE_TOOLS`** (default `true`): when `false`, `AgentService` skips the tool loop entirely and behaves exactly as Phase 1 (one LLM call, no `tools` advertised, nothing tool-related persisted). It is a hard, complete degradation switch.
-- **`MAX_TOOL_ITERATIONS`** (default `5`): hard cap on LLM↔tool round-trips per message. Hitting it raises a `ToolLoopLimitError`, surfaced to the user as a generic, user-safe "too many tool calls" message (category `tool_limit`).
+- **`MAX_TOOL_ITERATIONS`** (default `20`): hard cap on LLM↔tool round-trips per message. Hitting it raises a `ToolLoopLimitError`, surfaced to the user as a generic, user-safe "too many tool calls" message (category `tool_limit`).
 
 One multimodal-input knob (phase 2.2):
 - **`MAX_IMAGE_SIZE_MB`** (default `10`): a Telegram photo larger than this is refused with a user-safe "图片过大" message (category `image_too_large`) before anything reaches the LLM. The cap is enforced in `telegram/media.py` (the adapter), the single gatekeeper.
@@ -127,7 +127,7 @@ One attachment-storage knob (phase 2.3):
 - **`ATTACHMENT_STORAGE_PATH`** (default `./data/attachments`): the root directory for the content-addressed image blob store. Relative paths stay relative to the working directory (like `DATABASE_URL` / the system prompt); the directory is created on demand. Under Docker the default is inside the `./data:/app/data` bind mount. Only blob *bytes* live here — the DB holds metadata only.
 
 Two context-budget knobs (phase 2.4):
-- **`MAX_CONTEXT_ESTIMATED_TOKENS`** (default `24000`): a **conservative, model-agnostic estimate** of the total prompt (system + selected history + current user turn). It is *not* a provider billing token count — there is no model-specific tokenizer. It is an independent, second limit that works alongside `MAX_CONTEXT_MESSAGES`; the effective context must satisfy **both**.
+- **`MAX_CONTEXT_ESTIMATED_TOKENS`** (default `200000`): a **conservative, model-agnostic estimate** of the total prompt (system + selected history + current user turn). It is *not* a provider billing token count — there is no model-specific tokenizer. It is an independent, second limit that works alongside `MAX_CONTEXT_MESSAGES`; the effective context must satisfy **both**.
 - **`CONTEXT_IMAGE_ESTIMATED_TOKENS`** (default `2000`): the estimated cost attributed to each image kept in context, used by the planner to decide whether a history turn's images fit.
 
 Both are validated as positive integers (`>= 1`) in `Config.__post_init__`; a zero/negative/non-integer value raises `ConfigError`.

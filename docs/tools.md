@@ -74,7 +74,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `ENABLE_TOOLS` | `true` | `false` 时完全退回纯对话（硬降级开关）。 |
-| `MAX_TOOL_ITERATIONS` | `5` | 单条消息内 LLM↔工具最大往返；超过 → `tool_limit`。 |
+| `MAX_TOOL_ITERATIONS` | `20` | 单条消息内 LLM↔工具最大往返；超过 → `tool_limit`。 |
 | `MCP_PERMISSIONS_FILE` | 空 | 专用 MCP 工具权限文件（CWD 相对路径的 JSON **数组**，每项 `{ "tool": "mcp_<server>__<remote>", "permission": "allow\|ask\|deny\|"" }`）。**仅列 MCP 工具**，内置工具不在此文件中。由**后端维护**：启动时重同步到当前 MCP 工具集（新工具出现为未填 `""`＝默认；**已填写**的条目永远保留，即使该工具后来消失；**未填写**的消失工具条目被删去），并**热加载**（改动在下次调用即生效，无需重启）。`""`（或缺省）＝用工具默认值。未设置/空文件＝无覆盖（全部 MCP 工具默认 `ask`），非错误；**存在但损坏**的文件＝启动 `ConfigError`（坏掉的安全设置绝不被静默忽略）。 |
 | `TOOL_APPROVAL_TIMEOUT_SECONDS` | `60` | `ask` 工具等待审批的秒数，超时 → `approval_expired`。必须为正。 |
 | `TOOL_TIMEOUT_SECONDS` | `30` | 单个工具最长执行秒数，超时 → `tool_timeout`。必须为正。 |

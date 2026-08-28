@@ -37,7 +37,7 @@
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `MAX_CONTEXT_MESSAGES` | `50` | 携带的最近 N 条消息（消息数，非 token），另加一条 system。 |
-| `MAX_CONTEXT_ESTIMATED_TOKENS` | `24000` | 一次请求（system + 选中历史 + 当前）的估算 token 预算。模型无关的保守估算，**不是**计费 token，与 `MAX_CONTEXT_MESSAGES` 共同约束。 |
+| `MAX_CONTEXT_ESTIMATED_TOKENS` | `200000` | 一次请求（system + 选中历史 + 当前）的估算 token 预算。模型无关的保守估算，**不是**计费 token，与 `MAX_CONTEXT_MESSAGES` 共同约束。 |
 | `CONTEXT_IMAGE_ESTIMATED_TOKENS` | `2000` | 估算中每张保留图片的成本，planner 用它判断某个历史 turn 的图放不放得下。 |
 
 三者都按正整数（`>= 1`）校验。
