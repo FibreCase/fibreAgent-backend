@@ -764,6 +764,71 @@ async def test_connect_timeout_maps_to_connect_code(monkeypatch, caplog):
     await mgr.close()
 
 
+# A server whose handshake *leaks* an ``asyncio.CancelledError`` — e.g. the MCP
+# SDK's own cancel scope unwinding mid-``initialize`` (``Cancelled via cancel
+# scope …``) — must be treated as a plain connect failure, not allowed to abort
+# the whole bot startup. Regression for the startup crash where a
+# ``BaseException`` escaped ``_start_one`` because it is not an ``Exception``.
+async def test_leaked_cancelled_error_degrades_to_unavailable(monkeypatch, caplog):
+    import logging
+
+    class _LeakingSession:
+        def __init__(self, read, write, read_timeout_seconds=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def initialize(self):
+            # Simulates the SDK leaking a bare CancelledError from within the
+            # await (no outstanding cancel on our task — this is the internal case).
+            raise asyncio.CancelledError()
+
+    _patch(monkeypatch, {"https://leak.example/mcp": {"session": (_LeakingSession, {})}})
+    mgr = McpManager([_spec("leak", "https://leak.example/mcp")], connect_timeout_seconds=5.0, max_result_chars=100)
+    with caplog.at_level(logging.WARNING, logger="mcp"):
+        await mgr.start()  # must NOT raise
+    assert mgr.status()[0]["available"] is False
+    assert mgr.tools() == []
+    assert mgr.total_tools == 0
+    assert CODE_CONNECT_FAILED in {r.__dict__.get("code") for r in caplog.records}
+    await mgr.close()
+
+
+# The inverse guarantee: when the *process* is shutting down (our task is
+# genuinely cancelled), the leaked-cancellation guard must **propagate** rather
+# than swallow it — otherwise a real Ctrl-C during MCP startup would hang.
+async def test_external_cancellation_during_start_propagates(monkeypatch):
+    class _HangSession:
+        def __init__(self, read, write, read_timeout_seconds=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def initialize(self):
+            await asyncio.Event().wait()  # never returns; will be cancelled
+
+    _patch(monkeypatch, {"https://hang.example/mcp": {"session": (_HangSession, {})}})
+    mgr = McpManager([_spec("hang", "https://hang.example/mcp")], connect_timeout_seconds=30.0, max_result_chars=100)
+
+    task = asyncio.create_task(mgr.start())
+    await asyncio.sleep(0.05)  # let it enter the handshake
+    task.cancel()  # genuine external cancellation (simulated shutdown)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # ``start()`` was aborted by the cancellation before it could register the
+    # state, so the server must never appear as available.
+    assert not any(s["available"] for s in mgr.status())
+    await mgr.close()
+
+
 # ===========================================================================
 # required #5 — invalid schema/name or collision → whole server dropped
 # ===========================================================================

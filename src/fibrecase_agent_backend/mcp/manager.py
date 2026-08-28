@@ -152,7 +152,20 @@ class McpManager:
         self._started = True
 
     async def _start_one(self, state: _ServerState, taken: set[str]) -> None:
-        """Bring up one server; on any failure leave it marked unavailable."""
+        """Bring up one server; on any failure leave it marked unavailable.
+
+        The handshake itself runs in a *child task*. This isolates the MCP SDK
+        from our start-up: the SDK is anyio-based and, on a server whose
+        handshake never completes, can unwind its own cancel scope in ways that
+        surface as a bare ``asyncio.CancelledError`` (a ``BaseException``) or an
+        anyio ``ExceptionGroup`` — neither of which ``except Exception``
+        catches, and either of which used to propagate out of :meth:`start` and
+        abort the whole bot's start-up. Containing the handshake in a child task
+        keeps any such internal mess *inside* that task; we observe only a
+        finished task carrying a result or an exception, and a cancellation
+        that reaches *our* task means a genuine shutdown (see the
+        ``cancelling()`` check below).
+        """
         spec = state.spec
         # Phase 4.x: an OAuth server requires the OAuth infrastructure (the
         # per-user token auth) to have been wired by the composition root.
@@ -166,6 +179,87 @@ class McpManager:
             state.code = CODE_OAUTH_NOT_CONFIGURED
             state.available = False
             return
+
+        task = asyncio.ensure_future(self._handshake(spec, state, taken))
+        try:
+            # The handshake is *self-bounded*: every SDK round-trip inside it is
+            # wrapped in ``wait_for(self._connect_timeout)`` (see
+            # :meth:`_handshake`), so the child task always terminates on its own
+            # within roughly two connect deadlines. We just ``await`` it and
+            # observe the finished task. We deliberately do *not* wrap this in
+            # ``wait_for`` or ``asyncio.wait``: ``wait_for`` cancels its child on
+            # timeout (a second, competing cancel scope — the same class of race
+            # the SDK's anyio scope had), and ``asyncio.wait`` swallows a genuine
+            # external cancellation when it races the child finishing. A plain
+            # ``await`` keeps cancel semantics clean: our task is cancelled iff
+            # *someone cancelled our task*, which is exactly what we test below.
+            await task
+            return  # success: _handshake populated state and kept the stack
+        except asyncio.CancelledError:
+            # Two distinct causes surface as a CancelledError here, and the
+            # child-task boundary is what lets us tell them apart:
+            #   * an *external* cancellation of *our* task — the process is
+            #     shutting down (the composition root / PTB cancels the startup
+            #     task). That cancels *us*, so ``cancelling()`` on our task is
+            #     >= 1.
+            #   * an *internal* SDK unwind: the anyio-based SDK, on a server
+            #     whose handshake never completes, can leak a bare CancelledError
+            #     out of its own cancel scope. That cancels only the *child*
+            #     task, never ours, so ``cancelling()`` on our task stays 0.
+            # (Neither a leaked CancelledError nor an anyio ExceptionGroup is an
+            # ``Exception``, so a naive ``except Exception`` catches neither —
+            # which is why a bad endpoint used to propagate out of :meth:`start`
+            # and abort the whole bot's startup. Containing the handshake in a
+            # child task means we only ever see it as a finished task here.)
+            external = asyncio.current_task().cancelling() >= 1
+            await self._drain_child(task)
+            if external:
+                raise
+            state.code = CODE_CONNECT_FAILED
+            state.available = False
+            return
+        except _StartFailure as exc:
+            # A timeout / protocol / discovery failure _handshake mapped to a
+            # stable code.
+            state.code = exc.code
+            state.available = False
+            return
+        except BaseException as exc:  # anyio ExceptionGroup / anything unexpected
+            # Re-raise the process-level signals; degrade on everything else so
+            # one server can never take the bot down with it.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            state.code = CODE_CONNECT_FAILED
+            state.available = False
+            logger.warning(
+                "mcp server failed to start",
+                extra={"server": spec.name, "code": state.code, "exception": type(exc).__name__},
+            )
+            return
+
+    async def _drain_child(self, task: "asyncio.Task[Any]") -> None:
+        """Cancel a handshake child task and wait for it to finish cleaning up.
+
+        Used when the handshake task has ended in a cancelled state — either a
+        genuine shutdown cancelled it (we are about to re-raise) or the SDK
+        leaked a cancellation out of its own scope (we degrade instead). The
+        child closes its own half-open transport on the way out (see
+        :meth:`_handshake`); we suppress everything it raises so the drain
+        itself never disturbs start-up or shutdown.
+        """
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+
+    async def _handshake(self, spec: McpServer, state: _ServerState, taken: set[str]) -> None:
+        """Connect + initialise + discover one server (runs in a child task).
+
+        On success it sets ``state.session`` / ``state.tools`` /
+        ``state.tool_count`` / ``state.available`` and appends the live transport
+        stack to ``self._stacks`` (so :meth:`close` owns it). On any failure it
+        closes the stack it opened and raises a :class:`_StartFailure` carrying
+        the stable code. It never closes a stack that was successfully kept.
+        """
         stack = contextlib.AsyncExitStack()
         try:
             # The only place the two transports diverge: http builds an outbound
@@ -187,14 +281,19 @@ class McpManager:
                 http_client = self._build_http_client(spec)
                 await stack.enter_async_context(http_client)
                 # Streamable HTTP transport (connects lazily; the real round-trip
-                # is driven by initialize() below, which we bound with wait_for).
+                # is driven by initialize() below, bounded by wait_for).
                 streams = await stack.enter_async_context(
                     streamable_http_client(spec.url, http_client=http_client, terminate_on_close=True)
                 )
             read_stream, write_stream = streams
-            session = await stack.enter_async_context(
-                ClientSession(read_stream, write_stream, read_timeout_seconds=self._connect_timeout)
-            )
+            # No ``read_timeout_seconds``: it becomes a second, concurrent anyio
+            # cancel scope inside the SDK that, racing the handshake, is what
+            # leaks the bare ``CancelledError`` that used to abort start-up. Each
+            # round-trip is bounded here by ``wait_for(self._connect_timeout)``;
+            # runtime ``call_tool`` is bounded separately by the tool loop's own
+            # ``wait_for(tool_timeout_seconds)``, so nothing is left unbounded.
+            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+
             # The initialisation round-trip is where DNS/TLS/auth/handshake
             # surface. A timeout is a connect-level failure; anything else that
             # fails here is an initialise failure (bad protocol, rejected auth,
@@ -227,23 +326,35 @@ class McpManager:
             state.tool_count = len(tools)
             state.available = True
             self._stacks.append(stack)  # keep the transport/session alive
-        except _StartFailure as failure:
-            state.code = failure.code
-            state.available = False
-        except Exception as exc:  # defensive: a truly unexpected error
-            state.code = CODE_CONNECT_FAILED
-            state.available = False
-            logger.warning(
-                "mcp server failed to start",
-                extra={"server": spec.name, "code": state.code, "exception": type(exc).__name__},
-            )
-        finally:
-            # On any failure the per-server stack must be unwound now (it holds
-            # a live http client / transport). On success it is already kept in
-            # self._stacks, so we must **not** close it here.
+        except BaseException:
+            # On any failure unwind the stack we opened (it holds a live http
+            # client / transport, possibly a half-open connection). On success
+            # it was already kept in self._stacks, so we must **not** close it
+            # here.
+            #
+            # The close must run to completion **in this task**: the MCP SDK's
+            # transport holds an anyio task group, and an anyio cancel scope can
+            # only be exited in the task that created it. (``asyncio.shield``
+            # would run the close in a *different* task and trip anyio with
+            # "Attempted to exit cancel scope in a different task".) But this
+            # child may carry a pending cancellation — we cancelled it on the
+            # connect deadline or a shutdown — and that would interrupt the
+            # close at its first await. So: clear the pending cancellation(s),
+            # close the stack to completion, then restore the cancellation
+            # count so the task still ends cancelled. The original exception is
+            # re-raised unchanged, so the child's outcome is preserved.
             if not state.available:
-                with contextlib.suppress(Exception):
-                    await stack.aclose()
+                current = asyncio.current_task()
+                pending = current.cancelling()
+                for _ in range(pending):
+                    current.uncancel()
+                try:
+                    with contextlib.suppress(Exception):
+                        await stack.aclose()
+                finally:
+                    for _ in range(pending):
+                        current.cancel()
+            raise
 
     def _build_tools(
         self,
