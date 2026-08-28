@@ -112,7 +112,7 @@ def _arguments_block(arguments: dict[str, Any]) -> str | None:
     return f"<b>Arguments:</b>\n<pre><code>{_html_escape(pretty)}</code></pre>"
 
 
-def _card_text(request: ApprovalRequest, footer: str) -> str:
+def _card_text(request: ApprovalRequest, footer: str, *, show_arguments: bool = True) -> str:
     """The full Telegram-HTML approval card body, single-sourced for both the
     initial prompt and the in-place finalisation.
 
@@ -121,9 +121,13 @@ def _card_text(request: ApprovalRequest, footer: str) -> str:
     fixed, backend-authored HTML and are inserted **verbatim** (never escaped).
 
     Layout: the fixed title, the tool name, the "What it does" purpose summary,
-    an "Arguments:" block (readable JSON) **only when the call has arguments**,
-    then the footer. Every interpolated *data* value (tool name, summary,
-    arguments) is HTML-escaped so nothing can break the markup or inject a tag.
+    an "Arguments:" block (readable JSON) **only when the call has arguments and
+    ``show_arguments`` is set**, then the footer. The prompt shows the arguments
+    (the owner needs them to judge the call); the in-place finalisation passes
+    ``show_arguments=False`` so the resolved card — with its buttons already
+    removed — drops the Arguments section too. Every interpolated *data* value
+    (tool name, summary, arguments) is HTML-escaped so nothing can break the
+    markup or inject a tag.
     """
     lines = [
         _APPROVAL_TITLE,
@@ -131,9 +135,10 @@ def _card_text(request: ApprovalRequest, footer: str) -> str:
         f"<b>Tool:</b> {_html_escape(request.tool_name)}",
         f"<b>What it does:</b> {_html_escape(request.summary)}",
     ]
-    args_block = _arguments_block(request.arguments)
-    if args_block is not None:
-        lines.append(args_block)
+    if show_arguments:
+        args_block = _arguments_block(request.arguments)
+        if args_block is not None:
+            lines.append(args_block)
     lines += ["", footer]
     return "\n".join(lines)
 
@@ -362,8 +367,10 @@ class TelegramApprovalBroker:
 
         ``status`` is already Telegram-HTML (a fixed, bold, emoji-tagged
         constant) — it is inserted verbatim, **not** escaped, so its ``<b>`` tags
-        render. Every interpolated *data* value (tool name, summary, arguments)
-        is escaped inside :func:`_card_text`.
+        render. The card keeps the title, tool name, and purpose summary
+        (escaped inside :func:`_card_text`) but **drops the Arguments section**
+        (``show_arguments=False``), since the buttons are already removed and the
+        arguments have served their purpose.
 
         Passing ``reply_markup=InlineKeyboardMarkup([])`` is what removes the
         keyboard: the empty markup serialises to ``{}`` on the wire (the Bot API
@@ -371,7 +378,10 @@ class TelegramApprovalBroker:
         by PTB entirely and leave the old buttons in place.
         """
         try:
-            text = _card_text(request, status)
+            # The resolved card keeps only the outcome: the buttons are gone and
+            # the arguments have already served their purpose, so drop the
+            # Arguments section too (show_arguments=False).
+            text = _card_text(request, status, show_arguments=False)
             await self._application.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,

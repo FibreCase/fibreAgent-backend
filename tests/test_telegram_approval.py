@@ -615,6 +615,38 @@ async def test_approval_prompt_omits_arguments_when_empty():
     await broker.shutdown()
 
 
+async def test_finalised_card_drops_arguments():
+    # A call *with* arguments: the live prompt shows them, but once the owner
+    # decides the in-place edit removes the Arguments section too (buttons are
+    # already gone, so the resolved card keeps only the purpose + status).
+    broker = TelegramApprovalBroker(_FakeRepo(chat_id=CHAT_A))
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("ra", tool="risky", arguments={"city": "北京", "days": 3})
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "ra")
+
+    # The live prompt carries the readable Arguments block…
+    prompt = app.bot.sent[0]
+    assert "<b>Arguments:</b>" in prompt["text"]
+    assert '"city": "北京"' in prompt["text"]
+
+    # …and approving edits the SAME card without the Arguments section.
+    approve = _callback_data(prompt, _approve_label)
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+
+    assert len(app.bot.edited) == 1
+    edit = app.bot.edited[0]
+    assert edit["message_id"] == prompt["message_id"]
+    edited = _edited_text(app.bot.edited)
+    assert "<b>Arguments:</b>" not in edited
+    assert "北京" not in edited  # the argument value is gone with the block
+    # Purpose + status survive the edit.
+    assert "risky" in edited
+    assert "<b>✅ Approved.</b>" in edited
+
+
 # ---------------------------------------------------------------------------
 # required #13 — a blocked conversation stays ordered; another proceeds
 # ---------------------------------------------------------------------------
