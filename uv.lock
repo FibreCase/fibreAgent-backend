@@ -213,7 +213,7 @@ wheels = [
 
 [[package]]
 name = "fibrecase-agent-backend"
-version = "1.9.2"
+version = "1.10.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
