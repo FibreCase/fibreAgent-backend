@@ -452,6 +452,46 @@ MAX_INFRA_TOOL_RESULT_CHARS=8000
 
 **说明**：单个 infra 工具结果回传给模型的字符硬上限。超大结果按稳定码 `infra_result_too_large` 拒绝（**不截断、不回显**）。必须 `>= 1`。
 
+### Scheduled (cron) runs（phase 9）
+
+定时任务只来自**启动配置**（改需重启）；模型 / 聊天 / 工具参数无法创建、修改或删除任何定时任务。纯出向、不暴露新端口、不新增 DB 表或运行时依赖（cron 为纯 Python，时区用 stdlib `zoneinfo`）。详见 [定时任务](scheduling.md)。
+
+#### `SCHEDULES`
+
+**默认值**：空（未设 / `[]` / 空白）
+
+**示例**
+
+```
+SCHEDULES=[{"name":"morning-brief","cron":"0 7 * * *","chat_id":123456789,"user_id":987654321,"prompt":"Summarise today's priorities."}]
+```
+
+**说明**：定时任务列表，JSON **数组**。空 = 无自动化、不建调度循环、不跑任何定时任务（与空 `MCP_SERVERS` 同构）。每个对象**有且只有**五个字段：`name`（`[a-z][a-z0-9_-]{0,31}`、整表唯一）+ `cron`（**严格 5 字段**，见 [定时任务](scheduling.md)）+ `chat_id`（正整数，通知/审批卡投递到的绑定聊天）+ `user_id`（正整数，运行身份，故长期记忆检索仍生效）+ `prompt`（每次运行的固定文本，非空、≤ 2000 字符）。**启动期强校验**，任何违规都是 `ConfigError`（最多 16 个任务）——**只点名 `name` 与字段，绝不回显 `prompt` 内容或任何密钥**。多任务建议改用 `SCHEDULES_FILE`。
+
+#### `SCHEDULES_FILE`
+
+**默认值**：空
+
+**示例**
+
+```
+SCHEDULES_FILE=config/schedules.json
+```
+
+**说明**：**多任务的推荐写法**——把 `SCHEDULES` 的同一份 JSON **数组**放进单独的文件，这里填路径（相对工作目录）。**设置后优先于内联 `SCHEDULES`**（内联值被忽略，二者设其一即可）。文件必须是任务对象数组（字段/规则与 `SCHEDULES` 完全一致）。**设置了却**不存在 / 不可读 / 为空（0 字节或纯空白）→ 启动期 `ConfigError`（点名路径，**绝不**静默禁用任务）；文件里显式写 `[]` 表示「无任务」。**未设置时**：若**默认文件** `config/schedules.json` 存在则读它（存在但为空 → `ConfigError`），否则退回内联 `SCHEDULES`。
+
+#### `SCHEDULE_TIMEZONE`
+
+**默认值**：空（用进程本地时区，Docker 里由 `TZ` 决定）
+
+**示例**
+
+```
+SCHEDULE_TIMEZONE=Asia/Shanghai
+```
+
+**说明**：cron 求值用的 IANA 时区名。**启动期强校验**——非法时区名是 `ConfigError`（点名字段、不回显其它值）。空白 / 未设按「未设」处理（用本地时区），不是错误。
+
 ### Exec shell tool（opt-in）
 
 #### `ENABLE_EXEC_TOOL`

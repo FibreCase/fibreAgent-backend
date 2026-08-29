@@ -255,26 +255,41 @@ class TelegramApprovalBroker:
 
     # -- the ToolApprovalProvider contract ---------------------------------
     async def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
-        """Present an approval prompt in the original chat and await the decision.
+        """Present an approval prompt in the delivery chat and await the decision.
 
-        Resolves the transport chat from the conversation id, sends the prompt
+        Resolves the transport chat to deliver the prompt to, sends the prompt
         with Approve/Deny buttons, and awaits the one-time decision (or expiry).
         Never raises: any setup failure resolves to ``DENIED`` (fail closed — a
         tool that can't be presented for approval is not executed).
+
+        The delivery chat is resolved in one of two ways:
+
+        * **``metadata["delivery_chat_id"]`` is set** (a scheduled run) — the turn
+          ran in a synthetic conversation whose row does not correspond to a real
+          chat, so the card must go to the owner's *bound* chat. That id is used
+          directly (no conversation lookup); the principal binding below is
+          unchanged, so only the bound user in that chat can approve.
+        * **otherwise** (every interactive caller) — resolve the conversation's
+          ``telegram_chat_id`` from the conversation id, exactly as before.
         """
         if self._application is None:
             logger.error("approval requested but no application bound; denying")
             return ApprovalDecision.DENIED
 
-        try:
-            conversation = await self._repo.get_conversation_by_id(request.conversation_id)
-        except Exception:
-            logger.error("approval: could not resolve conversation; denying", exc_info=True)
-            return ApprovalDecision.DENIED
-        if conversation is None:
-            logger.error("approval: unknown conversation; denying")
-            return ApprovalDecision.DENIED
-        chat_id = conversation.telegram_chat_id
+        delivery_chat_id = request.metadata.get("delivery_chat_id")
+        if isinstance(delivery_chat_id, int) and not isinstance(delivery_chat_id, bool) and delivery_chat_id > 0:
+            # Scheduled run: deliver to the owner's bound (real) chat directly.
+            chat_id = delivery_chat_id
+        else:
+            try:
+                conversation = await self._repo.get_conversation_by_id(request.conversation_id)
+            except Exception:
+                logger.error("approval: could not resolve conversation; denying", exc_info=True)
+                return ApprovalDecision.DENIED
+            if conversation is None:
+                logger.error("approval: unknown conversation; denying")
+                return ApprovalDecision.DENIED
+            chat_id = conversation.telegram_chat_id
         principal_hash = hash_scope(request.scope)
 
         loop = asyncio.get_running_loop()

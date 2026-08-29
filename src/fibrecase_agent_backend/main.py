@@ -16,14 +16,18 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 
-from .agent.service import AgentService
+from .agent.service import AgentError, AgentService, _user_safe_for
 from .attachments import AttachmentStore
+from .automation import Scheduler
 from .config import Config, ConfigError, McpServer, load_config
 from .database.audit import RepositoryToolAuditor
+from .database.models import schedule_chat_id
 from .database.oauth import OAuthStorageImpl
 from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
@@ -39,7 +43,7 @@ from .mcp.auth import (
     build_oauth_callback_server,
 )
 from .telegram.approval import TelegramApprovalBroker
-from .telegram.bot import build_application, compose_startup_hooks, register_command_menu
+from .telegram.bot import build_application, compose_startup_hooks, deliver_markdown, register_command_menu
 from .tools import FileBackedToolPolicy, build_policy, reconcile_permissions_file
 from .tools.builtin import build_default_tools
 
@@ -189,6 +193,30 @@ class AgentBackend:
             tool_timeout_seconds=config.tool_timeout_seconds,
             tool_approval_timeout_seconds=config.tool_approval_timeout_seconds,
         )
+        # Phase 9 (Automation, first slice): time-triggered scheduling. The
+        # :class:`Scheduler` is a pure, channel-agnostic background task that only
+        # fires an injected ``runner`` coroutine; the Telegram-specific runner
+        # (dedicated fresh conversation → ``process_message`` → formatted
+        # notification → cleanup) is the ``_run_schedule`` closure below. It is
+        # built **only** when schedules are configured — with an empty
+        # ``SCHEDULES`` there is no automation, so the scheduler does not exist
+        # and no background task is ever started (isomorphic to empty
+        # ``MCP_SERVERS`` / ``INFRA_SSH_TARGETS``). The wall clock is evaluated
+        # in ``SCHEDULE_TIMEZONE`` (or the process-local tz when unset). The
+        # scheduler is *started* in ``_post_init`` (after ``init_db`` and MCP
+        # discovery) and *stopped* in ``_post_shutdown`` (after the approval
+        # broker drains, before the LLM/DB close).
+        self._schedule_tz = ZoneInfo(config.schedule_timezone) if config.schedule_timezone else datetime.now().astimezone().tzinfo
+        self.scheduler: Scheduler | None = (
+            Scheduler(
+                config.schedules,
+                self._schedule_tz,
+                self._run_schedule,
+                now_fn=lambda: datetime.now(self._schedule_tz),
+            )
+            if config.schedules
+            else None
+        )
         application = build_application(
             config,
             self.service,
@@ -288,9 +316,98 @@ class AgentBackend:
         except TelegramError:
             logger.warning("oauth notifier send failed", extra={"server": mcp_server})
 
+    # Phase 9 (Automation): the Telegram-specific runner the scheduler fires for
+    # each due schedule. Runs as a task on the PTB event loop (created by the
+    # scheduler), so it can drive ``self.service`` and ``self.application.bot``
+    # directly.
+    #
+    # Execution model (the phase-9 core decision):
+    #   1. prepare a **dedicated, fresh** venue: a synthetic ``telegram_chat_id``
+    #      in the reserved range (``schedule_chat_id(spec.name)``) reuses the
+    #      ``conversations`` table — no new table. ``reset_conversation`` yields an
+    #      empty history and self-heals a crashed run's leftover row;
+    #   2. run the fixed prompt through the *same* channel-agnostic
+    #      ``AgentService.process_message()`` the interactive path uses — with the
+    #      owner's ``memory_scope`` and ``delivery_chat_id=spec.chat_id`` (so any
+    #      approval card goes to the real chat, not the synthetic venue);
+    #   3. deliver a **formatted notification** (task name + result) to
+    #      ``spec.chat_id``; a failure sends a fixed, safe short notice;
+    #   4. always (``finally``) delete the dedicated venue, leaving no trace.
+    #
+    # A scheduled run never enters ``bot_data[_IN_FLIGHT]`` (that slot is the
+    # interactive handler's), so ``/stop`` does not affect it — it converges via
+    # its venue's per-conversation lock + tool/LLM timeouts + the scheduler's
+    # per-task single-flight.
+    async def _run_schedule(self, spec) -> None:
+        synthetic_chat_id = schedule_chat_id(spec.name)
+        conversation = await self.repository.reset_conversation(synthetic_chat_id, spec.user_id)
+        try:
+            reply = await self.service.process_message(
+                conversation.id,
+                spec.prompt,
+                memory_scope=f"telegram:{spec.user_id}",
+                delivery_chat_id=spec.chat_id,
+            )
+            if reply:
+                text = f"⏰ **定时任务：{spec.name}**\n\n{reply}"
+                try:
+                    await deliver_markdown(self.application.bot, spec.chat_id, text)
+                except TelegramError:
+                    # Best-effort delivery (mirrors _oauth_notifier): a failed
+                    # notification is logged (by name) and swallowed, never
+                    # raised — the venue cleanup below must still run.
+                    logger.warning(
+                        "scheduled run notification failed",
+                        extra={"schedule": spec.name},
+                    )
+            # An empty reply carries nothing to report: no notification.
+        except AgentError as exc:
+            # A fixed, safe failure notice: the task name + a category-mapped
+            # Chinese phrase. Never the prompt, exception text, or a stack —
+            # the owner should know the 7am check failed rather than it vanishing.
+            notice = f"⏰ **定时任务：{spec.name}**\n\n{exc.user_safe}"
+            try:
+                await deliver_markdown(self.application.bot, spec.chat_id, notice)
+            except TelegramError:
+                logger.warning(
+                    "scheduled run failure notice failed",
+                    extra={"schedule": spec.name},
+                )
+        except Exception:
+            # Fault isolation is already guaranteed by the scheduler, but the
+            # runner must not leak venue cleanup: log by name + class only.
+            logger.warning(
+                "scheduled run failed",
+                extra={"schedule": spec.name},
+                exc_info=True,
+            )
+        finally:
+            try:
+                await self.repository.delete_conversation(conversation.id)
+            except Exception:
+                # A failed cleanup is left to the next run's self-heal / the
+                # startup sweep. Safe log (synthetic id is safe to log).
+                logger.warning(
+                    "scheduled run venue cleanup failed",
+                    extra={"schedule": spec.name, "conversation_id": conversation.id},
+                )
+
     # PTB lifecycle hooks (run inside the application's own event loop) ------
     async def _post_init(self, application) -> None:
         await init_db(self.engine)
+        # Phase 9 (Automation): sweep away any orphaned dedicated (scheduled-run)
+        # conversations left in the reserved range by a killed run or a schedule
+        # since removed from config. Runs *after* ``init_db`` (schema exists) and
+        # *before* the scheduler starts (so the sweep and the first tick are
+        # ordered). A no-op (returns 0) when there is nothing to clear — the
+        # empty-``SCHEDULES`` case. Best-effort: a failure is logged and never
+        # blocks boot (the per-run self-heal + next sweep cover it).
+        try:
+            cleared = await self.repository.clear_ephemeral_conversations()
+            if cleared:
+                logger.info("startup sweep cleared orphaned schedule venues", extra={"count": cleared})
+        except Exception:
+            logger.error("startup sweep of schedule venues failed", exc_info=True)
         # Phase 4: connect + discover the configured remote MCP servers, then
         # register their tools into the *same* registry (after the built-ins).
         # This is best-effort by construction — ``start`` never raises, and a
@@ -355,6 +472,14 @@ class AgentBackend:
                 self.oauth_manager, port=self.config.oauth_callback_port
             )
             await self.oauth_callback_server.start()
+        # Phase 9 (Automation): start the scheduler, last, once the DB is ready
+        # and MCP/infra discovery has registered the tools the runner's
+        # ``process_message`` may dispatch. ``start`` is idempotent and never
+        # raises; it recomputes every schedule's next fire from *now* (no
+        # catch-up). A broken scheduler cannot crash the bot (mirrors the OAuth
+        # callback server's lifecycle contract).
+        if self.scheduler is not None:
+            self.scheduler.start()
         logger.info(
             "agent backend initialised",
             extra={
@@ -364,6 +489,7 @@ class AgentBackend:
                 "tools": self.registry.names() if self.registry else [],
                 "mcp_tools": mcp_tool_count,
                 "infra_tools": infra_tool_count,
+                "schedules": len(self.config.schedules),
             },
         )
 
@@ -373,6 +499,13 @@ class AgentBackend:
         # decision resolves (expired) instead of hanging the shutdown.
         if self.approval_broker is not None:
             await self.approval_broker.shutdown()
+        # Phase 9 (Automation): stop the scheduler *after* the approval broker
+        # (so a scheduled turn awaiting an approval is first unblocked) and
+        # *before* the LLM client / engine are closed (so no scheduled turn is
+        # abandoned mid-call). ``stop`` is idempotent, never raises, and lets any
+        # in-flight run finish (bounded) so its venue is cleaned up.
+        if self.scheduler is not None:
+            await self.scheduler.stop()
         # Stop the OAuth callback listener before the MCP sessions (idempotent,
         # never raises) — an in-flight callback after this is rejected by the
         # manager as invalid/expired state, not by a dead loop.

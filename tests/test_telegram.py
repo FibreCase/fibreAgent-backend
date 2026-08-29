@@ -20,6 +20,7 @@ from telegram.ext import CallbackContext
 from fibrecase_agent_backend import __version__
 from fibrecase_agent_backend.telegram.bot import (
     CHUNK_SIZE,
+    _COMMANDS,
     _IN_FLIGHT,
     _is_authorized,
     _send_long,
@@ -29,6 +30,7 @@ from fibrecase_agent_backend.telegram.bot import (
     cmd_memories,
     cmd_new,
     cmd_remember,
+    cmd_schedule_status,
     cmd_start,
     cmd_status,
     cmd_stop,
@@ -769,3 +771,97 @@ async def test_in_flight_handle_removed_after_normal_completion():
         await handle_message(update, context)
     assert app.bot_data.get(_IN_FLIGHT, {}).get(chat.id) is None
     assert any(c.kwargs.get("text") == "ok" for c in send.await_args_list if c.kwargs)
+
+
+# ---------------------------------------------------------------------------
+# /schedule_status (phase 9) — read-only status: name + cron + next fire only,
+# never the prompt / chat_id / user_id; disabled when none configured.
+# ---------------------------------------------------------------------------
+class _ScheduleConfig:
+    def __init__(self, schedules=(), schedule_timezone="UTC"):
+        self.schedules = schedules
+        self.schedule_timezone = schedule_timezone
+
+
+def _sched(name, cron, *, chat_id=42, user_id=7, prompt="SECRET-PROMPT-BODY"):
+    from fibrecase_agent_backend.config import ScheduleSpec
+
+    return ScheduleSpec(name=name, cron=cron, chat_id=chat_id, user_id=user_id, prompt=prompt)
+
+
+def _sent_text(send):
+    return [c.kwargs.get("text", "") for c in send.await_args_list if c.kwargs]
+
+
+async def test_schedule_status_disabled_when_none_configured():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/schedule_status", allowed=(1,))
+    app.bot_data["config"] = _ScheduleConfig(schedules=())
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_schedule_status(update, context)
+    texts = _sent_text(send)
+    assert len(texts) == 1
+    assert "disabled" in texts[0].lower()
+
+
+async def test_schedule_status_shows_name_cron_next_fire_only():
+    # Distinctive ids that do not appear in any cron field or next-fire timestamp,
+    # so a leak of chat_id / user_id into the rendered text would be caught.
+    specs = (
+        _sched("nightly", "0 7 * * *", chat_id=81234567, user_id=98765432),
+        _sched("weekly", "0 9 * * MON", chat_id=81234567, user_id=98765432),
+    )
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/schedule_status", allowed=(1,))
+    app.bot_data["config"] = _ScheduleConfig(schedules=specs, schedule_timezone="UTC")
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_schedule_status(update, context)
+    texts = "\n".join(_sent_text(send))
+    # Each schedule's name + cron + a "next:" line is shown.
+    assert "nightly" in texts and "0 7 * * *" in texts
+    assert "weekly" in texts and "0 9 * * MON" in texts
+    assert "next:" in texts
+    # …but the prompt, chat_id, or user_id are never exposed.
+    assert "SECRET-PROMPT-BODY" not in texts
+    assert "81234567" not in texts
+    assert "98765432" not in texts
+
+
+async def test_schedule_status_calendar_impossible_shows_never():
+    # "0 0 31 2 *" is syntactically valid but can never fire → shown as
+    # "never (untriggerable)" rather than a date.
+    specs = (_sched("impossible", "0 0 31 2 *"),)
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/schedule_status", allowed=(1,))
+    app.bot_data["config"] = _ScheduleConfig(schedules=specs, schedule_timezone="UTC")
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_schedule_status(update, context)
+    texts = "\n".join(_sent_text(send))
+    assert "impossible" in texts
+    assert "never (untriggerable)" in texts
+
+
+async def test_schedule_status_unauthorized_is_silent():
+    update, chat, context, app, bot = _make(user_id=999, chat_id=1, text="/schedule_status", allowed=(1,))
+    app.bot_data["config"] = _ScheduleConfig(schedules=(_sched("nightly", "0 7 * * *"),))
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_schedule_status(update, context)
+    assert send.await_count == 0  # nothing sent to an unauthorised sender
+
+
+def test_schedule_status_is_in_command_menu():
+    # /schedule_status is advertised in the Telegram command menu (one of the
+    # read-only status commands).
+    assert ("schedule_status", "Show configured schedules") in _COMMANDS
+
+
+# ---------------------------------------------------------------------------
+# /schedule_status does not trigger anything: no agent service, no LLM call.
+# The command only reads config.schedules + the pure cron parser.
+# ---------------------------------------------------------------------------
+async def test_schedule_status_never_triggers_a_run():
+    specs = (_sched("nightly", "0 7 * * *"),)
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/schedule_status", allowed=(1,))
+    # No agent_service in bot_data at all — if the command tried to trigger a
+    # run it would raise; it must not, because it is purely read-only.
+    app.bot_data["config"] = _ScheduleConfig(schedules=specs, schedule_timezone="UTC")
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_schedule_status(update, context)
+    assert "nightly" in _sent_text(send)[0]

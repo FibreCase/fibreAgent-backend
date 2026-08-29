@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -112,6 +113,43 @@ class InfraSshTarget:
     known_hosts_path: str
     mounts: tuple[str, ...]
     services: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ScheduleSpec:
+    """One validated, operator-configured cron schedule (phase 9 — Automation).
+
+    A schedule fires the Agent on a time basis, in a *dedicated fresh
+    conversation*, running ``prompt`` through the normal
+    ``AgentService.process_message()`` and then delivering a formatted
+    notification (task name + result) to ``chat_id``.
+
+    Every field is **startup operator config**: the model, chat input, memory,
+    and tool arguments can never create / modify / trigger a schedule.
+
+    * ``name`` — unique, matching the MCP/infra name charset
+      (``[a-z][a-z0-9_-]{0,31}``); the only schedule attribute that is ever
+      logged, shown in ``/schedule_status``, or echoed in a notification.
+    * ``cron`` — a strict 5-field cron expression, validated at parse time by
+      :func:`.automation.cron.parse_cron` (a bad cron is a startup
+      ``ConfigError`, never a silent "never fires"). The expression is stored as
+      a string and re-parsed by the scheduler; it is never logged.
+    * ``chat_id`` — the **delivery** Telegram chat id (a positive int): where the
+      notification and any approval cards are sent (usually the owner's private
+      chat with the bot; a group id delivers there instead).
+    * ``user_id`` — the **owner** Telegram user id (a positive int): the memory
+      scope (``telegram:<user_id>``), the approval-callback principal binding,
+      and the ``telegram_user_id`` stored on the dedicated conversation row.
+    * ``prompt`` — the fixed, non-empty prompt (≤ 2000 chars) the schedule runs.
+      It is never logged, shown in ``/schedule_status``, or written anywhere but
+      the dedicated conversation (which is deleted after each run).
+    """
+
+    name: str
+    cron: str
+    chat_id: int
+    user_id: int
+    prompt: str
 
 
 @dataclass(frozen=True)
@@ -242,6 +280,20 @@ class Config:
     max_file_read_chars: int = 8000
     max_file_list_entries: int = 1000
 
+    # Phase 9 (Automation, first slice): time-triggered scheduling. ``schedules``
+    # is the parsed, validated list, read from the **default**
+    # ``config/schedules.json`` when that file is present, the explicit
+    # ``SCHEDULES_FILE`` when set (which wins over both the default file and the
+    # inline value; a set-but-missing/blank file is a ConfigError), or the inline
+    # ``SCHEDULES`` when no file is present — the same file-over-inline rule as
+    # MCP/infra. Empty means no automation: no scheduler task, no scheduled
+    # runs (isomorphic to empty ``MCP_SERVERS`` / ``INFRA_SSH_TARGETS``).
+    # ``schedule_timezone`` is the IANA tz name the cron wall clock is evaluated
+    # in ("" = the process-local tz, which Docker sets via ``TZ``); validated to
+    # be a parseable IANA name at startup.
+    schedules: tuple = field(default_factory=tuple)
+    schedule_timezone: str = ""
+
     log_level: str = "INFO"
     log_color: str = "auto"  # "auto" | "true" | "false" — see logging_setup
     system_prompt_override: str | None = field(default=None)
@@ -340,6 +392,18 @@ class Config:
                 raise ConfigError("MAX_FILE_READ_CHARS must be >= 1")
             if self.max_file_list_entries < 1:
                 raise ConfigError("MAX_FILE_LIST_ENTRIES must be >= 1")
+        # Phase 9 (Automation): SCHEDULE_TIMEZONE, when set, must be a name the
+        # stdlib can resolve — a bad timezone is a startup failure, never a silent
+        # fallback to the wrong wall clock. ("" means "use the process-local tz"
+        # and is always valid; no ZoneInfo call is made for it.)
+        if self.schedule_timezone:
+            try:
+                ZoneInfo(self.schedule_timezone)
+            except Exception as exc:
+                raise ConfigError(
+                    f"SCHEDULE_TIMEZONE must be a valid IANA timezone name (got {self.schedule_timezone!r}): "
+                    f"{type(exc).__name__}"
+                ) from exc
 
     @property
     def max_image_size_bytes(self) -> int:
@@ -643,6 +707,12 @@ def _load_mcp_servers_text() -> str:
 # set. A module global so tests can monkeypatch it to a per-test path (keeping the
 # developer's real ``config/infra_ssh_targets.json`` out of unrelated config tests).
 _INFRA_TARGETS_DEFAULT_FILE = "config/infra_ssh_targets.json"
+
+# Default location of the schedules file (CWD-relative, like the other config
+# files), consulted when ``SCHEDULES_FILE`` is not set. A module global so tests
+# can monkeypatch it to a per-test path (keeping a developer's real
+# ``config/schedules.json`` out of unrelated config tests).
+_SCHEDULES_DEFAULT_FILE = "config/schedules.json"
 
 
 def _load_infra_targets_text() -> str:
@@ -1150,10 +1220,161 @@ def _parse_infra_targets(raw: str) -> tuple[InfraSshTarget, ...]:
     return tuple(targets)
 
 
+# ---------------------------------------------------------------------------
+# Phase 9 (Automation, first slice): cron schedules
+# ---------------------------------------------------------------------------
+# A schedule name reuses the MCP/infra name charset — it is a stable identifier
+# used in logs, the reserved-range synthetic conversation id, and the
+# notification header.
+_SCHEDULE_MAX_PROMPT_CHARS = 2000
+_SCHEDULE_MAX_COUNT = 16
+# The only fields a schedule entry may carry. Any other key is a startup error —
+# a typo is a config error, never silently dropped (so an operator cannot
+# accidentally ship a schedule that behaves differently from what they wrote).
+_SCHEDULE_FIELDS = frozenset({"name", "cron", "chat_id", "user_id", "prompt"})
+
+
+def _load_schedules_text() -> str:
+    """Return the raw schedules JSON *text* to validate, choosing its source.
+
+    Source selection (the same file-over-inline idea as infra targets, with a
+    well-known **default path** so the common single-file setup needs no env var):
+
+    * ``SCHEDULES_FILE`` **set** (a path, CWD-relative) — it is the strict source
+      of truth and **wins** over both the default file and the inline ``SCHEDULES``
+      (both ignored). A set-but-**missing** or **blank** (0-byte / whitespace-only)
+      file is a startup :class:`ConfigError` naming the path — an operator who
+      pointed the provider at a file must not silently get "no schedules" (an
+      explicit ``[]`` in the file is still valid and means none).
+    * ``SCHEDULES_FILE`` **unset** — the **default file** (:data:`_SCHEDULES_DEFAULT_FILE`,
+      ``config/schedules.json``) is used **when it exists**; a present-but-**blank**
+      default file is a :class:`ConfigError`. When the default file is **absent**,
+      it falls back to the inline ``SCHEDULES`` value (so inline-only config keeps
+      working and the default-off case needs no file).
+    """
+    explicit = os.environ.get("SCHEDULES_FILE", "").strip()
+    if explicit:
+        try:
+            text = Path(explicit).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"cannot read SCHEDULES_FILE '{explicit}': {exc.strerror or exc}") from exc
+        if not text.strip():
+            raise ConfigError(
+                f"SCHEDULES_FILE '{explicit}' is empty; it must contain a JSON array "
+                'of schedule objects (use "[]" for none, or unset SCHEDULES_FILE)'
+            )
+        return text
+    default_path = Path(_SCHEDULES_DEFAULT_FILE)
+    if default_path.exists():
+        try:
+            text = default_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"cannot read default schedules file '{_SCHEDULES_DEFAULT_FILE}': {exc.strerror or exc}") from exc
+        if not text.strip():
+            raise ConfigError(
+                f"default schedules file '{_SCHEDULES_DEFAULT_FILE}' is empty; it must contain a "
+                'JSON array of schedule objects (use "[]" for none, or remove the file)'
+            )
+        return text
+    return os.environ.get("SCHEDULES", "")
+
+
+def _parse_schedules(raw: str) -> tuple[ScheduleSpec, ...]:
+    """Parse + strictly validate the raw schedules JSON *text* into a tuple of
+    :class:`ScheduleSpec`. The text is a JSON *array* (resolved from the default
+    ``config/schedules.json`` when present, the explicit ``SCHEDULES_FILE`` when
+    set, or the inline ``SCHEDULES`` — see :func:`_load_schedules_text`); each
+    element carries exactly the :data:`_SCHEDULE_FIELDS` fields. An empty / blank
+    value yields an empty tuple (no automation). Anything malformed is a startup
+    :class:`ConfigError`:
+
+    * invalid JSON, a non-array, a non-object entry, an unknown field,
+    * a missing / bad / duplicate ``name`` (must match the name charset),
+    * more than :data:`_SCHEDULE_MAX_COUNT` schedules,
+    * a missing / non-string ``cron`` or a cron that :func:`.automation.cron.parse_cron`
+      rejects (a bad cron is a startup failure, never a silent "never fires"),
+    * a ``chat_id`` / ``user_id`` that is not a positive int (bools rejected),
+    * a missing / empty ``prompt`` or a ``prompt`` over
+      :data:`_SCHEDULE_MAX_PROMPT_CHARS` chars.
+
+    Error messages name the *schedule* (once its name is known) or its *index*,
+    and the *field* — **never** the ``prompt`` body (or any other field value),
+    mirroring the "don't echo the value" rule for the other providers.
+    """
+    # Imported here (not at module top) so the pure cron parser stays importable
+    # without pulling in the rest of the config module's runtime dependencies.
+    from .automation.cron import CronError, parse_cron
+
+    text = (raw or "").strip()
+    if not text:
+        return ()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"invalid SCHEDULES configuration JSON: {exc.msg}") from exc
+    if not isinstance(data, list):
+        raise ConfigError("SCHEDULES must be a JSON array of schedule objects")
+    if len(data) > _SCHEDULE_MAX_COUNT:
+        raise ConfigError(f"SCHEDULES may contain at most {_SCHEDULE_MAX_COUNT} schedules")
+
+    schedules: list[ScheduleSpec] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(data):
+        where = f"schedule #{index + 1}"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where} in SCHEDULES must be a JSON object")
+        unknown = set(entry) - _SCHEDULE_FIELDS
+        if unknown:
+            raise ConfigError(f"{where} has unknown field(s): {', '.join(sorted(unknown))}")
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise ConfigError(f"{where} is missing a valid 'name' (non-empty string)")
+        where = f"schedule {name!r}"
+        if not _INFRA_NAME_RE.match(name):
+            raise ConfigError(
+                f"{where} name must match [a-z][a-z0-9_-]{{0,31}} "
+                "(lowercase start; lowercase letters, digits, '_', '-')"
+            )
+        if name in seen:
+            raise ConfigError(f"duplicate schedule name: {name!r}")
+        seen.add(name)
+
+        cron = entry.get("cron")
+        if not isinstance(cron, str) or not cron.strip():
+            raise ConfigError(f"{where} is missing a valid 'cron' (non-empty string)")
+        try:
+            parse_cron(cron)
+        except CronError as exc:
+            raise ConfigError(f"{where} 'cron' is invalid: {exc}") from exc
+
+        for id_field in ("chat_id", "user_id"):
+            value = entry.get(id_field)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"{where} '{id_field}' must be a positive integer")
+
+        prompt = entry.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ConfigError(f"{where} is missing a valid 'prompt' (non-empty string)")
+        if len(prompt) > _SCHEDULE_MAX_PROMPT_CHARS:
+            raise ConfigError(
+                f"{where} 'prompt' exceeds {_SCHEDULE_MAX_PROMPT_CHARS} characters"
+            )
+
+        schedules.append(
+            ScheduleSpec(
+                name=name,
+                cron=cron,
+                chat_id=entry["chat_id"],
+                user_id=entry["user_id"],
+                prompt=prompt,
+            )
+        )
+    return tuple(schedules)
+
+
 def _parse_exec_deny_patterns(raw: str) -> tuple[str, ...]:
     """Parse ``EXEC_POLICY_DENY_PATTERNS`` — an add-only JSON array of regex strings.
-
-    Unset/blank/``[]`` → ``()`` (core denylist only). Strict and fail-closed: a
     non-array, a non-string element, or a pattern that does not compile is a
     startup ``ConfigError`` — a bad pattern must never be silently dropped
     (that would *weaken* the backstop). The patterns are stored as raw strings;
@@ -1232,6 +1453,14 @@ def load_config() -> Config:
     )
     max_infra_tool_result_chars = _parse_int(os.environ.get("MAX_INFRA_TOOL_RESULT_CHARS", ""), 8000)
     infra_ssh_targets = _parse_infra_targets(_load_infra_targets_text())
+    # Phase 9 (Automation, first slice): cron schedules. The sources are the
+    # default ``config/schedules.json`` when present, the explicit SCHEDULES_FILE
+    # when set (winning over the default + inline), or the inline SCHEDULES — see
+    # _load_schedules_text. Parsed unconditionally (empty = no automation, no
+    # scheduler task, isomorphic to empty MCP_SERVERS / INFRA_SSH_TARGETS).
+    # SCHEDULE_TIMEZONE (when set) is validated in Config.__post_init__.
+    schedules = _parse_schedules(_load_schedules_text())
+    schedule_timezone = os.environ.get("SCHEDULE_TIMEZONE", "").strip()
     # Exec shell tool. The opt-in flag is read first (it gates the numeric
     # validation in __post_init__); the deny patterns are always parsed so a
     # configured-but-bad list fails at startup even before the tool is built.
@@ -1289,6 +1518,8 @@ def load_config() -> Config:
         max_file_string_chars=max_file_string_chars,
         max_file_read_chars=max_file_read_chars,
         max_file_list_entries=max_file_list_entries,
+        schedules=schedules,
+        schedule_timezone=schedule_timezone,
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
         log_color=_normalize_log_color(os.environ.get("LOG_COLOR", "")),
         system_prompt_override=os.environ.get("SYSTEM_PROMPT", "").strip() or None,

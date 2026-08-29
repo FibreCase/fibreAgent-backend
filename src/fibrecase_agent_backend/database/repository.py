@@ -18,7 +18,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from ..memory import hash_scope
-from .models import Attachment, Conversation, Memory, Message, ToolAuditEvent, utcnow
+from .models import (
+    SCHEDULE_CHAT_ID_BASE,
+    SCHEDULE_CHAT_ID_MAX,
+    Attachment,
+    Conversation,
+    Memory,
+    Message,
+    ToolAuditEvent,
+    utcnow,
+)
 
 logger = logging.getLogger("database")
 
@@ -293,6 +302,74 @@ class ConversationRepository:
             await session.commit()
             await session.refresh(fresh)
             return fresh
+
+    async def delete_conversation(self, conversation_id: int) -> bool:
+        """Explicitly delete one conversation (and its messages + attachments) by PK.
+
+        The phase-9 scheduled-run runner calls this in its ``finally`` so a run's
+        dedicated conversation leaves **no** trace after the run. Attachments and
+        messages are removed explicitly (mirroring :meth:`reset_conversation`)
+        rather than relying on the backend enforcing ``ON DELETE CASCADE``. A
+        missing id is a no-op returning ``False`` (the caller treats both the
+        "deleted" and "already gone" cases as success). Returns ``True`` if a
+        row was removed.
+        """
+        async with self._session() as session:
+            result = await session.execute(
+                select(Conversation.id).where(Conversation.id == conversation_id)
+            )
+            if result.scalar_one_or_none() is None:
+                return False
+            # Attachments reference messages, so remove them first.
+            await session.execute(
+                delete(Attachment).where(
+                    Attachment.message_id.in_(
+                        select(Message.id).where(Message.conversation_id == conversation_id)
+                    )
+                )
+            )
+            await session.execute(delete(Message).where(Message.conversation_id == conversation_id))
+            await session.execute(delete(Conversation).where(Conversation.id == conversation_id))
+            await session.commit()
+            # Log by the *conversation id* only (a synthetic scheduled-run id is
+            # safe to log; a real id would never reach here in this flow).
+            logger.info("conversation deleted", extra={"conversation_id": conversation_id})
+            return True
+
+    async def clear_ephemeral_conversations(self) -> int:
+        """Delete **every** reserved-range (scheduled-run) conversation, by startup sweep.
+
+        Removes conversations whose ``telegram_chat_id`` falls in the reserved
+        range (``SCHEDULE_CHAT_ID_BASE < id < SCHEDULE_CHAT_ID_MAX``) together
+        with their messages and attachments — the orphan-cleanup for a run whose
+        process was killed, and for a task that was later removed from config (and
+        so will never self-heal on its next run). A *real* chat id is never in that
+        range, so no interactive conversation can be touched. Returns the number of
+        conversation rows removed (0 when there is nothing to sweep — the empty
+        ``SCHEDULES`` case, where this is a harmless no-op).
+        """
+        async with self._session() as session:
+            result = await session.execute(
+                select(Conversation.id).where(
+                    Conversation.telegram_chat_id > SCHEDULE_CHAT_ID_BASE,
+                    Conversation.telegram_chat_id < SCHEDULE_CHAT_ID_MAX,
+                )
+            )
+            ids = [row[0] for row in result.all()]
+            if not ids:
+                return 0
+            await session.execute(
+                delete(Attachment).where(
+                    Attachment.message_id.in_(
+                        select(Message.id).where(Message.conversation_id.in_(ids))
+                    )
+                )
+            )
+            await session.execute(delete(Message).where(Message.conversation_id.in_(ids)))
+            await session.execute(delete(Conversation).where(Conversation.id.in_(ids)))
+            await session.commit()
+            logger.info("ephemeral conversations cleared", extra={"count": len(ids)})
+            return len(ids)
 
     # ------------------------------------------------------------- memories
     # Phase 2.5: explicit long-term memory. Every read/delete is filtered by

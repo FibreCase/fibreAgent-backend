@@ -185,6 +185,47 @@ async def test_different_conversations_run_concurrently(repo):
 
 
 # ---------------------------------------------------------------------------
+# Phase 9 — a scheduled run's dedicated venue never serializes with the
+# interactive conversation in the *same real chat*.
+#
+# The per-conversation lock is keyed by conversation PK. A scheduled run does
+# not run in the interactive chat's conversation — it prepares its own *fresh*
+# venue conversation (a reserved-range ``telegram_chat_id`` derived from the
+# task name) — so it holds a *different* lock. Even when both target the same
+# real Telegram chat, the two conversations are distinct and run in parallel.
+# (The *same task* is instead single-flight in the scheduler — a previous in-
+# flight run makes the next due tick skip; see test_scheduler.py.)
+# ---------------------------------------------------------------------------
+async def test_scheduled_venue_does_not_block_interactive_same_real_chat(repo):
+    from fibrecase_agent_backend.database.models import schedule_chat_id
+
+    # The interactive conversation for a real chat, and a scheduled run's
+    # dedicated venue (name-derived reserved-range id) — *different* PKs even
+    # though they serve the same real chat (spec.chat_id / user).
+    real_chat = 1
+    interactive = await repo.get_or_create_conversation(real_chat, 7)
+    venue = await repo.reset_conversation(schedule_chat_id("nightly"), 7)
+    assert interactive.id != venue.id  # distinct conversations → distinct locks
+
+    llm = RecordingLLM(delay=0.05, replies=["ok"])
+    service = _service(repo, llm)
+
+    # A scheduled turn and an interactive turn on the same real chat, at once.
+    import asyncio
+
+    await asyncio.gather(
+        service.process_message(interactive.id, "interactive hi"),
+        service.process_message(venue.id, "scheduled prompt"),
+    )
+
+    # They did NOT serialize: both completions were in flight together.
+    assert llm.max_active >= 2
+    # Each conversation stayed internally consistent.
+    assert [r.role for r in await repo.get_messages(interactive.id)] == ["user", "assistant"]
+    assert [r.role for r in await repo.get_messages(venue.id)] == ["user", "assistant"]
+
+
+# ---------------------------------------------------------------------------
 # tool-calling integration (phase 2.1)
 # ---------------------------------------------------------------------------
 async def test_enabled_tools_persist_only_user_and_final_assistant(repo):

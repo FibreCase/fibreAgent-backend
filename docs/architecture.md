@@ -44,6 +44,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - **Agent Service 渠道无关**：未来接 Web UI / Discord / HTTP API 都复用同一个 `AgentService`。
 - **只有 `llm/client.py` 知道 OpenAI 协议**；只有 `database/` 知道 ORM/SQL。
 - `attachments/` 与 `memory/` 两个包**不含**任何 Telegram / OpenAI SDK / ORM 依赖（纯 Python + 文件系统）；`mcp/` 同样不含 Telegram / OpenAI SDK / ORM（只依赖 MCP SDK + 其 HTTP client / stdio 子进程）。
+- `automation/` **不含**任何 Telegram / OpenAI SDK / ORM / AgentService 依赖：cron 解析（纯 Python，stdlib `zoneinfo`）与后台调度循环只认一个注入的 `runner` 协程；Telegram 专用的 runner（专属会话 → `process_message` → 通知 → 清理）在组合根 `main.py` 里提供。
 - 模块之间低耦合：Telegram / Agent / Tool / LLM / Database 各自单一职责。
 
 ## 模块地图
@@ -63,6 +64,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 | `memory/` | 记忆文本规范化 + 词法排序（纯 Python、无 I/O） | 无 Telegram/SDK/ORM |
 | `llm/client.py` | 唯一的 OpenAI SDK 知识来源 | 无 Telegram |
 | `database/` | ORM + repository（唯一碰 SQL 的层） | 无 Telegram / OpenAI |
+| `automation/` | 定时任务：严格 5 字段纯 Python cron（`parse_cron`/`CronSpec.next_fire`）+ 后台调度循环（单 `asyncio.Task`、可注入时钟/sleep、单飞、故障隔离、不 catch-up） | 无 Telegram/OpenAI SDK/ORM/AgentService（只认注入的 `runner`） |
 
 ## 如何扩展
 
@@ -90,5 +92,6 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - 日志**绝不**泄露 secret、消息正文、图片字节/base64；记忆路径只记短 scope 哈希 + id，从不记原始 scope / 内容。
 - `attachments/` 与 `memory/` 保持无 Telegram / OpenAI SDK / ORM 依赖。
 - 每个按 id 的记忆读/删都在 SQL 里按 `scope + id` 过滤（不泄露存在性）。
-- `ENABLE_TOOLS=false` 仍是一次完整的 Phase-1 降级。
+- **定时运行用专属、全新的会话**：每次运行在**保留区间**的合成 `telegram_chat_id`（`schedule_chat_id(name) = BASE + sha256(name)[:8]`，`BASE < id < MAX`）里跑 `reset_conversation`（自愈 + 启动清扫），运行后 `delete_conversation` 删除、不留痕；**绝不**并入用户日常会话、**绝不**用真实 chat_id。`/new` 与重启从不触碰它。
+- `ENABLE_TOOLS=false` 仍是一次完整的 Phase-1 降级（定时运行在 tools 关闭时同样工作，只走单次 completion）。
 - 从不按模型名编码模型能力。

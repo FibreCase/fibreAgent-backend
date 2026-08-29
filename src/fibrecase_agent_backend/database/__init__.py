@@ -1,6 +1,6 @@
 """Database package: models, session/engine, and the repository."""
 
-from .models import Attachment, Base, Conversation, Message
+from .models import Attachment, Base, Conversation, Message, SCHEDULE_CHAT_ID_BASE, SCHEDULE_CHAT_ID_MAX, schedule_chat_id
 from .repository import (
     AttachmentRef,
     ConversationRepository,
@@ -14,6 +14,9 @@ __all__ = [
     "Base",
     "Conversation",
     "Message",
+    "SCHEDULE_CHAT_ID_BASE",
+    "SCHEDULE_CHAT_ID_MAX",
+    "schedule_chat_id",
     "AttachmentRef",
     "ConversationRepository",
     "MessageRecord",

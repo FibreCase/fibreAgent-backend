@@ -1245,6 +1245,23 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   `/new` must never force re-authentication; this is regression-tested). `init_db`
   (`create_all`) creates the new tables on a fresh DB *and* adds any missing one to an
   existing DB — no data loss, no manual `data/agent.db` wipe, no Alembic.
+  **Phase 9 (Automation)** reuses the `conversations` table for scheduled-run venues —
+  **no new table, no migration** — by reserving a slice of the
+  `telegram_chat_id` space: `SCHEDULE_CHAT_ID_BASE = 9_000_000_000_000_000_000` and
+  `SCHEDULE_CHAT_ID_MAX = BASE + 2**32` (a 2³² window ~10⁷× above any real chat id, so
+  a real interactive chat can never collide with it), and
+  `schedule_chat_id(name) = BASE + int(sha256(name.encode())[:8], 16)` — a
+  **deterministic** synthetic id (same name → same id every call; distinct names
+  collide only with negligible 32-bit probability, and a collision is harmless). The
+  repository gains `delete_conversation(conversation_id)` (the runner's `finally`
+  teardown: explicitly removes the row + its messages + its attachments, **not**
+  relying on FK cascade; a missing id is a no-op returning `False`) and
+  `clear_ephemeral_conversations()` (the startup sweep: deletes **only** conversations
+  whose `telegram_chat_id` falls strictly inside the reserved range, together with
+  their messages + attachments, returning the count — a real chat id is never in range,
+  so it is a no-op returning `0` for the empty-`SCHEDULES` case). `reset_conversation`
+  is unchanged but doubles as the **self-heal**: a killed run's leftover venue row is
+  wiped on the next `reset_conversation` for that name-derived id.
 
 - **`main.py`** — the composition root. When `ENABLE_TOOLS=true` it builds the
   registry (`build_default_tools()`), the policy (**`FileBackedToolPolicy(config.
@@ -1296,6 +1313,34 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   `ConfigError` naming the colliding tool) and records the count in the init log. The
   MCP permissions-file reconcile still passes **only** the MCP tools — infra tools
   are local and are **never** seeded into `MCP_PERMISSIONS_FILE`.
+- **`automation/`** — phase 9 (Automation). Two pure modules, **no** Telegram /
+  OpenAI SDK / ORM / AgentService imports: **`cron.py`** is a zero-dependency,
+  **strict 5-field** cron grammar (`parse_cron` → frozen `CronSpec`): per-field
+  `*` / value / `a-b` (inclusive) / `*/n` / `a-b/n` / comma lists (mixable), month
+  names `JAN`–`DEC` + day names `SUN`–`SAT` (case-insensitive), **`0` and `7` both
+  = Sunday** (`7` normalises to `0`), the **Vixie day-of-month / day-of-week OR
+  rule** (both restricted → *either* matching day fires; one restricted → that one
+  wins), and strict rejections (`CronError`, never a silent "never fires") of wrong
+  field count, `?`, `@daily`-shorthands, inverted ranges, out-of-bounds values,
+  empty fields, and unknown tokens. `CronSpec.next_fire(after, tz)` is a **strictly
+  after**, **bounded** (`_MAX_SEARCH_DAYS = 1830`) wall-clock search in the
+  caller's `zoneinfo` timezone; a calendar-impossible expression (Feb 31) returns
+  `None` rather than looping forever. **`scheduler.py`** is a single background
+  `asyncio.Task` (`Scheduler`) that only (1) watches an **injected clock**
+  (`now_fn`) and (2) fires an **injected** `runner` coroutine when a schedule is
+  due — deliberately channel- and service-agnostic. Invariants: **no catch-up**
+  (every next fire is recomputed from *now* at start and after each fire, so a
+  fire missed while down is never replayed); **per-task single-flight** (a
+  previous in-flight run makes the next due tick *skip* — safe log — and advance
+  the due time, so a stuck turn never builds a queue); **fault isolation** (each
+  run is wrapped; one schedule's runner exception is logged by **name + exception
+  class only**, never the text, and never stops the loop or the others);
+  `start`/`stop` are **idempotent, never raise**, and `stop` cancels the loop then
+  gives in-flight runs a **bounded** chance to finish (a genuinely stuck one is
+  cancelled) so shutdown never hangs; sleep is capped at 30 s so `stop` latency
+  stays bounded. The Telegram-specific runner (dedicated fresh conversation →
+  `process_message` → formatted notification → `finally` cleanup) lives in the
+  composition root (`main.py::_run_schedule`), not here.
 
 ---
 
@@ -1720,6 +1765,50 @@ The two numeric knobs + the cross-knob invariant
 host, key paths, known-hosts path, username, mount paths, and command are **never**
 controllable by the model, chat input, memory, or tool arguments — they come only from
 these startup-time settings.
+
+### Scheduled (cron) run knobs (phase 9)
+
+- **`SCHEDULES`** (default empty): a JSON **array** of cron schedules; empty
+  (unset / `[]` / whitespace) = no automation, no scheduler task, no scheduled runs
+  (isomorphic to an empty `MCP_SERVERS`). This is the *inline* source — the schedule
+  list may instead live in the **default file `config/schedules.json`** (read when
+  present) or an explicit `SCHEDULES_FILE` (see below). Each object has **exactly**
+  five fields: `name` (`[a-z][a-z0-9_-]{0,31}`, **unique** across the list — it also
+  derives the dedicated-conversation synthetic id), `cron` (a **strict 5-field**
+  expression — see the `automation/` per-module reference; bad cron → `ConfigError`),
+  `chat_id` (**positive** `int`, never `bool`/float/string/`None` — the bound chat the
+  notification + any approval card are delivered to), `user_id` (**positive** `int` —
+  the owner identity the run executes as, so long-term memory retrieval still
+  applies), and `prompt` (the fixed per-run text; non-empty after strip, **≤ 2000**
+  chars). Max **16** schedules, duplicate names refused. A violation is a startup
+  `ConfigError` naming the **schedule (or index) and field**, **never** the `prompt`
+  body or any other field value (mirrors the infra-targets rule).
+- **`SCHEDULES_FILE`** (default empty): a path (relative to the working directory,
+  e.g. `config/schedules.json`) to a standalone file holding the **same** JSON
+  **array**. Source selection (the same file-over-inline idea as `MCP_SERVERS_FILE`,
+  with a well-known default path so the common single-file setup needs no env var):
+  when **set**, it is the strict source of truth and **wins** over both the default
+  file and the inline `SCHEDULES` (both ignored) — a set-but-**missing**/**unreadable**
+  /**blank** file is a startup `ConfigError` naming the path (an explicit `[]` = no
+  schedules); when **unset**, the **default file `config/schedules.json`** is read when
+  it exists (a present-but-**blank** default file is a `ConfigError`), and if that
+  file is **absent** the inline `SCHEDULES` is used (so inline-only config and the
+  default-off case both work with no file). The **same** strict per-entry validation
+  applies to a file-configured schedule.
+- **`SCHEDULE_TIMEZONE`** (default empty): the IANA timezone name cron wall-clock
+  times are evaluated in. **Validated at startup** — an invalid name is a
+  `ConfigError` (naming the field, never echoing it); blank / whitespace / unset is
+  treated as *unset* (use the process-local tz, which Docker sets via `TZ`), **not**
+  an error.
+
+The schedule list is validated in `load_config` (strict, fail-fast). Schedules come
+**only** from these startup-time settings — the model, chat input, memory, and tool
+arguments can **never** create, modify, delete, or trigger a schedule; changing one
+requires a restart. `chat_id` / `user_id` / `prompt` / the run's reply are **never**
+written to the logs, the audit table, or `/schedule_status` (the `cron` **is** shown
+there, alongside the name and next-fire time — the one allowed schedule attribute in
+a command); the notification itself carries the task name + result (content delivered
+to the owner, allowed).
 
 ### Exec shell-tool knobs (opt-in)
 
@@ -2232,6 +2321,48 @@ A map of which behaviours each phase covers:
   / service / command / `systemctl` / `uname` / `proc`); it states it shows **no
   reachability conclusion**; and `("infra_status", "Show configured infra targets")`
   is in `_COMMANDS`.
+- **Scheduled (cron) runs (phase 9)** — across `tests/test_cron.py` (the pure
+  5-field parser: every field form, month/day names, `0`/`7` = Sunday, the Vixie
+  day-of-month/day-of-week **OR** rule asserted via `CronSpec._day_matches`, all the
+  strict rejections — wrong field count / `?` / `@daily` / inverted range /
+  out-of-bounds / unknown token / empty — and `next_fire` for representative
+  expressions under a fixed tz, incl. leap Feb 29 and calendar-impossible Feb 31 →
+  `None` with no infinite loop), `tests/test_schedules_config.py` (the
+  `SCHEDULES` / `SCHEDULES_FILE` / `SCHEDULE_TIMEZONE` parsing + **all** invalid sets
+  + file-over-inline source selection; the error names the schedule/field but
+  **never** echoes the `prompt`), `tests/test_scheduler.py` (the background loop
+  driven by an injected clock + gated sleep: on-time fire, several schedules due the
+  same minute all fire, **per-task single-flight** (an in-flight run makes the next
+  due tick skip), **fault isolation** (one runner's exception logged by name + class
+  only — never the text — and never stops the loop/others), `next_fire is None`
+  safe-skipped, **no catch-up** on (re)start, idempotent `start`/`stop` leaving no
+  dangling task, bounded drain of an in-flight run), `tests/test_schedule_runner.py`
+  (the composition-root `_run_schedule`: dedicated **reserved-range** synthetic venue
+  via `reset_conversation(name-derived id, user_id)`, `process_message` **exactly
+  once** with `memory_scope` + `delivery_chat_id`, a single formatted notification to
+  `spec.chat_id` carrying name + result **not** the prompt, empty reply → no
+  notification, long result chunked, `AgentError` → fixed safe notice, a generic
+  exception → no notification, **`finally` always deletes the venue**, a failed
+  send is swallowed, and prompt/reply never reach Telegram text or logs),
+  `tests/test_main_scheduling_wiring.py` (empty `SCHEDULES` → **no scheduler
+  object** so no task is ever started and the startup sweep is a no-op; non-empty →
+  the scheduler is wired to the bound `_run_schedule` runner + `SCHEDULE_TIMEZONE`),
+  plus additive coverage in `tests/test_telegram_approval.py` (**`delivery_chat_id`
+  routing**: a scheduled run's card goes to the bound chat, the conversation-lookup
+  path is bypassed, the binding is still `(hash_scope(telegram:<user_id>), chat_id)`,
+  invalid `delivery_chat_id` values fall through to the lookup path, and the
+  interactive path with empty metadata is byte-for-byte the existing lookup),
+  `tests/test_database.py` (`delete_conversation` removes the row + messages +
+  attachments without relying on FK cascade; `clear_ephemeral_conversations` deletes
+  **only** reserved-range venues — a real chat, an in-range synthetic, and a
+  just-below-range id coexist and only the synthetic is swept; `reset_conversation`
+  self-heals a leftover synthetic row), `tests/test_agent.py` (a scheduled run's
+  dedicated venue never serialises with the interactive conversation in the *same
+  real chat* — different conversation PKs → different per-conversation locks), and
+  `tests/test_telegram.py` (`/schedule_status`: authorised, in the command menu,
+  disabled/none/multiple branches, calendar-impossible → "never (untriggerable)",
+  **only** name + cron + next-fire rendered — **never** prompt/chat_id/user_id,
+  unauthorised → silent, and it never triggers a run / calls the LLM).
 
 ---
 

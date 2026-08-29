@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from telegram import BotCommand, Chat, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
@@ -42,6 +43,7 @@ from telegram.ext import (
 )
 
 from ..agent.service import AgentError, AgentService, _user_safe_for
+from ..automation.cron import CronError, parse_cron
 from ..config import Config
 from ..database.repository import ConversationRepository
 from ..infrastructure import local_tool_name
@@ -75,6 +77,7 @@ _COMMANDS: list[tuple[str, str]] = [
     ("mcp_status", "Show remote MCP tool status"),
     ("mcp", "Show MCP servers / start OAuth login"),
     ("infra_status", "Show configured infra targets"),
+    ("schedule_status", "Show configured schedules"),
     ("help", "Show this help"),
 ]
 
@@ -161,6 +164,40 @@ async def _safe_reply(chat: Chat, text: str) -> None:
         await chat.send_message(text=text)
     except TelegramError:
         logger.error("telegram failed to send reply", extra={"chat_id": chat.id}, exc_info=True)
+
+
+async def deliver_markdown(bot, chat_id: int, markdown_text: str) -> None:
+    """Send ``markdown_text`` (rendered Markdown→HTML) to a raw ``chat_id`` via ``bot``.
+
+    The shared delivery primitive for **proactive, non-reply** sends — the phase-9
+    scheduled-run notification (and any future out-of-band message) uses it, since
+    there is no inbound :class:`Chat` / message to quote. It mirrors
+    :func:`_send_long`'s behaviour exactly: the text is split into tag-balanced
+    chunks and each is sent with ``parse_mode=HTML``; a chunk whose HTML Telegram
+    rejects (the "can't parse entities" 400) is re-sent as **plain text** so the
+    recipient still gets the content. The only differences from ``_send_long`` are
+    that the target is a bare ``chat_id`` (not a :class:`Chat`) and no
+    ``reply_to_message_id`` is ever set (there is nothing to reply to).
+
+    This is the **caller's** responsibility to swallow ``TelegramError`` (the
+    interactive path routes its own error handling); a caller that must not crash
+    (the schedule runner) wraps the call in its own try/except.
+    """
+    for chunk in to_telegram_html_chunks(markdown_text, limit=CHUNK_SIZE):
+        if not chunk.html:
+            continue
+        try:
+            await bot.send_message(chat_id=chat_id, text=chunk.html, parse_mode=ParseMode.HTML)
+        except BadRequest:
+            # Unparseable HTML for this chunk: deliver it verbatim instead.
+            logger.warning("html parse failed for a delivery chunk; falling back to plain text")
+            for plain in split_into_chunks(chunk.text, limit=CHUNK_SIZE):
+                if plain:
+                    await bot.send_message(chat_id=chat_id, text=plain)
+        except TelegramError:
+            # Non-parse errors (FloodWait, timeouts): let the caller handle them.
+            raise
+
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +701,51 @@ async def cmd_infra_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# read-only schedule status (phase 9)
+# ---------------------------------------------------------------------------
+async def cmd_schedule_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/schedule_status — show the configured cron schedules and their next fire time.
+
+    Read-only and non-mutating: it renders the startup-configured
+    :class:`~..config.ScheduleSpec` list (name + cron expression) and, for each,
+    the next fire time computed by the pure :func:`..automation.cron.parse_cron`
+    cron parser in ``SCHEDULE_TIMEZONE``. It does **not** trigger a run, call the
+    LLM, or touch any conversation. The reply shows **only** each schedule's
+    *name*, its *cron* expression, and its *next fire time* — never its ``prompt``,
+    ``chat_id``, or ``user_id`` (those are startup config and must not be exposed
+    through a command). A schedule whose cron has no fire time in the search
+    window (calendar-impossible) is shown as "never (untriggerable)". An
+    unauthorised sender is ignored silently, exactly like every other command.
+    """
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    config: Config = context.application.bot_data["config"]
+
+    if not config.schedules:
+        await _send_long(chat, "**Schedules:** disabled (none configured)")
+        return
+
+    tz = ZoneInfo(config.schedule_timezone) if config.schedule_timezone else datetime.now().astimezone().tzinfo
+    now = datetime.now(tz)
+    lines = ["**Scheduled tasks:**", ""]
+    for spec in config.schedules:
+        try:
+            nxt = parse_cron(spec.cron).next_fire(now, tz)
+        except CronError:
+            # Cannot happen — the cron was validated at startup — but stay safe.
+            nxt = None
+        if nxt is None:
+            fire = "never (untriggerable)"
+        else:
+            fire = nxt.strftime("%Y-%m-%d %H:%M %Z")
+        lines.append(f"**{spec.name}** — `{spec.cron}` → next: {fire}")
+    lines += ["", f"(Times in {config.schedule_timezone or 'local tz'}. Read-only — this does not trigger anything.)"]
+    # Name + cron + next-fire only; never prompt / chat_id / user_id.
+    await _send_long(chat, "\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # MCP status + user-level OAuth (phase 4.x)
 # ---------------------------------------------------------------------------
 async def cmd_mcp(update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1001,6 +1083,9 @@ def build_application(
     # Phase 5.1: read-only view of the configured infrastructure observation
     # targets (config metadata only — no SSH / LLM / reachability).
     application.add_handler(CommandHandler("infra_status", cmd_infra_status))
+    # Phase 9: read-only view of the configured cron schedules + next fire time
+    # (config metadata only — no LLM, no trigger, no prompt/chat_id/user_id).
+    application.add_handler(CommandHandler("schedule_status", cmd_schedule_status))
     # Phase 4.x: MCP status + user-level OAuth login. ``/mcp auth <server>`` is
     # the single ``/mcp`` command with an ``auth`` argument (Telegram treats it
     # as one command), so it is dispatched inside ``cmd_mcp`` — there is no

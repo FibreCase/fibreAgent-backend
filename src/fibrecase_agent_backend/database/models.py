@@ -24,6 +24,7 @@ actually injected into a live LLM context.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, String, Text
@@ -32,6 +33,49 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Reserved range for *ephemeral* scheduled-run conversations (phase 9).
+#
+# Interactive conversations are keyed by a *real* Telegram chat id: positive ~10⁹
+# ids for users/private chats, negative ids for groups/supergroups. A scheduled
+# run needs a dedicated, per-run conversation row but must never collide with a
+# real chat (which would break ``get_conversation``'s one-row-per-chat assumption
+# and merge a run into the owner's live conversation). So scheduled runs use a
+# *synthetic* ``telegram_chat_id`` in a documented reserved range far above any
+# real id:
+#
+#     schedule_chat_id = SCHEDULE_CHAT_ID_BASE + int(sha256(task_name)[:8], 16)
+#
+# The suffix is 32 bits, so every synthetic id lies in
+# (SCHEDULE_CHAT_ID_BASE, SCHEDULE_CHAT_ID_BASE + 2**32]. That range is ~10⁷× above
+# the largest realistic positive Telegram id and entirely below int64 max, so it
+# can never collide with a real chat (positive or negative) and always fits the
+# column. The mapping is *deterministic in the task name* (the same task maps to
+# the same id every run — for log attribution and self-heal reuse) and is **not**
+# a secret (it is never a real user identity) — it may appear in logs at the same
+# level as the existing conversation-id logs.
+# ---------------------------------------------------------------------------
+SCHEDULE_CHAT_ID_BASE = 9_000_000_000_000_000_000
+# The exclusive upper bound of the reserved range (``id`` is strictly less than
+# this). Kept as a constant so the startup sweep and the id derivation share one
+# definition of "the reserved range".
+SCHEDULE_CHAT_ID_MAX = SCHEDULE_CHAT_ID_BASE + 2**32
+
+
+def schedule_chat_id(name: str) -> int:
+    """The deterministic synthetic ``telegram_chat_id`` for a named schedule.
+
+    ``sha256(name)``'s first 8 hex chars (32 bits) are added to
+    :data:`SCHEDULE_CHAT_ID_BASE`. Same name → same id every call; distinct names
+    collide only with negligible probability in a 32-bit space (and a collision
+    is harmless — each run creates/deletes its own row and never reuses another
+    task's by id).
+    """
+    suffix = int(hashlib.sha256(name.encode("utf-8")).hexdigest()[:8], 16)
+    return SCHEDULE_CHAT_ID_BASE + suffix
+
 
 
 class Base(DeclarativeBase):

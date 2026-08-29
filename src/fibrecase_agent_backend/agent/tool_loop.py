@@ -185,6 +185,7 @@ async def run_tool_loop(
     tool_timeout_seconds: float = 30.0,
     conversation_id: int | None = None,
     scope: str | None = None,
+    delivery_chat_id: int | None = None,
 ) -> Any:
     """Run the model + tools until a final text answer is produced.
 
@@ -207,6 +208,14 @@ async def run_tool_loop(
     ``auditor`` defaults to a :class:`NoopAuditor`; ``approval_provider`` is
     only consulted for ``ask`` tools. ``scope`` is the opaque principal used for
     audit hashing (ignored by the no-op auditor).
+
+    ``delivery_chat_id`` (phase 9, optional) is the *real* Telegram chat id an
+    approval card for this turn should be delivered to, when the turn runs in a
+    venue whose conversation row is not a real chat (a scheduled run's synthetic
+    conversation). It is carried onto each :class:`ApprovalRequest`` in
+    ``metadata`` **only when set** — the broker then delivers the card there
+    instead of resolving the conversation's chat. When ``None`` (every
+    interactive caller) no metadata is set and the broker's path is unchanged.
     """
     _auditor = auditor if auditor is not None else _NO_AUDITOR
     _approval = approval_provider if approval_provider is not None else _NoApprovalProvider()
@@ -263,6 +272,7 @@ async def run_tool_loop(
                 auditor=_auditor,
                 scope=scope or "",
                 conversation_id=conversation_id,
+                delivery_chat_id=delivery_chat_id,
                 approval_timeout_seconds=approval_timeout_seconds,
                 tool_timeout_seconds=tool_timeout_seconds,
             )
@@ -284,6 +294,7 @@ async def _execute_gated(
     auditor: ToolAuditor,
     scope: str,
     conversation_id: int | None,
+    delivery_chat_id: int | None,
     approval_timeout_seconds: float,
     tool_timeout_seconds: float,
 ) -> str:
@@ -347,6 +358,12 @@ async def _execute_gated(
     # 6. ask → one-time human approval (allow skips straight to execution).
     if permission is ToolPermission.ASK:
         await auditor.record(_event(EVENT_APPROVAL_REQUESTED, code=RESULT_OK))
+        # Phase 9: when this turn runs in a synthetic (scheduled) conversation,
+        # the approval card must be delivered to a *real* chat — the owner's
+        # bound chat — not the synthetic one. That delivery target rides
+        # ``metadata`` (a provider-consumable, non-sensitive field) **only** when
+        # it is set, so the interactive path (``delivery_chat_id is None``) sets
+        # no metadata and the broker resolves the conversation's chat as before.
         request = ApprovalRequest(
             request_id=secrets.token_urlsafe(16),
             conversation_id=conversation_id or 0,
@@ -357,6 +374,7 @@ async def _execute_gated(
             arguments=args_for_exec,
             detail=tool.approval_detail(args_for_exec) or "",
             language=tool.approval_language(args_for_exec) or "",
+            metadata={"delivery_chat_id": delivery_chat_id} if delivery_chat_id is not None else {},
         )
         try:
             decision = await approval.request_approval(request)

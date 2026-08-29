@@ -102,7 +102,7 @@ class _FakeUpdate:
         self.effective_user = type("U", (), {"id": user_id})()
 
 
-def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None, arguments=None, detail=None, language=None):
+def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None, arguments=None, detail=None, language=None, metadata=None):
     return ApprovalRequest(
         request_id=request_id,
         conversation_id=5,
@@ -113,6 +113,7 @@ def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", sec
         arguments=arguments if arguments is not None else {},
         detail=detail if detail is not None else "",
         language=language if language is not None else "",
+        metadata=metadata if metadata is not None else {},
     )
 
 
@@ -395,6 +396,150 @@ async def test_callback_data_parser_is_safe():
     assert decision_from("v2:abc123:a") is None  # wrong version
     assert decision_from("v1:abc123:x") is None  # bad decision
     assert request_id_from("garbage") == ""
+
+
+# ---------------------------------------------------------------------------
+# required #12 — delivery_chat_id routing (scheduled runs)
+#
+# A scheduled run's turn runs in a *synthetic* conversation whose row does not
+# correspond to a real chat, so the card must go to the owner's *bound* chat.
+# ``process_message(delivery_chat_id=spec.chat_id)`` threads that id into
+# ``ApprovalRequest.metadata``; the broker uses it directly (no conversation
+# lookup) when present, else the existing lookup path (interactive, unchanged).
+# ---------------------------------------------------------------------------
+class _SpyRepo:
+    """A repo that both records whether the lookup path was consulted *and*
+    resolves to a deliberate "wrong" chat, so a test can prove the
+    metadata path bypassed it entirely."""
+
+    def __init__(self, lookup_chat_id: int = 999_999, *, exists: bool = True):
+        self.lookup_chat_id = lookup_chat_id
+        self.exists = exists
+        self.lookup_calls = 0
+
+    async def get_conversation_by_id(self, conversation_id):
+        self.lookup_calls += 1
+        if not self.exists:
+            return None
+        return type("C", (), {"telegram_chat_id": self.lookup_chat_id})()
+
+
+async def test_scheduled_run_card_goes_to_delivery_chat_not_synthetic():
+    # metadata carries the owner's real chat; the repo would resolve to a
+    # different ("synthetic-venue") chat. The card must go to the real one.
+    repo = _SpyRepo(lookup_chat_id=777_777)
+    broker = TelegramApprovalBroker(repo)
+    app = _FakeApp()
+    broker.bind_application(app)
+
+    req = _request("sd1", metadata={"delivery_chat_id": CHAT_A})
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "sd1")
+
+    # The prompt went to the *delivery* chat, not the repo-resolved chat.
+    assert app.bot.sent[0]["chat_id"] == CHAT_A
+    # …and the conversation-lookup path was never consulted for it.
+    assert repo.lookup_calls == 0
+
+
+async def test_scheduled_run_binding_is_owner_in_delivery_chat():
+    # The principal is still bound to (hash_scope(telegram:<user_id>), chat_id),
+    # where chat_id is the *delivery* chat: only the owner *in that chat* may
+    # approve; a different chat is refused.
+    repo = _SpyRepo()
+    broker = TelegramApprovalBroker(repo)
+    app = _FakeApp()
+    broker.bind_application(app)
+
+    req = _request("sd2", scope=f"telegram:{USER_A}", metadata={"delivery_chat_id": CHAT_A})
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "sd2")
+    approve = _callback_data(app.bot.sent[0], _approve_label)
+
+    # Owner in the delivery chat → approved.
+    await broker.handle_callback(_FakeUpdate(approve, CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+
+    # A fresh request: the same user from a *different* chat is refused (voided).
+    app2 = _FakeApp()
+    broker2 = TelegramApprovalBroker(_SpyRepo())
+    broker2.bind_application(app2)
+    req2 = _request("sd3", scope=f"telegram:{USER_A}", metadata={"delivery_chat_id": CHAT_A})
+    task2 = asyncio.create_task(broker2.request_approval(req2))
+    await _await_pending(broker2, "sd3")
+    approve2 = _callback_data(app2.bot.sent[0], _approve_label)
+    await broker2.handle_callback(_FakeUpdate(approve2, CHAT_A + 1, USER_A), None)  # wrong chat
+    assert await task2 == ApprovalDecision.EXPIRED  # voided, not approved
+
+
+async def test_scheduled_run_approve_denied_expire_all_fail_closed():
+    # Approve → runs; Deny → does not; no-click timeout → does not. (The broker
+    # only *decides*; the loop decides whether to execute, but the decision
+    # returned is exactly what the loop gates on.)
+    # Approve
+    broker = TelegramApprovalBroker(_SpyRepo())
+    app = _FakeApp()
+    broker.bind_application(app)
+    req = _request("ok", metadata={"delivery_chat_id": CHAT_A})
+    task = asyncio.create_task(broker.request_approval(req))
+    await _await_pending(broker, "ok")
+    await broker.handle_callback(_FakeUpdate(_callback_data(app.bot.sent[0], _approve_label), CHAT_A, USER_A), None)
+    assert await task == ApprovalDecision.APPROVED
+
+    # Deny
+    broker2 = TelegramApprovalBroker(_SpyRepo())
+    app2 = _FakeApp()
+    broker2.bind_application(app2)
+    req2 = _request("no", metadata={"delivery_chat_id": CHAT_A})
+    task2 = asyncio.create_task(broker2.request_approval(req2))
+    await _await_pending(broker2, "no")
+    await broker2.handle_callback(_FakeUpdate(_callback_data(app2.bot.sent[0], _deny_label), CHAT_A, USER_A), None)
+    assert await task2 == ApprovalDecision.DENIED
+
+    # Expire (no click)
+    broker3 = TelegramApprovalBroker(_SpyRepo())
+    app3 = _FakeApp()
+    broker3.bind_application(app3)
+    req3 = _request("ex", seconds=0.05, metadata={"delivery_chat_id": CHAT_A})
+    task3 = asyncio.create_task(broker3.request_approval(req3))
+    assert await task3 == ApprovalDecision.EXPIRED
+
+
+async def test_scheduled_run_metadata_ignores_invalid_delivery_ids():
+    # A delivery_chat_id that is not a positive int (bool, 0, negative, str) is
+    # *not* trusted — it falls through to the (existing) conversation-lookup
+    # path. A non-int/bool value is the interactive-path invariant: never a
+    # silently-wrong target.
+    for bad in (True, 0, -5, "42", None):
+        repo = _SpyRepo(lookup_chat_id=CHAT_A, exists=True)
+        broker = TelegramApprovalBroker(repo)
+        app = _FakeApp()
+        broker.bind_application(app)
+        req = _request("inv", metadata={"delivery_chat_id": bad})
+        task = asyncio.create_task(broker.request_approval(req))
+        await _await_pending(broker, "inv")
+        # Fell through to the lookup path (consulted the repo).
+        assert repo.lookup_calls == 1
+        await broker.shutdown()  # clean up the pending wait
+        await task
+
+
+async def test_interactive_path_unchanged_without_metadata():
+    # The default (no metadata / empty metadata) uses the conversation-lookup
+    # path byte-for-byte: the repo *is* consulted and its chat is used.
+    repo = _SpyRepo(lookup_chat_id=CHAT_A, exists=True)
+    broker = TelegramApprovalBroker(repo)
+    app = _FakeApp()
+    broker.bind_application(app)
+
+    for meta in (None, {}):
+        req = _request("int", metadata=meta)
+        task = asyncio.create_task(broker.request_approval(req))
+        await _await_pending(broker, "int")
+        assert app.bot.sent[-1]["chat_id"] == CHAT_A
+        assert repo.lookup_calls >= 1
+        await broker.shutdown()
+        await task
 
 
 # ---------------------------------------------------------------------------

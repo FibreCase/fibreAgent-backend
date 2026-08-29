@@ -550,6 +550,7 @@ class AgentService:
         user_message: str | AgentMessage,
         *,
         memory_scope: str | None = None,
+        delivery_chat_id: int | None = None,
     ) -> str:
         """Process one inbound message and return the assistant reply text.
 
@@ -571,6 +572,15 @@ class AgentService:
         after the main prompt and before history. Without ``memory_scope`` the
         path is byte-for-byte the phase-2.4 behaviour. Memory retrieval never
         touches the tool loop or the attachment store.
+
+        ``delivery_chat_id`` (phase 9, optional) is the *real* Telegram chat id
+        that approval cards for this turn should be delivered to, when the turn
+        runs in a venue whose conversation row does not correspond to a real
+        chat (a scheduled run's synthetic conversation). It is threaded to the
+        tool loop and, only when set, carried on each :class:`ApprovalRequest`
+        ``metadata`` so the approval broker delivers the card there instead of
+        resolving the conversation's own chat. When ``None`` (every interactive
+        caller) the path is byte-for-byte unchanged.
         """
         # Normalise a plain string to a single-part text message so both entry
         # points share one code path; a string with no text short-circuits.
@@ -748,6 +758,7 @@ class AgentService:
                         approval_timeout_seconds=self._tool_approval_timeout_seconds,
                         conversation_id=conversation_id,
                         scope=memory_scope,
+                        delivery_chat_id=delivery_chat_id,
                     )
                 else:
                     # Phase-one path: one completion, no tools.
