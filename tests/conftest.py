@@ -1,27 +1,26 @@
 """Shared fixtures for the test suite.
 
-All tests use an in-memory SQLite database and a fake LLM — nothing ever
+All tests use a throwaway SQLite database and a fake LLM — nothing ever
 talks to the real LLM endpoint or Telegram.
 """
 
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import event
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
-from sqlalchemy.pool import StaticPool
 
 from fibrecase_agent_backend import config as _config_module
-from fibrecase_agent_backend.database.models import Base
 from fibrecase_agent_backend.database.repository import ConversationRepository
+from fibrecase_agent_backend.database.session import (
+    create_engine,
+    create_session_factory,
+    init_db,
+)
 from fibrecase_agent_backend.llm.client import LLMError, LLMResult
 
 
@@ -72,25 +71,29 @@ def _no_default_schedules_file(monkeypatch):
 
 @pytest.fixture
 async def repo():
-    """An in-memory SQLite-backed repository with a fresh schema per test."""
-    engine = create_async_engine(
-        "sqlite+aiosqlite://",
-        poolclass=StaticPool,  # share one in-memory DB across all connections
-        connect_args={"check_same_thread": False},
-    )
+    """A file-backed SQLite repository with a fresh, per-test schema.
 
-    @event.listens_for(engine.sync_engine, "connect")
-    def _enable_fk(dbapi_connection, _record) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys = ON")
-        cursor.close()
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    yield ConversationRepository(factory)
-    await engine.dispose()
+    The engine is built through the *production* helpers so it matches what the
+    app actually runs (a default connection pool, i.e. **several** connections,
+    plus the SQLite FK pragma). That matters: the repository is exercised
+    concurrently (one session per in-flight turn), and a single shared
+    connection is not safe for two sessions writing at once — the second
+    ``commit`` closes the shared connection and detaches the first session's
+    in-flight instance, surfacing as a flaky
+    ``DetachedInstanceError``/``InvalidRequestError`` on refresh. A
+    file-backed database (mirroring production's
+    ``sqlite+aiosqlite:///./data/agent.db``) gives each session its own
+    connection, so the tests reproduce the real access pattern. The file lives
+    in a ``TemporaryDirectory`` that is removed on teardown.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "test.db"
+        engine = create_engine(f"sqlite+aiosqlite:///{db_path}")
+        await init_db(engine)
+        try:
+            yield ConversationRepository(create_session_factory(engine))
+        finally:
+            await engine.dispose()
 
 
 @dataclass

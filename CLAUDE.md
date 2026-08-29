@@ -189,11 +189,19 @@ built-ins.
 
 ## Testing
 
-`tests/conftest.py` provides an in-memory `repo` fixture and `FakeLLM` /
+`tests/conftest.py` provides a `repo` fixture and `FakeLLM` /
 `RecordingLLM` fakes. **The whole suite is mocked** — nothing ever talks to the real
-LLM endpoint, Telegram, an MCP server, an OAuth provider, or an SSH target. Tests use
-in-memory SQLite via `StaticPool` (no real files); blob-store tests write to
-`tmp_path`, never the repo's `data/`.
+LLM endpoint, Telegram, an MCP server, an OAuth provider, or an SSH target. The
+shared `repo` fixture is **file-backed SQLite built through the production
+`create_engine` / `create_session_factory` / `init_db` helpers** (a default
+connection pool, i.e. several connections, in a `TemporaryDirectory` that is
+removed on teardown) — **do not** switch it to a single shared in-memory
+connection. The repository is exercised concurrently (one session per in-flight
+turn); a single `StaticPool` connection is *not* safe for two sessions writing at
+once — the second `commit` closes the shared connection and detaches the first
+session's in-flight instance, surfacing as a flaky `DetachedInstanceError` /
+`InvalidRequestError` on refresh. Blob-store tests write to `tmp_path`, never the
+repo's `data/`.
 
 Conventions:
 

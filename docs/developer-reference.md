@@ -1526,8 +1526,15 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   both `to_dict()` identically for a plain message. Keep them in sync if you change
   either.
 - `data/` and its `.db` are created automatically at startup (`create_engine` makes
-  the parent dir). Tests use in-memory SQLite via `StaticPool` — keep them that way
-  (no real files).
+  the parent dir). The shared `repo` test fixture is **file-backed** SQLite, built
+  through the same production `create_engine` / `create_session_factory` / `init_db`
+  helpers (default pool, in a `TemporaryDirectory`) so its access pattern matches
+  the app: the repository is written concurrently, and a single shared in-memory
+  connection (the old `StaticPool` fixture) is not safe for two sessions — the
+  second `commit` closes the shared connection and detaches the first session's
+  in-flight instance, surfacing as a flaky `DetachedInstanceError` /
+  `InvalidRequestError` on `refresh`. Keep the `repo` fixture file-backed; other
+  single-session DB tests may still build their own in-memory / `tmp_path` engine.
 
 ---
 
@@ -1867,7 +1874,9 @@ path confinement for `file`), and never reaches the logs or the audit table.
 
 ## Test coverage map
 
-`tests/conftest.py` provides an in-memory `repo` fixture and `FakeLLM` /
+`tests/conftest.py` provides a `repo` fixture (file-backed SQLite through the
+production helpers — see the deployment note above for why it is not a shared
+in-memory connection) and `FakeLLM` /
 `RecordingLLM` fakes. **All tests pass, all mocked** — nothing ever talks to the real
 LLM endpoint, Telegram, an MCP server, an OAuth provider, or an SSH target. The fakes
 used across the suite: `FakeToolLLM` (`test_tool_loop.py`) and
