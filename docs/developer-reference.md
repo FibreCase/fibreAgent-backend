@@ -39,7 +39,7 @@ implemented, mocked-tested, and released:
 - **Phase 4.x (User-Level OAuth for MCP)** — implemented and mocked-tested on top of v1.8.0 (release pending)
 - **Phase 5.1 (Read-Only Infrastructure Observation via SSH)** — implemented and mocked-tested on top of that (release pending)
 - An **opt-in `exec` shell tool** (default off, always `ask`, with a static catastrophic-command backstop) — implemented and tested on top of that
-- An **opt-in `edit` file tool** (default off, always `ask`, confined to `EDIT_WORKDIR` against `../` and symlink escape, precise replace + read) — implemented and tested on top of that
+- An **opt-in `file` toolset** (default off; `file_read`/`file_ls` read-only `allow`, the other seven tools always `ask`; confined to `FILE_WORKDIR` against `../` and symlink escape, precise replace + narrow non-overwriting file/directory operations) — implemented and tested on top of that
 
 ### Phase 1
 
@@ -604,58 +604,73 @@ deny patterns are always parse-validated (fail-closed). `main.py` registers `exe
 `build_default_tools(...)` **only when** `ENABLE_TOOLS` and `ENABLE_EXEC_TOOL` are
 both true.
 
-### The `edit` file tool (opt-in, on top of Phase 3, in `tools/builtin/edit.py`)
+### The `file` toolset (opt-in, on top of Phase 3, in `tools/builtin/file.py`)
 
-The second, **narrower** of the two state-changing built-ins: where `exec` is "run an
-arbitrary command", `edit` lets the model read a file and make a **precise** edit
-without writing any shell. It is a single tool with an `operation` discriminator —
-`operation="read"` returns the content of a UTF-8 file; `operation="replace"` swaps
-the **unique** `old_string` for `new_string` (or every occurrence with
-`replace_all`) — no whole-file write / append / move / copy / delete / mkdir (those
-belong to `exec`). The schema is `required=["operation","path"]`,
-`additionalProperties: false`, with `old_string`/`new_string` bounded by `maxLength`.
-It is **off by default** (`ENABLE_EDIT_TOOL=false`), so the default deployment stays
-write-free, and it always declares `ask` — every call needs a one-time human Approve.
-Its `approval_summary` is a fixed, argument-free purpose line that never echoes the
-arguments; it additionally overrides the optional `approval_detail` hook so the
-approval card shows `path` / `old_string` / `new_string` as a **faithful
-`Action:` block rendered in git-diff style** — a `📄 File:` / `🔁 Operation:` header,
-then `--- a/<path>` / `+++ b/<path>`, with each `old_string` line `-`-prefixed and
-each `new_string` line `+`-prefixed (newlines preserved; an empty `new_string` is a
-pure deletion with no `+` lines), and `read` showing just the file + operation —
-**in place of** the generic `Arguments:` JSON, and labelled `diff` via the
-`approval_language` hook (a `read` has no diff body and is left unlabelled) so
-Telegram highlights it as a diff rather than guessing — the detail is plain text (the
+The second, **narrower** of the two state-changing local capabilities: where `exec`
+is "run an arbitrary command", the `file` toolset lets the model do file/directory
+operations — read, list, precise-edit, move, copy, create, delete, touch — *without
+writing any shell*. It is **nine tools** (a shared `_FileTool` base holds the
+confinement root + helpers; each is a first-class `Tool`, `additionalProperties:
+false`): `file_read` (UTF-8 file content, tail-truncated) and `file_ls` (directory
+entries, dirs `/`-suffixed) both declare **`allow`** (read-only, no per-call
+approval); `file_edit` (swap the **unique** `old_string` for `new_string`, or every
+occurrence with `replace_all`; `new_string` may be empty = delete that span),
+`file_mv` (move/rename a file or dir; target must not exist), `file_cp` (copy a file
+or directory tree; dirs need `recursive=true`; target must not exist), `file_rm`
+(delete a **regular file** only — never a directory), `file_mkdir` (create a dir;
+`parents=true` makes intermediates), `file_rmdir` (delete an **empty** directory
+only), and `file_touch` (create an empty file or update mtime) all declare **`ask`**
+— every call needs a one-time human Approve. Single-path tools use
+`required=["path"]`; `file_mv`/`file_cp` use `required=["source","target"]`;
+`file_edit` uses `required=["path","old_string","new_string"]` with
+`old_string`/`new_string` bounded by `maxLength`. It is **off by default**
+(`ENABLE_FILE_TOOL=false`), so the default deployment stays write-free. `file_edit`
+overrides the optional `approval_detail` hook so the approval card shows the replace
+as a **faithful `Action:` block rendered in git-diff style** — a `📄 File:` /
+`🔁 Operation:` header, then `--- a/<path>` / `+++ b/<path>`, with each `old_string`
+line `-`-prefixed and each `new_string` line `+`-prefixed (newlines preserved; an
+empty `new_string` is a pure deletion with no `+` lines) — **in place of** the
+generic `Arguments:` JSON, and labelled `diff` via the `approval_language` hook so
+Telegram highlights it as a diff rather than guessing (the detail is plain text; the
 provider HTML-escapes + length-bounds it, wraps it in `<pre><code>`, and drops it on
-card finalisation exactly like the JSON block). Defence in depth, all *inside*
-`execute` (the tool loop is untouched):
+card finalisation exactly like the JSON block). The other tools override only
+`approval_summary` (a fixed, argument-free purpose line) and ride the generic
+`Arguments:` JSON block. Defence in depth, all *inside* each `execute` (the tool loop
+is untouched):
 
-1. **Path confinement — the core safety property** — `_resolve` resolves the path
-   (collapsing `..` *and* following **symlinks**) and refuses anything that does not
-   land inside `EDIT_WORKDIR` *before any I/O* (`edit_path_escape`), so a `../`
-   escape, an out-of-root absolute path, or a symlink pointing out of the root is
-   **never read or written even after the owner approves**.
-2. **Exact-match semantics** — `old_string` must appear exactly once unless
-   `replace_all` (`edit_not_found` / `edit_not_unique`).
-3. **Atomic write** — same-directory `tempfile.mkstemp` + `fsync` + `os.replace`, so a
-   mid-write crash never leaves a half-written file (the attachment-store /
-   permissions-file idiom).
-4. **Bounding** — a `read` result is tail-truncated to `MAX_EDIT_READ_CHARS` with the
-   `[N chars … truncated]` marker (truncation, not an error).
+1. **Path confinement — the core safety property** — `_resolve` resolves every
+   `path` / `source` / `target` (collapsing `..` *and* following **symlinks**) and
+   refuses anything that does not land inside `FILE_WORKDIR` *before any I/O*
+   (`file_path_escape`), so a `../` escape, an out-of-root absolute path, or a symlink
+   pointing out of the root is **never read or written even after the owner approves**.
+2. **Narrow verbs, no overwrite** — `file_rm` never deletes a directory
+   (`file_is_directory`), `file_rmdir` only an empty one (`file_not_empty`), and
+   `file_mv`/`file_cp` refuse an existing target (`file_already_exists`) — so the model
+   cannot clobber or delete a whole tree.
+3. **Atomic write** — `file_edit` writes new content to a same-directory
+   `tempfile.mkstemp` + `fsync` + `os.replace`, so a mid-write crash never leaves a
+   half-written file (the attachment-store / permissions-file idiom).
+4. **Bounding** — a `file_read` result is tail-truncated to `MAX_FILE_READ_CHARS` with
+   the `[N chars … truncated]` marker (truncation, not an error); `file_ls` entries are
+   capped at `MAX_FILE_LIST_ENTRIES` (extra entries dropped, a `truncated` flag set);
+   `file_edit`'s `old_string`/`new_string` are bounded by `MAX_FILE_STRING_CHARS`
+   (also the schema `maxLength`).
 
-`EDIT_WORKDIR` is **required** when the tool is enabled (must be an existing
+`FILE_WORKDIR` is **required** when the toolset is enabled (must be an existing
 directory, else a startup `ConfigError`) — deliberately stricter than the optional
-`EXEC_WORKDIR`, because a confinement root is the tool's security premise. The only
-edit-specific result codes are `edit_path_escape`, `edit_file_not_found`,
-`edit_not_a_file`, `edit_read_failed`, `edit_invalid_op`, `edit_not_found`,
-`edit_not_unique`, and `edit_write_failed`, all **returned** (not raised) so the
-specific code reaches the model. **The path, file content, and old/new strings go to
-the model only — never logged, never audited.** Four config knobs (`config.py`):
-`ENABLE_EDIT_TOOL` (default `false`), `EDIT_WORKDIR` (required existing dir when
-enabled), `MAX_EDIT_STRING_CHARS` (default `2000`, `>= 1`, also the schema
-`maxLength`), and `MAX_EDIT_READ_CHARS` (default `8000`, `>= 1`); the three non-flag
-knobs are validated **only when enabled**. `main.py` registers `edit` in
-`build_default_tools(...)` **only when** `ENABLE_TOOLS` and `ENABLE_EDIT_TOOL` are
+`EXEC_WORKDIR`, because a confinement root is the toolset's security premise. The
+only file-specific result codes are `file_path_escape`, `file_not_found`,
+`file_not_a_file`, `file_not_a_directory`, `file_is_directory`, `file_read_failed`,
+`file_invalid_path`, `file_invalid_args`, `file_not_replaced`, `file_not_unique`,
+`file_write_failed`, `file_not_empty`, `file_already_exists`, and `file_fs_failed`,
+all **returned** (not raised) so the specific code reaches the model. **The path,
+file content, and old/new strings go to the model only — never logged, never
+audited.** Five config knobs (`config.py`): `ENABLE_FILE_TOOL` (default `false`),
+`FILE_WORKDIR` (required existing dir when enabled), `MAX_FILE_STRING_CHARS` (default
+`2000`, `>= 1`, also the schema `maxLength`), `MAX_FILE_READ_CHARS` (default `8000`,
+`>= 1`), and `MAX_FILE_LIST_ENTRIES` (default `1000`, `>= 1`); the four non-flag
+knobs are validated **only when enabled**. `main.py` registers the toolset in
+`build_default_tools(...)` **only when** `ENABLE_TOOLS` and `ENABLE_FILE_TOOL` are
 both true (added last, after `exec`).
 
 ---
@@ -790,8 +805,8 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   safe **purpose** summary under a `What it does:` line + a readable **argument view**
   when the call has arguments — either the default pretty-JSON **`Arguments:`** block
   (labelled `json`), or, when the tool overrides the optional `approval_detail` hook
-  (`edit`, `exec`), a tool-supplied plain-text view under an **`Action:`** label
-  (labelled by the tool's `approval_language` hook — `diff` for `edit`'s `replace`,
+  (`file_edit`, `exec`), a tool-supplied plain-text view under an **`Action:`** label
+  (labelled by the tool's `approval_language` hook — `diff` for `file_edit`,
   `bash` for `exec` — so Telegram highlights it by language rather than guessing); both
   rendered in `<pre><code>` — the `<pre>` carrying a sanitised `class="language-…"`
   attribute (the tool-declared language is kept to `[A-Za-z0-9_-]`, capped at 24 chars,
@@ -954,7 +969,7 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   that — when non-`None` — **replaces** the generic `Arguments:` JSON block on the
   card, shown under an `Action:` label; the provider HTML-escapes + length-bounds it
   and drops it on finalisation exactly like the JSON block. The **default** is `None`
-  → the generic JSON block; the state-changing built-ins `edit` (a faithful
+  → the generic JSON block; the state-changing built-ins `file_edit` (a faithful
   **git-style diff** of its `old_string`/`new_string` — `--- a/<path>`/`+++ b/<path>`
   headers, each old line `-`-prefixed, each new line `+`-prefixed, empty
   `new_string` a pure deletion) and `exec` (the command as a `$ …` bash block)
@@ -965,10 +980,9 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   vocabulary, **never** a value derived from argument content, so it cannot inject a
   second `class`/close the tag; the provider keeps only `[A-Za-z0-9_-]`, caps it at 24
   chars, lowercases it, and drops the label when empty; the **default** is `None` →
-  unlabelled, `edit`'s `replace` returns `diff` (a `read` returns `None` — no diff
-  body), and `exec` returns `bash`; the generic `Arguments:` JSON block is always
-  labelled `json`), and `async execute(arguments) -> str`; `spec()` builds the inner
-  `function` block. `registry.ToolRegistry` does `register`/`add`/`get`/`names` (a
+  unlabelled, `file_edit` returns `diff`, and `exec` returns `bash`; the generic
+  `Arguments:` JSON block is always labelled `json`), and `async execute(arguments)
+  -> str`; `spec()` builds the inner `function` block. `registry.ToolRegistry` does `register`/`add`/`get`/`names` (a
   `register()` of an invalid declared schema is a `ValueError`, checked with
   `jsonschema`'s `Draft202012Validator.check_schema`), `to_openai_schema(names=None)`
   (list of `{"type":"function","function":{...}}` — it honours the `names` set so a
@@ -990,10 +1004,11 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   state-changing built-ins: `/bin/sh -c` full shell, `ask`, a static
   catastrophic-command backstop (`tools/exec_policy.py`), arg-vector spawn,
   process-group kill on timeout/cancel, and tail-truncated output — added by
-  `build_default_tools(...)` **only when `enable_exec` is true**. The opt-in **`edit`**
-  tool (`tools/builtin/edit.py`) is the narrower second state-changing built-in (see
-  the [edit tool section](#status-phase-by-phase)). Both keep their path/command/content
-  **only** in the model-facing result, never in logs or the audit table. Phase-3
+  `build_default_tools(...)` **only when `enable_exec` is true**. The opt-in **`file`
+  toolset** (`tools/builtin/file.py`) is the narrower second state-changing built-in
+  (see the [file toolset section](#status-phase-by-phase)). Both keep their
+  path/command/content **only** in the model-facing result, never in logs or the audit
+  table. Phase-3
   sub-modules: `policy.py` (`ToolPermission`, `ToolPolicy`/`build_policy(overrides,
   registry=)` — precedence: config override > declared default, unknown tool → `ask`;
   `advertised_names()` drops `deny` tools; `parse_permission(raw)` parses one of
@@ -1728,32 +1743,36 @@ these startup-time settings.
   the pattern body), even when the tool is off. The denylist is a *backstop*, not a
   sandbox.
 
-### Edit file-tool knobs (opt-in)
+### File toolset knobs (opt-in)
 
-- **`ENABLE_EDIT_TOOL`** (default **`false`**): the opt-in switch for the `edit` file
-  tool. Off → `edit` is never registered, never advertised to the model, and its other
-  knobs are not validated (a default deployment stays write-free). On +
-  `ENABLE_TOOLS=true` → `build_default_tools(...)` adds `edit` (always `ask`).
-- **`EDIT_WORKDIR`** (default `None`): the confinement root every `edit` path must
-  resolve inside (relative to the working directory). **Required** when the tool is
-  enabled — it must be an **existing directory**, else a startup `ConfigError`
-  (fail-fast). This is deliberately stricter than the optional `EXEC_WORKDIR` (which
-  may be unset): a confinement root is `edit`'s security premise, so the operator must
-  explicitly choose it. Validated only when enabled.
-- **`MAX_EDIT_STRING_CHARS`** (default `2000`): the cap on a `replace`'s
-  `old_string` / `new_string`, **also baked into the parameter schema's
-  `maxLength`** — it bounds both the model's proposal and, with it, the approval card's
-  argument block (edit's `Action:` diff, which reuses the same length bound as the
+- **`ENABLE_FILE_TOOL`** (default **`false`**): the opt-in switch for the `file`
+  toolset. Off → the nine `file_*` tools are never registered, never advertised to the
+  model, and the other file knobs are not validated (a default deployment stays
+  write-free). On + `ENABLE_TOOLS=true` → `build_default_tools(...)` adds the `file`
+  toolset (`file_read` / `file_ls` `allow`, the other seven always `ask`).
+- **`FILE_WORKDIR`** (default `None`): the confinement root every `path` / `source` /
+  `target` must resolve inside (relative to the working directory). **Required** when
+  the toolset is enabled — it must be an **existing directory**, else a startup
+  `ConfigError` (fail-fast). This is deliberately stricter than the optional
+  `EXEC_WORKDIR` (which may be unset): a confinement root is the toolset's security
+  premise, so the operator must explicitly choose it. Validated only when enabled.
+- **`MAX_FILE_STRING_CHARS`** (default `2000`): the cap on a `file_edit`'s
+  `old_string` / `new_string`, **also baked into the parameter schema's `maxLength`**
+  — it bounds both the model's proposal and, with it, the approval card's argument
+  block (`file_edit`'s `Action:` diff, which reuses the same length bound as the
   generic JSON block). Must be `>= 1`; validated only when enabled.
-- **`MAX_EDIT_READ_CHARS`** (default `8000`): the cap on a `read` result's content
+- **`MAX_FILE_READ_CHARS`** (default `8000`): the cap on a `file_read` result's content
   before **tail-truncation** (a fixed `[N chars of earlier output truncated]` marker,
   not an error — the read was already human-approved). Must be `>= 1`; validated only
   when enabled.
+- **`MAX_FILE_LIST_ENTRIES`** (default `1000`): the cap on how many entries one
+  `file_ls` call returns; over it, entries are dropped and a `truncated` flag is set
+  (not an error). Must be `>= 1`; validated only when enabled.
 
-The exec and edit knobs come only from these startup-time settings; the model can
-never set them, and what it proposes (a command, or a path + old/new strings) is gated
-by the per-call `ask` approval (+ the static denylist for `exec`, + path confinement
-for `edit`), and never reaches the logs or the audit table.
+The exec and file knobs come only from these startup-time settings; the model can never
+set them, and what it proposes (a command, or a path / source / target + old/new
+strings) is gated by the per-call `ask` approval (+ the static denylist for `exec`, +
+path confinement for `file`), and never reaches the logs or the audit table.
 
 ---
 
@@ -2221,14 +2240,16 @@ A map of which behaviours each phase covers:
 ### Tool limitations (phase 2.1 + 3)
 
 - **Three read-only built-ins ship locally** (`get_current_time`, `echo`,
-  `system_info`), **plus two opt-in state-changing built-ins** — the `exec` shell tool
-  (off by default; `ENABLE_EXEC_TOOL=true` to enable) and the `edit` file tool (off by
-  default; `ENABLE_EDIT_TOOL=true` to enable). MCP tools (remote Streamable HTTP or
-  local stdio) and the phase-5.1 read-only SSH observation tools are optional and
-  operator-configured. The current release has no *built-in* network scanning,
-  arbitrary-command SSH, or Docker — by design; **`exec` (arbitrary shell, backstopped
-  by a static denylist) and `edit` (confined read/precise-replace in `EDIT_WORKDIR`)
-  are the two state-changing local capabilities, both opt-in and always `ask`**.
+  `system_info`), **plus two opt-in state-changing local capabilities** — the `exec`
+  shell tool (off by default; `ENABLE_EXEC_TOOL=true` to enable) and the `file`
+  toolset (off by default; `ENABLE_FILE_TOOL=true` to enable). MCP tools (remote
+  Streamable HTTP or local stdio) and the phase-5.1 read-only SSH observation tools
+  are optional and operator-configured. The current release has no *built-in* network
+  scanning, arbitrary-command SSH, or Docker — by design; **`exec` (arbitrary shell,
+  backstopped by a static denylist) and the `file` toolset (confined file/directory
+  operations in `FILE_WORKDIR`) are the two state-changing local capabilities, both
+  opt-in** (`exec` always `ask`; the `file` toolset is `allow` for `file_read` /
+  `file_ls` and always `ask` for the other seven).
 - **Argument validation is enforced** (phase 3): `function.arguments` is parsed as JSON
   and **schema-validated with `jsonschema` before `execute`** — malformed / non-object
   / missing-required / wrong-type / extra-property payloads are rejected (stable
@@ -2298,31 +2319,39 @@ A map of which behaviours each phase covers:
   sandbox / user-drop / cgroup / seccomp isolation: the blast radius of an approved
   command is the account the bot runs under, so it should not run as root, and the
   denylist is a last line, not a substitute for reading the approval card.
-- **`edit` (opt-in) is the second state-changing local tool, and deliberately a much
-  narrower capability than `exec`.** It reads a UTF-8 file or makes a **precise**
-  edit — `operation="read"` returns a file's content, `operation="replace"` swaps a
-  **unique** `old_string` for `new_string` (or every occurrence with
-  `replace_all`) — so the model can read and minimally edit a file *without writing
-  shell*. There is **no** whole-file write / append / move / copy / delete / mkdir
-  (those belong to `exec`). Limits: **off by default**
-  (`ENABLE_EDIT_TOOL=false` — a default deploy performs no file write at all),
-  **always `ask`** (every call needs a one-time human Approve; `path` /
-  `old_string` / `new_string` are shown verbatim on the approval card — `edit`
-  overrides the optional `approval_detail` hook to lay them out as a faithful
-  **git-diff-style** `Action:` block in place of the generic JSON, labelled `diff` for
-  syntax highlighting — the model can never grant itself approval), **path
-  confinement to `EDIT_WORKDIR`** (the core safety property: `_resolve` collapses
-  `..` and follows **symlinks** and refuses anything outside the root *before any
-  I/O* → `edit_path_escape`, **even after the owner approves**; `EDIT_WORKDIR` is a
-  **required** existing directory when the tool is enabled — stricter than the
-  optional `EXEC_WORKDIR`), **atomic writes** (same-dir temp + `fsync` +
-  `os.replace`, so a mid-write crash never leaves a half-written file), **exact-match
-  semantics** (`old_string` must be unique unless `replace_all` → `edit_not_found` /
-  `edit_not_unique`), and **two caps** (`MAX_EDIT_STRING_CHARS` on the replace strings,
-  also the schema `maxLength`; `MAX_EDIT_READ_CHARS` on a `read` result,
-  tail-truncated with the `[N chars … truncated]` marker). The path, file content, and
-  old/new strings are returned to the model **only** — never logged, never in the
-  audit table.
+- **`file` (opt-in) is the second state-changing local capability, and deliberately a
+  much narrower one than `exec`.** It is a **toolset of nine** tools that lets the
+  model do file/directory operations *without writing shell*: `file_read` (a UTF-8
+  file's content) and `file_ls` (a directory's entries) are **`allow`** (read-only, no
+  per-call approval); `file_edit` (a **precise** edit — swap a **unique**
+  `old_string` for `new_string`, or every occurrence with `replace_all`),
+  `file_mv` / `file_cp` (move / copy a file or dir, **no** overwrite; copying a dir
+  needs `recursive`), `file_rm` (delete a **regular file** only), `file_mkdir`
+  (create a dir, `parents` for intermediates), `file_rmdir` (delete an **empty** dir
+  only), and `file_touch` (create/refresh a file) are all **`ask`** — so the model can
+  read and minimally manage files *without writing shell*. There is **no** whole-file
+  write / append (those belong to `exec`). Limits: **off by default**
+  (`ENABLE_FILE_TOOL=false` — a default deploy performs no file write at all), the
+  seven mutating tools are **always `ask`** (every call needs a one-time human Approve;
+  `path` / `source` / `target` / `old_string` / `new_string` are shown verbatim on the
+  approval card — `file_edit` overrides the optional `approval_detail` hook to lay
+  them out as a faithful **git-diff-style** `Action:` block in place of the generic
+  JSON, labelled `diff` for syntax highlighting — the model can never grant itself
+  approval), **path confinement to `FILE_WORKDIR`** (the core safety property:
+  `_resolve` collapses `..` and follows **symlinks** and refuses anything outside the
+  root *before any I/O* → `file_path_escape`, **even after the owner approves**;
+  `FILE_WORKDIR` is a **required** existing directory when the toolset is enabled —
+  stricter than the optional `EXEC_WORKDIR`), **narrow verbs, no overwrite**
+  (`file_rm` never deletes a directory, `file_rmdir` only an empty one,
+  `file_mv` / `file_cp` refuse an existing target), **atomic writes** in `file_edit`
+  (same-dir temp + `fsync` + `os.replace`, so a mid-write crash never leaves a
+  half-written file), **exact-match semantics** (`old_string` must be unique unless
+  `replace_all` → `file_not_found` / `file_not_unique`), and **three caps**
+  (`MAX_FILE_STRING_CHARS` on the replace strings, also the schema `maxLength`;
+  `MAX_FILE_READ_CHARS` on a `file_read` result, tail-truncated with the `[N chars …
+  truncated]` marker; `MAX_FILE_LIST_ENTRIES` on a `file_ls` result, extra entries
+  dropped with a `truncated` flag). The path, file content, and old/new strings are
+  returned to the model **only** — never logged, never in the audit table.
 - Not implemented (out of scope so far): RAG, Web Search, streaming, and the
   autonomous self-driven loop.
 

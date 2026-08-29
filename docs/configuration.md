@@ -502,55 +502,67 @@ EXEC_POLICY_DENY_PATTERNS=["\\bdocker\\b","\\bkubectl\\b"]
 
 **说明**：追加到 `exec` 静态灾难性命令 denylist 的正则，JSON **字符串数组**。**add-only**：核心列表（`tools/exec_policy.py` 代码编译、恒生效）不可删，此旋钮只能追加。坏 JSON / 非数组 / 非字符串元素 / 空白元素 / 不合法正则 → 启动期 `ConfigError`（点名数组索引，**从不**回显 pattern 正文）；**始终**校验，即便 `ENABLE_EXEC_TOOL=false`。
 
-### Edit file tool（opt-in）
+### File toolset（opt-in）
 
-#### `ENABLE_EDIT_TOOL`
+#### `ENABLE_FILE_TOOL`
 
 **默认值**：`false`
 
 **示例**
 
 ```
-ENABLE_EDIT_TOOL=true
+ENABLE_FILE_TOOL=true
 ```
 
-**说明**：**可选 `edit` 文件编辑工具的开关**。`false` → 不注册、不广告、默认部署**零文件写入**；`true` + `ENABLE_TOOLS=true` → 注册 `edit`（在 `EDIT_WORKDIR` 内读 / 精确替换，**恒 `ask`**，每次调用需一次性人工审批、`path`/`old_string`/`new_string` 逐字展示在审批卡上）。它是比 `exec` **更窄**的能力——`operation="read"` 读 UTF-8 文件、`operation="replace"` 把**唯一**出现的 `old_string` 换成 `new_string`（或 `replace_all`）——**不做**整文件写入 / 追加 / 移动 / 复制 / 删除 / mkdir（那些属于 `exec`）。核心安全机制是**路径受限**：所有路径（含 `..` 与**指向外部的符号链接**）须解析在 `EDIT_WORKDIR` 内，否则在**任何 I/O 之前**被拒（`edit_path_escape`）——**即便你刚点了批准**也读不写不出。写入用**原子写**（同目录 temp + `fsync` + `os.replace`，中途被杀不留半截文件）。路径、文件内容与 old/new 串**只回模型，永不进日志、永不进审计表**。
+**说明**：**可选 `file` 文件工具集的开关**。`false` → 不注册、不广告、默认部署**零文件写入**；`true` + `ENABLE_TOOLS=true` → 注册九个 `file_*` 工具（在 `FILE_WORKDIR` 内做文件/目录操作：`file_read` / `file_ls` 只读、`allow`；其余 `file_edit` / `file_mv` / `file_cp` / `file_rm` / `file_mkdir` / `file_rmdir` / `file_touch` **恒 `ask`**，每次调用需一次性人工审批、`path` / `old_string` / `new_string` 逐字展示在审批卡上）。它是比 `exec` **更窄**的一组能力——`file_read` 读 UTF-8 文件、`file_ls` 列目录、`file_edit` 把**唯一**出现的 `old_string` 换成 `new_string`（或 `replace_all`）、`file_mv` / `file_cp` 移动 / 复制（不覆盖）、`file_rm` 仅删普通文件、`file_rmdir` 仅删空目录、`file_touch` 新建 / 刷新文件——**不做**整文件写入 / 追加（那些属于 `exec`）。核心安全机制是**路径受限**：所有路径（含 `..` 与**指向外部的符号链接**）须解析在 `FILE_WORKDIR` 内，否则在**任何 I/O 之前**被拒（`file_path_escape`）——**即便你刚点了批准**也读不写不出。写入用**原子写**（同目录 temp + `fsync` + `os.replace`，中途被杀不留半截文件）。路径、文件内容与 old/new 串**只回模型，永不进日志、永不进审计表**。
 
-#### `EDIT_WORKDIR`
+#### `FILE_WORKDIR`
 
 **默认值**：（无；启用时**必填**）
 
 **示例**
 
 ```
-EDIT_WORKDIR=./scratch
+FILE_WORKDIR=./scratch
 ```
 
-**说明**：`edit` 的路径受限根目录。启用时**必填**且必须是**已存在目录**（否则启动期 `ConfigError`，fail-fast）。比 `EXEC_WORKDIR`（可选）更严——限定目录是 `edit` 的安全前提，强制属主显式选择编辑根。仅在 `ENABLE_EDIT_TOOL=true` 时校验。
+**说明**：`file` 工具集的路径受限根目录。启用时**必填**且必须是**已存在目录**（否则启动期 `ConfigError`，fail-fast）。比 `EXEC_WORKDIR`（可选）更严——限定目录是 `file` 工具集的安全前提，强制属主显式选择文件根。仅在 `ENABLE_FILE_TOOL=true` 时校验。
 
-#### `MAX_EDIT_STRING_CHARS`
+#### `MAX_FILE_STRING_CHARS`
 
 **默认值**：`2000`
 
 **示例**
 
 ```
-MAX_EDIT_STRING_CHARS=2000
+MAX_FILE_STRING_CHARS=2000
 ```
 
-**说明**：`edit` 的 `replace` 中 `old_string`/`new_string` 各自的长度上限。同时烧进参数 schema 的 `maxLength`——既约束模型提案，也把审批卡的参数视图（`edit` 的 `Action:` diff）压到有界尺寸。`>= 1`；仅在 `ENABLE_EDIT_TOOL=true` 时校验。
+**说明**：`file_edit` 中 `old_string` / `new_string` 各自的长度上限。同时烧进参数 schema 的 `maxLength`——既约束模型提案，也把审批卡的参数视图（`file_edit` 的 `Action:` diff）压到有界尺寸。`>= 1`；仅在 `ENABLE_FILE_TOOL=true` 时校验。
 
-#### `MAX_EDIT_READ_CHARS`
+#### `MAX_FILE_READ_CHARS`
 
 **默认值**：`8000`
 
 **示例**
 
 ```
-MAX_EDIT_READ_CHARS=8000
+MAX_FILE_READ_CHARS=8000
 ```
 
-**说明**：`edit` 的 `read` 结果内容的**尾截断**上限。超限时保留**尾部** N 字符并前置固定标记 `[N chars of earlier output truncated]`（**不是**报错，也不按稳定码拒绝——因为这次读已被人工批准）。`>= 1`；仅在 `ENABLE_EDIT_TOOL=true` 时校验。
+**说明**：`file_read` 结果内容的**尾截断**上限。超限时保留**尾部** N 字符并前置固定标记 `[N chars of earlier output truncated]`（**不是**报错，也不按稳定码拒绝——因为这次读已被人工批准）。`>= 1`；仅在 `ENABLE_FILE_TOOL=true` 时校验。
+
+#### `MAX_FILE_LIST_ENTRIES`
+
+**默认值**：`1000`
+
+**示例**
+
+```
+MAX_FILE_LIST_ENTRIES=1000
+```
+
+**说明**：`file_ls` 单次返回的最大条目数。超出的条目被截断并置 `truncated: true` 标志（**不是**报错）。`>= 1`；仅在 `ENABLE_FILE_TOOL=true` 时校验。
 
 ### Multimodal input
 
@@ -695,7 +707,7 @@ TZ=Asia/Shanghai
 - OAuth 项：`OAUTH_CALLBACK_BASE_URL` 非空时必须是裸 origin（绝对 `http(s)://` + host、无 userinfo/path/query/fragment/末尾斜杠），否则 `ConfigError`；`OAUTH_CALLBACK_PORT` 须 `1..65535`；`OAUTH_STATE_TTL_SECONDS` 必须 `> 0`。Google client id / secret 缺失**不是**错误——只是 google provider 未配置。
 - Infra 项：`INFRA_SSH_CONNECT_TIMEOUT_SECONDS` 必须为正、`MAX_INFRA_TOOL_RESULT_CHARS` 必须 `>= 1`，且 `INFRA_SSH_CONNECT_TIMEOUT_SECONDS <= TOOL_TIMEOUT_SECONDS`（跨项不变量）——违反任一即 `ConfigError`。目标列表的**来源**（`INFRA_SSH_TARGETS_FILE` 设置时优先，否则默认文件 `config/infra_ssh_targets.json` 存在时读它，否则内联 `INFRA_SSH_TARGETS`）与 `MCP_SERVERS_FILE` 同思路：`INFRA_SSH_TARGETS_FILE` 设置了却**不存在 / 不可读 / 为空（0 字节或空白）**同样 `ConfigError`（点名路径，绝不静默禁用 provider；文件里显式 `[]` 表示无目标）；默认文件**存在但为空**同样 `ConfigError`（存在但空不得静默当作「无目标」）。解析出的**结构**在 `load_config` 里强校验：非法 JSON、非数组、非对象条目、坏/重复 `name`、坏 `host`（含 user/port/路径/空白）、非 int 或越界 `port`、坏 `username`、缺失/含 `..`/软链/目录的 key 或 known_hosts 文件（路径**绝对或相对工作目录**均可）、空的 known_hosts、坏/超长 `mounts`/`services`——都 `ConfigError`。报错只点名目标（或其索引）与字段，**从不**回显 host、key 路径、known_hosts 路径或 mount 路径（service/单元名可作为操作者自选的非秘密值出现）。
 - `exec` 项：`MAX_EXEC_TOOL_RESULT_CHARS` 必须 `>= 1`、`EXEC_WORKDIR` 若设置必须是**已存在目录**——两者**仅当 `ENABLE_EXEC_TOOL=true`** 时校验（沿用「关闭的可选能力不强制其配置」惯例，关闭时设不设置都不影响启动）。`EXEC_POLICY_DENY_PATTERNS` **始终**强校验（即便 `ENABLE_EXEC_TOOL=false`）：非法 JSON、非数组、非字符串元素、空白元素，或不合法的正则 → `ConfigError`（点名数组**索引**，**从不**回显 pattern 正文）。
-- `edit` 项：`MAX_EDIT_STRING_CHARS` 与 `MAX_EDIT_READ_CHARS` 都必须 `>= 1`，且 `EDIT_WORKDIR` 必须是**已存在目录**（**必填**，缺省/空白也报错）——三者**仅当 `ENABLE_EDIT_TOOL=true`** 时校验（沿用「关闭的可选能力不强制其配置」惯例，关闭时设不设置都不影响启动）。比 `exec` 严格在 `EDIT_WORKDIR` 上：`EXEC_WORKDIR` 可缺省（=进程 cwd），而 `EDIT_WORKDIR` 因是 `edit` 路径受限的安全前提，启用即强制。
+- `file` 项：`MAX_FILE_STRING_CHARS` / `MAX_FILE_READ_CHARS` / `MAX_FILE_LIST_ENTRIES` 都必须 `>= 1`，且 `FILE_WORKDIR` 必须是**已存在目录**（**必填**，缺省/空白也报错）——四者**仅当 `ENABLE_FILE_TOOL=true`** 时校验（沿用「关闭的可选能力不强制其配置」惯例，关闭时设不设置都不影响启动）。比 `exec` 严格在 `FILE_WORKDIR` 上：`EXEC_WORKDIR` 可缺省（=进程 cwd），而 `FILE_WORKDIR` 因是 `file` 工具集路径受限的安全前提，启用即强制。
 
 ## System Prompt
 

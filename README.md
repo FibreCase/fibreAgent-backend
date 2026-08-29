@@ -4,7 +4,7 @@
 
 一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**：在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失；Agent 可以调用少量安全的内置工具来回答问题，也支持**图片输入**（收到的图片持久化、重启后仍在上下文里作为图片交给模型），还能用 `/remember` **显式保存长期记忆**（账号隔离、跨 `/new` 与重启保留）。
 
-> **默认部署只做只读/无害操作**：内置的 `get_current_time` / `echo` / `system_info` 都是只读、无副作用；默认**不** spawn 子进程、**不**写文件、**不**联网扫描。两个**默认关闭（opt-in）**的状态变更工具 `exec`（跑 shell 命令）与 `edit`（`EDIT_WORKDIR` 内读文件 / 精确替换）需显式开启，且**每次调用都需人工审批**（`ask`）——安全细节见 [工具与工具安全](docs/tools.md)。
+> **默认部署只做只读/无害操作**：内置的 `get_current_time` / `echo` / `system_info` 都是只读、无副作用；默认**不** spawn 子进程、**不**写文件、**不**联网扫描。两个**默认关闭（opt-in）**的状态变更能力 `exec`（跑 shell 命令）与 `file` 工具集（`FILE_WORKDIR` 内做文件/目录操作，`file_read` / `file_ls` 只读、`allow`，其余 `ask`）需显式开启；除只读的 `file_read` / `file_ls` 外**每次调用都需人工审批**（`ask`）——安全细节见 [工具与工具安全](docs/tools.md)。
 
 ## 架构
 
@@ -85,6 +85,6 @@ uv run python -m fibrecase_agent_backend
 
 ## 当前开发状态
 
-已在 Telegram 上跑通、全部通过测试的最小个人 Agent backend。核心能力：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio，默认 `ask`）+ **MCP 用户级 OAuth**、**只读基础设施观测（SSH）**、**可选的 `exec` shell 工具**与**可选的 `edit` 文件编辑工具**（两者均**默认关闭**、每次调用恒需人工审批）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。
+已在 Telegram 上跑通、全部通过测试的最小个人 Agent backend。核心能力：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio，默认 `ask`）+ **MCP 用户级 OAuth**、**只读基础设施观测（SSH）**、**可选的 `exec` shell 工具**与**可选的 `file` 文件工具集**（两者均**默认关闭**；`file` 里 `file_read` / `file_ls` 只读免审批，其余每次调用恒需人工审批）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。
 
-> **默认部署零子进程、零文件写入、零联网扫描**——两个状态变更工具 `exec` / `edit` 是 opt-in 的（`ENABLE_EXEC_TOOL` / `ENABLE_EDIT_TOOL`），且各自带静态兜底（`exec` 的危险命令 denylist、`edit` 的 `EDIT_WORKDIR` 路径受限）与逐次审批。**完整的能力清单、安全说明、有意不做 / 限制与下一步，见 [当前开发状态](docs/status.md)；`exec` / `edit` 的安全细节见 [工具与工具安全](docs/tools.md)。**
+> **默认部署零子进程、零文件写入、零联网扫描**——两个状态变更能力 `exec` / `file` 是 opt-in 的（`ENABLE_EXEC_TOOL` / `ENABLE_FILE_TOOL`），且各自带静态兜底（`exec` 的危险命令 denylist、`file` 的 `FILE_WORKDIR` 路径受限）与逐次审批。**完整的能力清单、安全说明、有意不做 / 限制与下一步，见 [当前开发状态](docs/status.md)；`exec` / `file` 的安全细节见 [工具与工具安全](docs/tools.md)。**

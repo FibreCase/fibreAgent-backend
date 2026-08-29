@@ -13,7 +13,7 @@ without touching the Telegram layer:
 
 ```
 Telegram Adapter → Agent Service → Tool Loop Runtime → LLM Client → Persistent Conversation (SQLite)
-   (→ AgentMessage: text/image)      ↑ drives Tool Registry (get_current_time / echo / system_info / [exec] / [edit] / mcp_… / infra_…)
+   (→ AgentMessage: text/image)      ↑ drives Tool Registry (get_current_time / echo / system_info / [exec] / [file] / mcp_… / infra_…)
 ```
 
 ### Where to read
@@ -158,8 +158,8 @@ Rules:
   - `approval_detail(arguments) -> str | None` — a **faithful, plain-text** argument
     view that, when non-`None`, **replaces** the generic `Arguments:` JSON under an
     `Action:` label. Show the real values verbatim (never a lossy paraphrase); the
-    provider HTML-escapes + length-bounds + drops it on finalisation. (`edit` shows a
-    git-diff, `exec` shows a `$ …` bash block.) Default `None` → generic JSON.
+    provider HTML-escapes + length-bounds + drops it on finalisation. (`file_edit`
+    shows a git-diff, `exec` shows a `$ …` bash block.) Default `None` → generic JSON.
   - `approval_language(arguments) -> str | None` — a **fixed** Pygments language name
     (`diff` / `bash` / `json` / …) so Telegram syntax-highlights the block. It must be
     a fixed vocabulary declared by the tool, **never** derived from argument content
@@ -172,7 +172,7 @@ Rules:
 Every call is JSON-Schema-validated, wrapped in a per-tool timeout, policy-gated
 (allow/ask/deny), and audited automatically — there is nothing extra to wire. See the
 **[Per-module reference → `tools/`](docs/developer-reference.md#per-module-reference)**
-and the `exec` / `edit` sections for worked examples of the two opt-in state-changing
+and the `exec` / `file` sections for worked examples of the two opt-in state-changing
 built-ins.
 
 ---
