@@ -49,7 +49,7 @@ cp .env.example .env
 | `EXEC_POLICY_DENY_PATTERNS` | 追加到 `exec` 静态灾难性命令 denylist 的正则，JSON **字符串数组**，默认空。**add-only**：核心列表（`tools/exec_policy.py` 代码编译、恒生效）不可删，此旋钮只能追加。坏 JSON / 非数组 / 非字符串元素 / 空白元素 / 不合法正则 → 启动期 `ConfigError`（点名数组索引，**从不**回显 pattern 正文）；**始终**校验，即便 `ENABLE_EXEC_TOOL=false`。 |
 | `ENABLE_EDIT_TOOL` | **可选 `edit` 文件编辑工具的开关**，默认 `false`。`false` → 不注册、不广告、默认部署**零文件写入**；`true` + `ENABLE_TOOLS=true` → 注册 `edit`（在 `EDIT_WORKDIR` 内读 / 精确替换，**恒 `ask`**，每次调用需一次性人工审批、`path`/`old_string`/`new_string` 逐字展示）。建议用 `EDIT_WORKDIR` 指定一个明确的编辑根目录。 |
 | `EDIT_WORKDIR` | `edit` 的路径受限根目录。**启用时必填**且必须是**已存在目录**（否则启动期 `ConfigError`，fail-fast）。比 `EXEC_WORKDIR`（可选）更严——限定目录是 `edit` 的安全前提，强制属主显式选择编辑根；`..` 逃逸与指向外部的符号链接在此目录外被拒（任何 I/O 之前）。仅在 `ENABLE_EDIT_TOOL=true` 时校验。 |
-| `MAX_EDIT_STRING_CHARS` | `edit` 的 `replace` 中 `old_string`/`new_string` 各自的长度上限，默认 `2000`。同时烧进参数 schema 的 `maxLength`——既约束模型提案，也把审批卡 `Arguments:` 块压到有界尺寸。`>= 1`；仅在 `ENABLE_EDIT_TOOL=true` 时校验。 |
+| `MAX_EDIT_STRING_CHARS` | `edit` 的 `replace` 中 `old_string`/`new_string` 各自的长度上限，默认 `2000`。同时烧进参数 schema 的 `maxLength`——既约束模型提案，也把审批卡的参数视图（`edit` 的 `Action:` diff）压到有界尺寸。`>= 1`；仅在 `ENABLE_EDIT_TOOL=true` 时校验。 |
 | `MAX_EDIT_READ_CHARS` | `edit` 的 `read` 结果内容的**尾截断**上限，默认 `8000`。超限时保留**尾部** N 字符并前置固定标记 `[N chars of earlier output truncated]`（**不是**报错，也不按稳定码拒绝——因为这次读已被人工批准）。`>= 1`；仅在 `ENABLE_EDIT_TOOL=true` 时校验。 |
 | `MAX_IMAGE_SIZE_MB` | 单张 Telegram 图片的最大字节数（MB），默认 `10`。超过则返回「图片过大，暂时无法处理。」，不会发给模型。 |
 | `ATTACHMENT_STORAGE_PATH` | 持久化图片附件 blob 的根目录，默认 `./data/attachments`（相对工作目录，目录按需自动创建）。图片**字节**存在这里（按 SHA-256 内容寻址、去重、原子写入），数据库里只存元数据。Docker 下默认路径落在 `./data` 绑定挂载内，随容器持久化。 |

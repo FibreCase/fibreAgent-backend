@@ -4,8 +4,7 @@
 
 一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**：在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失；Agent 可以调用少量安全的内置工具来回答问题，也支持**图片输入**（收到的图片持久化、重启后仍在上下文里作为图片交给模型），还能用 `/remember` **显式保存长期记忆**（账号隔离、跨 `/new` 与重启保留）。
 
-> **重要：当前内置工具仅限只读/无害操作**：`get_current_time`（当前时间）、`echo`（回显）、`system_info`（主机名/平台/Python 版本）。
-> 它**不能**执行命令、控制设备、读写文件、联网扫描。如果用户要求超出工具能力的操作，它会明确说明「当前尚未配置相应工具」。
+> **重要：默认部署只做只读/无害操作**：内置的 `get_current_time`（当前时间）、`echo`（回显）、`system_info`（主机名/平台/Python 版本）都是只读、无副作用的；默认**不** spawn 子进程、**不**写文件、**不**联网扫描。另有**两个默认关闭（opt-in）的状态变更内置工具**——`exec`（`ENABLE_EXEC_TOOL=true`，跑一条 shell 命令）与 `edit`（`ENABLE_EDIT_TOOL=true`，在 `EDIT_WORKDIR` 内读文件 / 精确替换）——两者都**恒需人工审批**（`ask`），不开则不注册、不广告。它们让 Agent 能真正执行命令、读写文件，因此刻意做成开关式而非默认开启。其余超出当前工具能力的操作，它会明确说明「当前尚未配置相应工具」。
 
 ## 架构
 
@@ -86,7 +85,7 @@ uv run python -m fibrecase_agent_backend
 | [Architecture](docs/architecture.md) | 分层、模块地图、扩展方式（工具 / 多模态 / RAG）、不变量 |
 | [Configuration](docs/configuration.md) | 全部环境变量参考、校验规则、system prompt |
 | [Telegram 接入](docs/telegram.md) | Bot 创建、启动、完整命令参考 |
-| [数据库](docs/database.md) | `conversations` / `messages` / `attachments` / `memories` / `tool_audit_events` 表结构 |
+| [数据库](docs/database.md) | `conversations` / `messages` / `attachments` / `memories` / `tool_audit_events` / `oauth_credentials` / `oauth_authorization_states` 表结构 |
 | [工具与工具安全](docs/tools.md) | 工具循环、allow/ask/deny、Schema 校验、一次性审批、超时、审计、加新工具 |
 | [远程 MCP 工具](docs/mcp.md) | Streamable HTTP + stdio 启动发现、命名空间、默认 `ask`、复用工具安全边界、`/mcp_status` |
 | [多模态与附件](docs/multimodal.md) | 图片输入、内容寻址 blob 存储、重入窗、`/new` 回收 |

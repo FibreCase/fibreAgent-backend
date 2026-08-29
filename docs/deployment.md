@@ -22,7 +22,7 @@ docker compose down                    # 停止（数据卷保留）
   - 设好 `HOST_UID/HOST_GID` 后直接 `docker compose up -d --build` 即可；`data/` 若不存在，`create_engine` 会自动建（首次可能由 root 建为空目录，属主随你而变，一般无碍）。
   - 若你坚持容器用固定的专用 uid 而不想以宿主用户跑，那就改用**命名卷** `-v agent-data:/app/data`：Docker 首次使用会按镜像里 `/app/data` 的属主初始化，省去宿主 chown；代价是查库要走 `docker volume inspect` / 辅助容器，不能直接 `ls ./data`。
 - **系统提示词**：镜像里已内置 `config/system_prompt.txt`（`WORKDIR=/app`，与 `.env` 中 `SYSTEM_PROMPT_PATH` 的相对路径一致）。想临时改用别的文件而不重建镜像，可在 compose 里加一行挂载（文件内已注明）。
-- **时区**：`python:slim` 镜像默认是 **UTC**，所以容器里的 `get_current_time`（`datetime.now()`）和日志时间戳会跟你的墙钟差几个小时。compose 通过 `environment: TZ=${TZ:-Asia/Shanghai}` 注入时区（镜像自带 `tzdata`）。把 `.env` 里 `TZ` 改成你的 IANA 时区（如 `Asia/Shanghai`）即可与宿主一致。**用 `TZ` 而不是挂载 `/etc/localtime`**，因为 macOS 上根本没有 `/etc/localtime` 可挂，Linux 上挂载也只会影响 `TZ=...` 未设置时的兜底。仅影响 Docker；本地 `uv run` 直接用宿主时区，无需设置。
+- **时区**：`python:3.14-slim` 镜像默认是 **UTC**，所以容器里的 `get_current_time`（`datetime.now()`）和日志时间戳会跟你的墙钟差几个小时。compose 通过 `environment: TZ=${TZ:-Asia/Shanghai}` 注入时区（镜像自带 `tzdata`）。把 `.env` 里 `TZ` 改成你的 IANA 时区（如 `Asia/Shanghai`）即可与宿主一致。**用 `TZ` 而不是挂载 `/etc/localtime`**，因为 macOS 上根本没有 `/etc/localtime` 可挂，Linux 上挂载也只会影响 `TZ=...` 未设置时的兜底。仅影响 Docker；本地 `uv run` 直接用宿主时区，无需设置。
 - **优雅停机**：`docker stop` / `compose down` 发 SIGTERM，PTB 会捕获并触发 `post_shutdown`（关闭审批 broker、LLM 客户端与数据库连接），不会丢正在写的 SQLite 数据。
 
 ## OAuth 回调端口（phase 4.x）
