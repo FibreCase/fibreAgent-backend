@@ -4,7 +4,7 @@
 
 一个运行在你自己服务器上的**最小可用的个人 AI Agent Backend**：在 Telegram 里和一个基于 OpenAI 兼容模型的 Agent 对话，**对话历史持久化**——重启后上下文不丢失；Agent 可以调用少量安全的内置工具来回答问题，也支持**图片输入**（收到的图片持久化、重启后仍在上下文里作为图片交给模型），还能用 `/remember` **显式保存长期记忆**（账号隔离、跨 `/new` 与重启保留）。
 
-> **重要：默认部署只做只读/无害操作**：内置的 `get_current_time`（当前时间）、`echo`（回显）、`system_info`（主机名/平台/Python 版本）都是只读、无副作用的；默认**不** spawn 子进程、**不**写文件、**不**联网扫描。另有**两个默认关闭（opt-in）的状态变更内置工具**——`exec`（`ENABLE_EXEC_TOOL=true`，跑一条 shell 命令）与 `edit`（`ENABLE_EDIT_TOOL=true`，在 `EDIT_WORKDIR` 内读文件 / 精确替换）——两者都**恒需人工审批**（`ask`），不开则不注册、不广告。它们让 Agent 能真正执行命令、读写文件，因此刻意做成开关式而非默认开启。其余超出当前工具能力的操作，它会明确说明「当前尚未配置相应工具」。
+> **默认部署只做只读/无害操作**：内置的 `get_current_time` / `echo` / `system_info` 都是只读、无副作用；默认**不** spawn 子进程、**不**写文件、**不**联网扫描。两个**默认关闭（opt-in）**的状态变更工具 `exec`（跑 shell 命令）与 `edit`（`EDIT_WORKDIR` 内读文件 / 精确替换）需显式开启，且**每次调用都需人工审批**（`ask`）——安全细节见 [工具与工具安全](docs/tools.md)。
 
 ## 架构
 
@@ -18,15 +18,13 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 ```
 
 - 通过 **Telegram Bot**（long polling）对话；用 **OpenAI 兼容** LLM 生成回复。
-- **工具调用 + 工具安全**：`allow`/`ask`/`deny` 策略 → JSON Schema 校验 → 需要时的一次性 Telegram 人工审批 → 单工具超时 → 只记元数据的 append-only 审计（`/tool_audit` 查看，绝不显示参数/结果）。
-- **远程 MCP 工具（Streamable HTTP + stdio 本地进程）**：启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并注册进同一个 registry（`mcp_<server>__<remote>`、默认 `ask`），因此**完全复用**上面的工具安全边界——MCP 只是又一个工具 provider，`/mcp_status` 只读查看状态。
-- **只读基础设施观测（SSH）**：对运维配置的 SSH 目标，各产出三个**固定、无参、只读**工具（主机 / 挂载磁盘 / systemd 服务状态，`infra_<target>__host_status` 等；严格只读，默认 `allow` 无需每次审批），经主机密钥固定、纯 key 的短命 AsyncSSH 连接取状态——注册进同一个 registry，**完全复用**上面的工具安全边界；模型无法指任何 host/path/service/command，`/infra_status` 只读显示已配置的目标与工具（不连接、不探活）。
-- **MCP 用户级 OAuth（per Telegram user）**：`/mcp auth <server>` 给**你**一个第三方 OAuth 登录按钮（首个实现：Google），凭据按 Telegram user 绑定、自动刷新 access token，后续 MCP 调用自动带上你自己的 token；`/new` 与重启都**不**影响登录状态。
-- **图片输入 + 持久化**：照片（可带说明文字）base64 内联交给模型，并以内容寻址 blob 落盘（SHA-256 去重、原子写入），重启后仍在窗口内时重新入窗。
+- **工具调用 + 工具安全**：每次调用都过一道统一边界——`allow`/`ask`/`deny` 策略 → JSON Schema 校验 → 需要时的一次性人工审批 → 单工具超时 → 只记元数据的 append-only 审计（`/tool_audit` 查看，绝不显示参数/结果）。
+- **远程 MCP 工具**（Streamable HTTP + stdio 本地进程）：启动时把发现的工具注册进同一个 registry（`mcp_<server>__<remote>`、默认 `ask`），**完全复用**上面的安全边界——MCP 只是又一个工具 provider；支持 **per-user OAuth**（`/mcp auth`，凭据绑定到你的账号、自动刷新，`/new` 与重启不影响登录态）。`/mcp_status` 只读查看状态。
+- **只读基础设施观测（SSH）**：对运维配置的目标各产出三个**固定、无参、只读**工具（主机 / 磁盘 / systemd 服务状态，默认 `allow` 无需审批），同样复用上面的安全边界——模型无法指定 host/path/service。`/infra_status` 只读查看（不连接、不探活）。
+- **图片输入 + 持久化**：照片（可带说明）base64 交给模型，并以内容寻址 blob 落盘（SHA-256 去重、原子写），重启后仍在窗口内时重新入窗。
 - **上下文预算管理**：消息数窗口之上再有一道模型无关的估算 token 预算，必要时把历史图片降级为纯文本，绝不让超长请求打爆端点。
 - **显式长期记忆**：`/remember` 显式保存，纯词法检索，跨 `/new` 与重启保留，作为一条明确标注的参考消息注入（不是自动摘要、不是 RAG）。
-- **Markdown 自动渲染**：模型回复的加粗/斜体/代码块/链接/标题转成 Telegram HTML 显示，无法解析时回退纯文本，回复永不丢失。
-- **最终回答引用你的消息**：模型的最后一条回答以 Telegram Reply 引用你发的那条消息（长回复只在首段引用一次）；命令回执、错误提示等不会引用。
+- **Markdown 自动渲染**：模型回复的加粗/斜体/代码块/链接转成 Telegram HTML，无法解析时回退纯文本，回复永不丢失；最终回答以 Reply 引用你发的那条消息（长回复只在首段引用一次）。
 - 仅允许你配置的 Telegram User ID 使用，其他人静默拒绝。
 
 ## 快速开始
@@ -51,7 +49,7 @@ uv run python -m fibrecase_agent_backend
 | --- | --- |
 | `/start` | 启动 Agent / 查看当前会话 |
 | `/new` | 开始新会话，清空本 chat 历史（**不影响**长期记忆） |
-| `/stop` | 打断本 chat 正在生成/执行工具的回复（取消这一轮、停止打字、释放会话锁；被中断的那一轮会发一条**引用原消息的 Reply**：「⛔️ **Interrupted.**」）；无进行中回复时回复「Nothing to stop.」。只停生成，不清会话/记忆，只影响本 chat |
+| `/stop` | 打断本 chat 正在生成/执行工具的回复；被中断的那一轮会发一条引用原消息的 Reply「⛔️ **Interrupted.**」，无进行中回复时回复「Nothing to stop.」。只停生成、不清会话/记忆、只影响本 chat |
 | `/context` | 只读预览当前上下文窗口：消息数、估算 token 占用/剩余、历史图片保留/降级数 |
 | `/remember <内容>` | 保存一条长期记忆到你的账号（跨 `/new` 与重启）；回显 ID |
 | `/memories` | 列出你保存的所有记忆 |
@@ -60,22 +58,12 @@ uv run python -m fibrecase_agent_backend
 | `/status` | 查看运行状态（版本、模型、会话 id、消息数） |
 | `/tool_audit [limit]` | 查看你本人的工具执行审计（只显工具名/事件/结果码/耗时） |
 | `/mcp` | 只读查看 MCP 服务器状态，并显示**你本人**在各 OAuth 服务器上的登录状态 |
-| `/mcp auth <server>` | 为你的账号发起第三方 OAuth 登录（如 `gcal` → Google 日历），返回一个**登录按钮**（无需复制 URL）；凭据绑定到你的 Telegram user，自动刷新 |
+| `/mcp auth <server>` | 为你的账号发起第三方 OAuth 登录（如 `gcal`），返回一个**登录按钮**（无需复制 URL）；凭据绑定到你的账号、自动刷新 |
 | `/mcp_status` | 只读查看已配置远程 MCP 服务器状态（available/unavailable、工具数、总数）；不发起连接、不显示 URL/token |
-| `/infra_status` | 只读查看已配置的 SSH 观测目标及其三个工具（read-only）；不连接、不探活、不显示 host/路径 |
+| `/infra_status` | 只读查看已配置的 SSH 观测目标及其三个工具（read-only）；不连接、不探活 |
 | `/help` | 列出帮助 |
 
 其它任何文字消息都会作为对话发给 Agent。完整说明见 [Telegram 接入与命令](docs/telegram.md)。
-
-## MCP 用户级 OAuth（phase 4.x）
-
-给 MCP 服务器配上**用户级 OAuth** 后（如 Google 日历），凭据按 **Telegram user** 绑定：
-
-- `/mcp auth <server>`（如 `/mcp auth gcal`）会返回一个 **Google OAuth 登录按钮**——点一下就完成登录，**无需复制 URL**。
-- 登录后，该用户后续对这个 MCP 服务器的调用**自动带上他自己的 token**（access token 过期自动刷新、刷新失败不删凭据）。
-- `/new`、`/start`、**重启**都**不会**清除或影响 OAuth 登录状态；换账号/换服务器重新 `/mcp auth` 即可覆盖。
-- 回调地址是 `https://<your-domain>/oauth/callback`（即 `OAUTH_CALLBACK_BASE_URL` + `/oauth/callback`），**必须能被 Google 公网访问**——内网/localhost 直连不行的话，用反代/隧道把它暴露出去，并在 Google Cloud 控制台登记这个精确的 redirect URI。
-- 需要配置：`OAUTH_CALLBACK_BASE_URL`（空 = OAuth 整体关闭）、`GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`、`GOOGLE_OAUTH_SCOPES`（留空 = 日历只读）。详见 [Configuration](docs/configuration.md) 与 [远程 MCP 工具](docs/mcp.md)。
 
 ## 文档
 
@@ -97,12 +85,6 @@ uv run python -m fibrecase_agent_backend
 
 ## 当前开发状态
 
-已在 Telegram 上跑通的最小个人 Agent backend。**能做的**：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio 本地进程，默认 `ask` 审批）+ **MCP 用户级 OAuth**（仅 http 传输，per Telegram user 凭据、自动刷新、`/new` 与重启不影响登录态）、**只读基础设施观测（SSH）**（每个目标三个固定无参只读工具：主机/磁盘/systemd 服务状态，严格只读默认 `allow`、无需每次审批，复用完整工具安全边界）、**可选的 shell `exec` 工具**（**默认关闭**，`ENABLE_EXEC_TOOL=true` 开启；`/bin/sh -c` 完整 shell，每次调用必须人工审批、命令逐字展示，另有静态危险命令兜底）、**可选的文件编辑 `edit` 工具**（**默认关闭**，`ENABLE_EDIT_TOOL=true` 开启；在 `EDIT_WORKDIR` 内读文件 / 精确替换，路径受限防 `../` 与符号链接逃逸，每次调用必须人工审批）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。**有意不做**：本地内置 3 个只读工具 + **默认关闭的可选 `exec` / `edit`**（两个状态变更能力，均 opt-in + 恒 `ask`，见下方安全说明）+ SSH 观测仅固定的 host/disk/service 三个无参工具（无内置联网扫描/Docker；`exec` 是任意命令、`edit` 是受限的读/精确改）、图片仅本地磁盘仅照片、估算是模型无关的保守值非计费 token、记忆是显式 + 纯词法（跨语言召回弱）、OAuth 仅 http 传输 + 用户级（无群组/共享/多账号切换，无 Web 面板）。
+已在 Telegram 上跑通、全部通过测试的最小个人 Agent backend。核心能力：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio，默认 `ask`）+ **MCP 用户级 OAuth**、**只读基础设施观测（SSH）**、**可选的 `exec` shell 工具**与**可选的 `edit` 文件编辑工具**（两者均**默认关闭**、每次调用恒需人工审批）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。
 
-> **关于 `exec`（安全说明）**：`exec` 是首个会在宿主机上**真正 spawn 子进程**的能力，**默认关闭**——不开则仍是"零子进程"。开启后 Agent 可在**逐次人工审批**下执行任意 shell 工作（装软件、改文件、管服务）。风险：一条被误批的命令，其爆炸半径 = bot 运行账号（若以 root 运行则整机）；`exec` 的静态 denylist 是**兜底而非沙箱**（只挡一批灾难性命令，无法理解意图）。缓解：逐次 `ask` 审批（命令逐字可见）+ 静态 denylist 兜底 + 超时/取消时**整棵子进程组被杀**（不留孤儿）+ 输出尾截断 + 命令与 stdout/stderr **永不进日志/审计表**。建议 bot **不以 root 运行**，并用 `EXEC_WORKDIR` 指定一个 scratch 目录。
-
-> **关于 `edit`（安全说明）**：`edit` 是第二个**状态变更**本地能力，**默认关闭**——不开则仍是"零文件写入"。开启后 Agent 可在**逐次人工审批**下，于 `EDIT_WORKDIR` 内**读 UTF-8 文本文件**（`read`）或做**精确替换**（`replace`：`old_string` 须唯一，或 `replace_all`）。它是比 `exec` **更窄**的能力：不做整文件写入 / 追加 / 移动 / 删除（删除等交给 `exec`）。核心安全机制是**路径受限**：所有路径须解析在 `EDIT_WORKDIR` 内，`../` 与**指向外部的符号链接**在任何 I/O 之前被拒（即便误批也读不写不出）。其余缓解：恒 `ask`（`path`/`old_string`/`new_string` 逐字展示在审批卡）+ **原子写**（同目录 temp + `fsync` + `os.replace`，中途被杀不留半截文件）+ `MAX_EDIT_STRING_CHARS` / `MAX_EDIT_READ_CHARS` 上限 + 文件内容**只回模型，永不进日志/审计表**。`EDIT_WORKDIR` 启用时**必填**（须为已存在目录）。
-
-**下一步（建议顺序）**：新的 `ContentPart` 类型（File / Audio / Video / Sticker，复用同一套附件存储）；有副作用的本地工具（Docker / Pi）以 Tool Provider 接入同一接口，默认进 `ask` 审批。
-
-完整版（含逐条能力、限制、未涉及清单）见 [当前开发状态](docs/status.md)。
+> **默认部署零子进程、零文件写入、零联网扫描**——两个状态变更工具 `exec` / `edit` 是 opt-in 的（`ENABLE_EXEC_TOOL` / `ENABLE_EDIT_TOOL`），且各自带静态兜底（`exec` 的危险命令 denylist、`edit` 的 `EDIT_WORKDIR` 路径受限）与逐次审批。**完整的能力清单、安全说明、有意不做 / 限制与下一步，见 [当前开发状态](docs/status.md)；`exec` / `edit` 的安全细节见 [工具与工具安全](docs/tools.md)。**
