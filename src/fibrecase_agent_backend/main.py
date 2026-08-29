@@ -81,18 +81,20 @@ class AgentBackend:
         )
         # The tool registry is built only when tools are enabled; when disabled
         # the service degrades to the phase-one single-completion path. The two
-        # state-changing tools are added only when their opt-ins are on (a default
-        # deployment stays subprocess-free and touch-free).
+        # opt-in capabilities (the ``exec`` shell tool and the ``file`` toolset)
+        # are added only when their flags are on (a default deployment stays
+        # subprocess-free and touch-free).
         if config.enable_tools:
             registry = build_default_tools(
                 enable_exec=config.enable_exec_tool,
                 max_exec_output_chars=config.max_exec_tool_result_chars,
                 exec_workdir=config.exec_workdir,
                 exec_policy_deny_patterns=config.exec_policy_deny_patterns,
-                enable_edit=config.enable_edit_tool,
-                edit_workdir=config.edit_workdir,
-                max_edit_string_chars=config.max_edit_string_chars,
-                max_edit_read_chars=config.max_edit_read_chars,
+                enable_file=config.enable_file_tool,
+                file_workdir=config.file_workdir,
+                max_file_string_chars=config.max_file_string_chars,
+                max_file_read_chars=config.max_file_read_chars,
+                max_file_list_entries=config.max_file_list_entries,
             )
         else:
             registry = None

@@ -57,7 +57,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 | `agent/context.py` | 唯一的上下文选择者（纯 Python，无 I/O）：估算 + `plan_context()` | 无 Telegram/SDK/ORM/文件系统 |
 | `agent/service.py` | 渠道无关核心：锁、持久化、记忆检索、驱动 tool loop | 调 LLM、DB、附件、记忆 |
 | `agent/tool_loop.py` | LLM ↔ 工具循环（渠道/协议无关） | 只依赖 LLM 协议 + `ToolRegistry` |
-| `tools/` | 工具：`Tool` 接口 / `ToolRegistry` / 三个只读内置 + 可选 `exec` / `edit`（均默认关闭）+ 策略/校验/审批/审计 | 无 Telegram/DB（审计经注入） |
+| `tools/` | 工具：`Tool` 接口 / `ToolRegistry` / 三个只读内置 + 可选 `exec` / `file` 工具集（均默认关闭）+ 策略/校验/审批/审计 | 无 Telegram/DB（审计经注入） |
 | `mcp/` | MCP 工具 provider（Streamable HTTP + stdio）：启动发现 + 包装成标准 `Tool` | 无 Telegram/DB/OpenAI SDK（只依赖 MCP SDK + HTTP client / stdio 子进程） |
 | `attachments/` | 内容寻址 blob 存储（SHA-256、原子写、去重、防路径穿越） | 纯文件系统 |
 | `memory/` | 记忆文本规范化 + 词法排序（纯 Python、无 I/O） | 无 Telegram/SDK/ORM |
@@ -74,7 +74,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - 工具结果必须是**短**的、人/模型可读的字符串；失败时 `raise`（registry 会转成 `{"error": ...}` 给模型看）。
 - 新工具默认 `ask`（需要审批）；只有确认无害/只读的才声明 `allow`。详见 [工具与工具安全](tools.md)。
 
-**MCP 已按此模式接入**（`mcp/` 包，Streamable HTTP + stdio）：启动时发现远程端点或后端 spawn 的本地 stdio 子进程的工具并包成标准 `Tool`（`mcp_<server>__<remote>`、默认 `ask`），注册进同一个 registry，从而完全复用执行边界——见 [远程 MCP 工具](mcp.md)。**只读 SSH 观测（phase 5.1，`infrastructure/` 包）也已按此模式接入**（每个目标三个固定、无参、只读工具，见 [工具与工具安全](tools.md)）。两个**可选的状态变更内置工具**（`ENABLE_EXEC_TOOL` / `ENABLE_EDIT_TOOL` 才注册）也按此模式接入：**`exec`**（`ENABLE_EXEC_TOOL=true`）是本库第一个真正 spawn 子进程的能力，在工具**内部**封装 subprocess（`/bin/sh -c`、参数向量、进程组杀、静态 denylist 兜底）、恒 `ask`、绝不进 loop；**`edit`**（`ENABLE_EDIT_TOOL=true`）是第二个状态变更能力，在工具**内部**封装文件 I/O（`EDIT_WORKDIR` 路径受限防 `../` 与符号链接逃逸、精确替换、原子写）、恒 `ask`。见 [工具与工具安全](tools.md)。未来的 **Docker / Pi** 仍是同一个模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess/网络都封装在工具**内部**、绝不进 loop，并在有副作用时走审批。
+**MCP 已按此模式接入**（`mcp/` 包，Streamable HTTP + stdio）：启动时发现远程端点或后端 spawn 的本地 stdio 子进程的工具并包成标准 `Tool`（`mcp_<server>__<remote>`、默认 `ask`），注册进同一个 registry，从而完全复用执行边界——见 [远程 MCP 工具](mcp.md)。**只读 SSH 观测（phase 5.1，`infrastructure/` 包）也已按此模式接入**（每个目标三个固定、无参、只读工具，见 [工具与工具安全](tools.md)）。两个**可选的状态变更本地能力**（`ENABLE_EXEC_TOOL` / `ENABLE_FILE_TOOL` 才注册）也按此模式接入：**`exec`**（`ENABLE_EXEC_TOOL=true`）是本库第一个真正 spawn 子进程的能力，在工具**内部**封装 subprocess（`/bin/sh -c`、参数向量、进程组杀、静态 denylist 兜底）、恒 `ask`、绝不进 loop；**`file` 工具集**（`ENABLE_FILE_TOOL=true`）是第二个状态变更能力，一组产出九个 `file_*` 工具的小 provider，在工具**内部**封装文件 I/O（`FILE_WORKDIR` 路径受限防 `../` 与符号链接逃逸、精确替换 / 窄动词不覆盖、原子写；`file_read` / `file_ls` 只读 `allow`、其余恒 `ask`）。见 [工具与工具安全](tools.md)。未来的 **Docker / Pi** 仍是同一个模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess/网络都封装在工具**内部**、绝不进 loop，并在有副作用时走审批。
 
 ### 加一种多模态输入
 
