@@ -8,8 +8,8 @@
 # The app only makes *outbound* connections (Telegram long polling + the
 # OpenAI-compatible API). There is nothing to expose inbound by default, so no
 # EXPOSE. (The one conditional inbound listener — the MCP user-level OAuth
-# callback, phase 4.x — is published by the compose override
-# docker-compose.oauth.yaml, not baked into the image.)
+# callback, phase 4.x — is published by the default-commented `ports:` entry in
+# docker-compose.yaml, not baked into the image.)
 # Config is the SAME `.env` the local `uv run fibrecase-agent-backend` uses
 # (see .env.example). It is passed at runtime and never baked into the image —
 # .dockerignore keeps .env, .venv/ and data/ out of the build.
@@ -94,5 +94,6 @@ RUN mkdir -p /app/data && chown agent:agent /app/data
 USER agent
 
 # Long polling only needs to reach api.telegram.org + the LLM host. No EXPOSE.
-# (OAuth callback port, if enabled, is published by docker-compose.oauth.yaml.)
+# (OAuth callback port, if enabled, is published by uncommenting the `ports:`
+# entry in docker-compose.yaml.)
 CMD ["fibrecase-agent-backend"]

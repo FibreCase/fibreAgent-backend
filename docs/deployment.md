@@ -31,25 +31,27 @@ docker compose down                    # 停止（数据卷保留）
 
 只有当你**启用** OAuth（`.env` 里设置 `OAUTH_CALLBACK_BASE_URL`，且至少一台 MCP 服务器声明 `authentication.type: oauth`、且相应 provider 凭据已配置）时，应用才会在 `OAUTH_CALLBACK_PORT`（默认 `8090`）上开**唯一一个**入站监听 `GET /oauth/callback`——OAuth provider（如 Google）在授权完成后会把浏览器重定向回这个地址，所以它**必须能被 provider 公网访问到**。
 
-### 为什么不能直接写在基础 compose 里
+### 为什么回调端口是默认注释的
 
-Docker 容器里 `0.0.0.0` 的本地监听**对外不可达**，除非 compose 里 `ports:` 把它**发布**到宿主。但 Compose **不支持**按环境变量**条件**地发布端口（`ports` 映射没有 `when`/`condition` 字段——那只是 `depends_on` 的东西），所以在基础文件里写死一个端口，会给**所有**用户（包括从不启用 OAuth 的）开一个入站口。为守住「默认无入站端口」这条不变量，我们把它拆成一个**按需加入**的覆盖文件：
+Docker 容器里 `0.0.0.0` 的本地监听**对外不可达**，除非 compose 里 `ports:` 把它**发布**到宿主。但 Compose **不支持**按环境变量**条件**地发布端口（`ports` 映射没有 `when`/`condition` 字段——那只是 `depends_on` 的东西）：一旦在文件里写死一个 `ports:` 映射，它就**无条件**发布，会给**所有**用户（包括从不启用 OAuth 的、应用纯出站的部署）白开一个入站口。
+
+为守住「默认无入站端口」这条不变量，`docker-compose.yaml` 里把这个 `ports:` 块**保留但整段注释**：取消注释才启用，未取消时 compose 完全不发布任何端口，与「纯出站」逐字一致。启用方式是**编辑文件**而非「多带一个 `-f` 覆盖文件」：
 
 ```bash
-# OAuth 关闭（默认）——照常运行，不发布任何端口：
+# OAuth 关闭（默认）——ports 块仍是注释，照常运行，不发布任何端口：
 docker compose up -d --build
 
-# OAuth 启用——多带一个覆盖文件，只发布回调端口：
-docker compose -f docker-compose.yaml -f docker-compose.oauth.yaml up -d --build
+# OAuth 启用——先取消注释 docker-compose.yaml 里那段 ports 块，再：
+docker compose up -d --build
 ```
 
-`docker-compose.oauth.yaml` 只做一件事：`ports: - "${OAUTH_CALLBACK_PORT:-8090}:${OAUTH_CALLBACK_PORT:-8090}/tcp"`。**不要**把它里的 `ports:` 抄进基础 `docker-compose.yaml`（基础文件里已用 `DANGER` 注释标出原因）。
+取消注释的那块就是 `ports: - "${OAUTH_CALLBACK_PORT:-8090}:${OAUTH_CALLBACK_PORT:-8090}/tcp"`。**默认务必保持注释**——取消注释会真的发布一个入站端口，只在你确实启用了 OAuth（`OAUTH_CALLBACK_BASE_URL` 已设）时才可放开。
 
 ### `OAUTH_CALLBACK_BASE_URL` 与宿主端口的关系
 
 - `OAUTH_CALLBACK_BASE_URL` 是 **provider 实际访问的公网 origin**（裸 origin，如 `https://oauth.example.com`），它指向的完整回调 URI 是 `<base>/oauth/callback`，必须能在你的 Google Cloud OAuth 客户端里登记、且能被 Google 公网访问。
 - 这个公网地址**不必**等于 `OAUTH_CALLBACK_PORT` 直接暴露的宿主端口——中间可以有一层反向代理 / 隧道（如 Caddy/Nginx、Cloudflare Tunnel、tailscale funnel、ngrok 等）终止 HTTPS 并转发到容器的回调端口。
-- **何时才直接把端口发布到 `0.0.0.0`**：只有当宿主本身能被 provider 直接公网访问、且你接受明文/自行处理 TLS 时。若宿主机在 NAT/内网后，通常应把 `OAUTH_CALLBACK_PORT` 绑定到 `127.0.0.1`（在覆盖文件里把映射改成 `"127.0.0.1:8090:8090"`），再交给你的反代/隧道对外暴露——这样公网只看到你的反代，而不是容器。
+- **何时才直接把端口发布到 `0.0.0.0`**：只有当宿主本身能被 provider 直接公网访问、且你接受明文/自行处理 TLS 时。若宿主机在 NAT/内网后，通常应把 `OAUTH_CALLBACK_PORT` 绑定到 `127.0.0.1`（在取消注释的 `ports:` 块里把映射改成 `"127.0.0.1:8090:8090"`，compose 文件里已给出这行的注释示例），再交给你的反代/隧道对外暴露——这样公网只看到你的反代，而不是容器。
 
 ## CI / 镜像发布
 

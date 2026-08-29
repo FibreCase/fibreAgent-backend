@@ -1,15 +1,11 @@
 # Agent Backend — single-service deployment.
 #
-#   cp .env.example .env               # same file the plain `uv run` uses
+#   cp .env.example .env
 #   docker compose up -d --build
 #   docker compose logs -f
 #
-# The app is outbound-only by default (Telegram long polling + LLM API):
-# nothing to expose. The ONE exception is user-level OAuth for MCP (phase 4.x):
-# when OAUTH_CALLBACK_BASE_URL is set, the app opens a single inbound listener
-# (GET /oauth/callback) that the OAuth provider must reach. That port is
-# published *only* in that case, via the opt-in file docker-compose.oauth.yaml
-# (see the "Inbound ports" note at the bottom of this file).
+# Why each setting (shared .env, host-uid mount, timezone, inbound/OAuth ports,
+# graceful shutdown) works the way it does: docs/deployment.md.
 
 services:
   agent-backend:
@@ -19,58 +15,39 @@ services:
     image: fibrecase-agent-backend
     container_name: fibrecase-agent-backend
 
-    # Same .env as the local `uv run fibrecase-agent-backend` — one config
-    # file for both. It is passed at runtime (env_file) and is NOT baked into
-    # the image (.dockerignore excludes it).
+    # Same .env as local `uv run`; read at runtime, never baked into the image.
     env_file:
       - .env
 
-    # Match the host timezone so the app's local time is correct. The image
-    # defaults to UTC, otherwise `get_current_time` (datetime.now()) and the
-    # log timestamps would be a few hours off from your wall clock. Set TZ in
-    # .env to your zone (e.g. Asia/Shanghai). This is the portable way — the
-    # image already ships tzdata, and macOS has no /etc/localtime to bind-mount.
-    # (Explicit `environment` wins over env_file if TZ is also in .env.)
+    # Match the host timezone (the image defaults to UTC). Set TZ in .env.
     environment:
       - TZ=${TZ:-Asia/Shanghai}
 
-    # Run the container as the *host* user so the bind-mounted ./data keeps
-    # normal host permissions (owned by you, 755) AND is writable by the
-    # container — no chown, and the DB stays readable from the host.
-    # Set HOST_UID/HOST_GID in .env to your uid/gid (`id -u` / `id -g`).
-    #   Linux desktop first user: 1000 · macOS default user: 501
-    # (If you'd rather keep the dedicated uid 10001, drop this line and use a
-    # named volume instead of the bind mount — see README 12.)
+    # Run as the host user so bind-mounted ./data stays writable (no chown).
+    # Set HOST_UID/HOST_GID in .env (`id -u` / `id -g`).
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
 
-    # Persist the SQLite conversation store across restarts and image rebuilds.
-    # ./data is shared with the local `uv run` — same file, same permissions.
+    # Persist SQLite + image blobs; shared with local `uv run`.
     volumes:
       - ./data:/app/data
-    # Optional: point at a different system prompt without rebuilding the image:
+    # Optional: use a different system prompt without rebuilding the image:
     # - ./config/system_prompt.txt:/app/config/system_prompt.txt:ro
 
-    # Restart if it exits (OOM, transient LLM/Telegram hiccup, host reboot).
-    # The bot is a single long-running process; this keeps it up.
+    # Keep the single long-running bot alive across OOM / hiccups / host reboot.
     restart: unless-stopped
 
     # ------------------------------------------------------------------
-    # Inbound ports
-    # ------------------------------------------------------------------
-    # This base file publishes NO ports, so the image stays "no inbound
-    # ports" by default — correct while OAuth is off, when the app is purely
-    # outbound.
+    # Inbound ports — NONE by default (the app is outbound-only).
     #
-    # DANGER: do not hand-add a `ports:` mapping for the OAuth callback here.
-    # Compose cannot publish a port *conditionally* on an env var (the ports
-    # mapping has no `when`/`condition` field — that only exists on
-    # `depends_on`), so any static port in this file would open a hole for
-    # users who never enable OAuth.
+    # Compose cannot publish a port *conditionally* on an env var, so the one
+    # OAuth callback port is written here but COMMENTED OUT. Uncomment only
+    # when MCP user-level OAuth is enabled (OAUTH_CALLBACK_BASE_URL set in .env):
+    # the app then opens one inbound listener, GET /oauth/callback, that the
+    # provider must reach. Leave it commented while OAuth is off — otherwise
+    # you open an inbound port for a deployment that is purely outbound.
+    # See docs/deployment.md ("OAuth 回调端口").
     #
-    # Instead, to enable OAuth (i.e. you have set OAUTH_CALLBACK_BASE_URL in
-    # .env), ALSO run with the opt-in file that publishes the callback port:
-    #
-    #     docker compose -f docker-compose.yaml -f docker-compose.oauth.yaml up -d --build
-    #
-    # When OAuth is off, just `docker compose up -d --build` as usual — no port
-    # is published and the app stays outbound-only.
+    #   ports:
+    #     - "${OAUTH_CALLBACK_PORT:-8090}:${OAUTH_CALLBACK_PORT:-8090}/tcp"
+    #   # Behind a reverse proxy / tunnel, bind to loopback instead:
+    #   # - "127.0.0.1:${OAUTH_CALLBACK_PORT:-8090}:${OAUTH_CALLBACK_PORT:-8090}/tcp"
