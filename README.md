@@ -51,6 +51,7 @@ uv run python -m fibrecase_agent_backend
 | --- | --- |
 | `/start` | 启动 Agent / 查看当前会话 |
 | `/new` | 开始新会话，清空本 chat 历史（**不影响**长期记忆） |
+| `/stop` | 打断本 chat 正在生成/执行工具的回复（取消这一轮、停止打字、释放会话锁；被中断的那一轮会发一条**引用原消息的 Reply**：「⛔️ **Interrupted.**」）；无进行中回复时回复「Nothing to stop.」。只停生成，不清会话/记忆，只影响本 chat |
 | `/context` | 只读预览当前上下文窗口：消息数、估算 token 占用/剩余、历史图片保留/降级数 |
 | `/remember <内容>` | 保存一条长期记忆到你的账号（跨 `/new` 与重启）；回显 ID |
 | `/memories` | 列出你保存的所有记忆 |

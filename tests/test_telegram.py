@@ -20,6 +20,7 @@ from telegram.ext import CallbackContext
 from fibrecase_agent_backend import __version__
 from fibrecase_agent_backend.telegram.bot import (
     CHUNK_SIZE,
+    _IN_FLIGHT,
     _is_authorized,
     _send_long,
     cmd_context,
@@ -30,6 +31,7 @@ from fibrecase_agent_backend.telegram.bot import (
     cmd_remember,
     cmd_start,
     cmd_status,
+    cmd_stop,
     compose_startup_hooks,
     handle_message,
     split_into_chunks,
@@ -647,3 +649,123 @@ def test_prefers_newline_boundaries():
     assert "".join(chunks) == text
     for c in chunks[:-1]:
         assert c.endswith("\n"), "chunks should break on newlines where possible"
+
+
+# ---------------------------------------------------------------------------
+# /stop — interrupt an in-flight reply (concurrent_updates: a command task can
+# cancel the message handler task for the same chat)
+# ---------------------------------------------------------------------------
+def _turn(app, user_id, chat_id, text):
+    """An (update, chat, context) for ``app`` (shares ``app.bot_data``)."""
+    user = User(id=user_id, first_name="U", is_bot=False)
+    chat = Chat(id=chat_id, type="private")
+    message = Message(message_id=1, date=0, chat=chat, from_user=user, text=text)
+    update = Update(update_id=1, message=message)
+    return update, chat, CallbackContext.from_update(update, app)
+
+
+async def test_stop_cancels_in_flight_and_notifies():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = _FakeService(reply="hi back", delay=0.5)
+    app.bot_data["config"] = _FakeConfig()
+
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        msg_task = asyncio.create_task(handle_message(update, context))
+        # Let the turn get going and register itself as in-flight.
+        for _ in range(200):
+            if app.bot_data.get(_IN_FLIGHT, {}).get(chat.id) is msg_task:
+                break
+            await asyncio.sleep(0.005)
+        assert app.bot_data[_IN_FLIGHT][chat.id] is msg_task  # it registered
+
+        # /stop from the same shared app (same bot_data), same chat.
+        stop_update, stop_chat, stop_context = _turn(app, 1, chat.id, "/stop")
+        await cmd_stop(stop_update, stop_context)
+
+        # Give the cancelled turn time to unwind (stop typing, post notice, clean up).
+        await asyncio.sleep(0.3)
+        assert msg_task.cancelled()
+        assert app.bot_data.get(_IN_FLIGHT, {}).get(chat.id) is None  # cleaned up
+
+        # The stopped turn posts the ⛔️ notice as a Telegram Reply quoting the
+        # original message — never the reply that was being generated.
+        texts = [c.kwargs.get("text") for c in send.await_args_list if c.kwargs]
+        assert any(t and "⛔️" in t and "<b>Interrupted.</b>" in t for t in texts)
+        assert "hi back" not in texts
+        # It quotes the original message (message_id from _make is 1).
+        stopped = [c for c in send.await_args_list if c.kwargs and c.kwargs.get("text", "").startswith("⛔️")]
+        assert stopped and stopped[0].kwargs.get("reply_to_message_id") == 1
+
+
+async def test_stop_when_idle_says_nothing_to_stop():
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="/stop", allowed=(1,))
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = _FakeService()
+    app.bot_data["config"] = _FakeConfig()
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_stop(update, context)
+    texts = [c.kwargs.get("text") for c in send.await_args_list if c.kwargs]
+    assert any(t and "Nothing to stop" in t for t in texts)
+
+
+async def test_stop_unauthorized_noop():
+    update, chat, context, app, bot = _make(user_id=999, chat_id=1, text="/stop", allowed=(1,))
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = _FakeService()
+    app.bot_data["config"] = _FakeConfig()
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_stop(update, context)
+    send.assert_not_awaited()
+
+
+async def test_stop_targets_only_its_own_chat():
+    # Two private chats of the same owner, both with an in-flight turn. /stop on
+    # chat A must cancel only chat A's task, not chat B's.
+    app = type("App", (), {})()
+    app.bot_data = {
+        "allowed_user_ids": {1},
+        "repository": _FakeRepo(),
+        "agent_service": _FakeService(reply="hi back", delay=0.5),
+        "config": _FakeConfig(),
+    }
+    app.bot = _StubBot()
+
+    u1, c1, ctx1 = _turn(app, 1, 11, "one")
+    u2, c2, ctx2 = _turn(app, 1, 22, "two")
+
+    with patch.object(Chat, "send_message", new_callable=AsyncMock):
+        task1 = asyncio.create_task(handle_message(u1, ctx1))
+        task2 = asyncio.create_task(handle_message(u2, ctx2))
+        for _ in range(200):
+            in_flight = app.bot_data.get(_IN_FLIGHT, {})
+            if in_flight.get(11) is task1 and in_flight.get(22) is task2:
+                break
+            await asyncio.sleep(0.005)
+
+        stop_update, _, stop_context = _turn(app, 1, 11, "/stop")  # stop chat 11 only
+        await cmd_stop(stop_update, stop_context)
+        await asyncio.sleep(0.3)
+
+        assert task1.cancelled()  # the targeted chat's turn was stopped
+        assert not task2.cancelled()  # the other chat's turn is untouched
+
+        # Clean up the still-running turn for chat 2.
+        task2.cancel()
+        try:
+            await task2
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_in_flight_handle_removed_after_normal_completion():
+    # The new registration must not leak on the ordinary (non-stopped) path, and
+    # must not change normal reply delivery.
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hi", allowed=(1,))
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = _FakeService(reply="ok", delay=0.0)
+    app.bot_data["config"] = _FakeConfig()
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await handle_message(update, context)
+    assert app.bot_data.get(_IN_FLIGHT, {}).get(chat.id) is None
+    assert any(c.kwargs.get("text") == "ok" for c in send.await_args_list if c.kwargs)

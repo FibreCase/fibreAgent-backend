@@ -5,8 +5,8 @@ to the channel-agnostic :class:`~..agent.service.AgentService` and handles the
 concerns specific to this transport:
 
 * user authorisation (only configured Telegram user ids may use the bot),
-* the ``/start``, ``/new``, ``/help``, ``/status``, ``/context``, memory, and
-  ``/tool_audit`` commands,
+* the ``/start``, ``/new``, ``/stop``, ``/help``, ``/status``, ``/context``,
+  memory, and ``/tool_audit`` commands,
 * a "typing…" keep-alive while the model is generating,
 * chunking of long model replies (the full reply is persisted *once*,
   upstream, in the Agent service),
@@ -65,6 +65,7 @@ TYPING_REFRESH_SECONDS = 4.0
 _COMMANDS: list[tuple[str, str]] = [
     ("start", "Start or view the agent"),
     ("new", "Start a new conversation"),
+    ("stop", "Stop the current reply"),
     ("context", "Show context budget"),
     ("remember", "Save a long-term memory"),
     ("memories", "List your memories"),
@@ -200,6 +201,26 @@ async def _typing_loop(bot, chat_id: int, stop: asyncio.Event) -> None:
             continue
 
 
+# bot_data key for the in-flight reply task, one per chat. A chat may have at
+# most one turn running at a time (its per-conversation lock serialises them),
+# so a single slot keyed by chat id is exactly the handle ``/stop`` cancels.
+_IN_FLIGHT = "in_flight"
+
+
+def _take_in_flight(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> asyncio.Task | None:
+    """Pop and return the in-flight reply task for ``chat_id``, or ``None``.
+
+    The task is consumed (removed from the registry) as it is taken so that a
+    ``/stop`` racing with the turn finishing never cancels an already-settled
+    task (cancelling a done task is a no-op, but removing it here keeps the
+    registry honest). A missing entry simply means the chat is idle.
+    """
+    in_flight = context.application.bot_data.get(_IN_FLIGHT)
+    if not in_flight:
+        return None
+    return in_flight.pop(chat_id, None)
+
+
 async def _with_typing(bot, chat_id: int, coro):
     """Run ``coro`` while keeping the "typing…" indicator alive."""
     stop = asyncio.Event()
@@ -252,6 +273,36 @@ async def cmd_new(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     service: AgentService = context.application.bot_data["agent_service"]
     await service.reset(chat.id, user_id)
     await _send_long(chat, "**New conversation started** (history cleared).")
+
+
+async def cmd_stop(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop — interrupt the chat's in-flight reply.
+
+    Cancels the ``handle_message`` task that is currently generating a reply or
+    running a tool for *this chat* (if one is running). Because updates are
+    handled concurrently (``concurrent_updates``), this handler runs as an
+    independent task and can cancel the other. Cancelling unwinds the turn: the
+    per-conversation lock releases (so a later message proceeds), the typing
+    keep-alive stops, and the in-flight handle is removed. The stopped turn
+    itself posts a short **Telegram Reply** to the interrupted message ("⛔️
+    **Interrupted.**"). When nothing is running for this chat, it replies
+    "Nothing to stop." Unauthorised senders are ignored silently, exactly like
+    every other command.
+
+    This only stops a *generation* — it does not drop the conversation or
+    memory (that is ``/new``), and it never touches another chat's turn.
+    """
+    if not _is_authorized(update, context):
+        return
+    chat = update.effective_chat
+    task = _take_in_flight(context, chat.id)
+    if task is None or task.done():
+        await _send_long(chat, "**Nothing to stop.**")
+        return
+    task.cancel()
+    # Do not await the cancelled task here: it is unwinding in its own task and
+    # posts its own "⛔️ **Interrupted.**" notice. Awaiting it could deadlock on
+    # the very per-conversation lock it is releasing.
 
 
 async def cmd_help(update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -777,34 +828,68 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         },
     )
 
+    # Register this turn as the chat's in-flight reply so ``/stop`` can cancel
+    # it while the model is generating or a tool is running. The per-conversation
+    # lock serialises a chat, so there is at most one such task per chat. The
+    # handle is removed in the ``finally`` below (completion *and* cancellation),
+    # so a finished or stopped turn never lingers as a stale, cancellable handle.
+    bot_data = context.application.bot_data
+    bot_data.setdefault(_IN_FLIGHT, {})[chat.id] = asyncio.current_task()
     try:
-        reply = await _with_typing(
-            context.bot,
-            chat.id,
-            service.process_message(conversation_id, agent_message, memory_scope=_memory_scope(update)),
-        )
-    except AgentError as exc:
-        logger.info(
-            "llm error surfaced to user",
-            extra={"conversation_id": conversation_id, "category": exc.category},
-        )
-        await _safe_reply(chat, exc.user_safe)
-        return
-    except Exception:
-        logger.exception("unexpected error handling message", extra={"conversation_id": conversation_id})
-        await _safe_reply(chat, "出现了一个意外错误，请稍后重试。")
-        return
+        try:
+            reply = await _with_typing(
+                context.bot,
+                chat.id,
+                service.process_message(conversation_id, agent_message, memory_scope=_memory_scope(update)),
+            )
+        except AgentError as exc:
+            logger.info(
+                "llm error surfaced to user",
+                extra={"conversation_id": conversation_id, "category": exc.category},
+            )
+            await _safe_reply(chat, exc.user_safe)
+            return
+        except Exception:
+            logger.exception("unexpected error handling message", extra={"conversation_id": conversation_id})
+            await _safe_reply(chat, "出现了一个意外错误，请稍后重试。")
+            return
 
-    if not reply:
-        return
-    try:
-        # The final answer quotes the user's message (Telegram Reply) so it
-        # visibly references what it is answering. Only this last reply carries
-        # the reference — command acks, the typing keep-alive, and intermediate
-        # sends do not.
-        await _send_long(chat, reply, reply_to_message_id=message.message_id)
-    except TelegramError:
-        logger.error("failed to send reply", extra={"conversation_id": conversation_id}, exc_info=True)
+        if not reply:
+            return
+        try:
+            # The final answer quotes the user's message (Telegram Reply) so it
+            # visibly references what it is answering. Only this last reply carries
+            # the reference — command acks, the typing keep-alive, and intermediate
+            # sends do not.
+            await _send_long(chat, reply, reply_to_message_id=message.message_id)
+        except TelegramError:
+            logger.error("failed to send reply", extra={"conversation_id": conversation_id}, exc_info=True)
+    except asyncio.CancelledError:
+        # ``/stop`` (or a shutdown) cancelled this turn while it was generating or
+        # running a tool. ``process_message``'s per-conversation lock is an async
+        # context manager, so it already released on this unwind — the next message
+        # can proceed. Send a short, bold notice as a **Telegram Reply quoting the
+        # user's interrupted message** (like the final answer quotes its question),
+        # then re-raise so the task is observed as cancelled: PTB never treats a
+        # cancelled handler as an error, and the typing keep-alive in
+        # ``_with_typing``'s ``finally`` stops before this point. The notice is
+        # best-effort — a failed send never changes the cancellation outcome.
+        logger.info("turn cancelled by /stop", extra={"conversation_id": conversation_id})
+        try:
+            await chat.send_message(
+                text=to_telegram_html("⛔️ **Interrupted.**"),
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=message.message_id,
+            )
+        except TelegramError:
+            logger.error(
+                "failed to send stop notice", extra={"conversation_id": conversation_id}, exc_info=True
+            )
+        raise
+    finally:
+        in_flight = bot_data.get(_IN_FLIGHT)
+        if in_flight is not None:
+            in_flight.pop(chat.id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -904,6 +989,7 @@ def build_application(
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("new", cmd_new))
+    application.add_handler(CommandHandler("stop", cmd_stop))
     application.add_handler(CommandHandler("context", cmd_context))
     application.add_handler(CommandHandler("remember", cmd_remember))
     application.add_handler(CommandHandler("memories", cmd_memories))
