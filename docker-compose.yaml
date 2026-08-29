@@ -30,6 +30,7 @@ services:
     # Persist SQLite + image blobs; shared with local `uv run`.
     volumes:
       - ./data:/app/data
+      - ./workspace:/app/workspace
     # Optional: use a different system prompt without rebuilding the image:
     # - ./config/system_prompt.txt:/app/config/system_prompt.txt:ro
 
