@@ -158,8 +158,9 @@ class EditTool(Tool):
 
     def approval_summary(self, arguments: dict[str, Any]) -> str:
         # Fixed and argument-free. The path + old/new strings are already shown in
-        # the card's separate "Arguments:" block, so they are deliberately NOT
-        # echoed here (secret-free convention — the strings may contain anything).
+        # the card's separate "Action:" block (a git-style diff), so they are
+        # deliberately NOT echoed here (secret-free convention — the strings may
+        # contain anything).
         return (
             "Read or precisely edit a UTF-8 text file within the configured working "
             "directory. Requires approval."
@@ -169,32 +170,51 @@ class EditTool(Tool):
         """A human-friendly, faithful view of this call for the approval card.
 
         Shown in place of the generic JSON "Arguments:" block (see
-        :meth:`Tool.approval_detail`). For ``replace`` it renders the **exact**
-        ``old_string`` / ``new_string`` values — newlines and all — so the owner
-        approves precisely what will be matched and what it becomes, rather than a
-        wall of escaped JSON. Plain text, no markup: the approval provider
-        HTML-escapes and length-bounds it and wraps it in a code block (which
-        preserves the newlines). ``read`` shows just the target file.
+        :meth:`Tool.approval_detail`). For ``replace`` it renders the edit as a
+        **git-style unified diff** — every line of the exact ``old_string``
+        prefixed ``-`` and every line of the exact ``new_string`` prefixed ``+``
+        (under ``--- a/<path>`` / ``+++ b/<path>`` headers) — so the owner
+        approves the change the way they read any diff, rather than a wall of
+        escaped JSON. A ``new_string`` of ``""`` renders as a pure deletion (no
+        ``+`` lines). For ``read`` it shows just the target file (there is no
+        diff to show). Plain text, no markup: the approval provider HTML-escapes
+        and length-bounds it and wraps it in a code block (which preserves the
+        newlines). See :meth:`approval_language` for the matching ``diff`` label.
         """
         path = arguments.get("path")
         if arguments.get("operation") == "replace":
             replace_all = bool(arguments.get("replace_all", False))
-            old = arguments.get("old_string")
-            new = arguments.get("new_string")
+            old = "" if arguments.get("old_string") is None else str(arguments["old_string"])
+            new = "" if arguments.get("new_string") is None else str(arguments["new_string"])
             lines = [
                 f"📄 File: {path}",
                 f"🔁 Operation: replace (replace_all: {'yes' if replace_all else 'no'})",
-                "── old_string ──",
-                "" if old is None else str(old),
-                "── new_string ──",
-                "(empty — this deletes old_string)" if new == "" else ("" if new is None else str(new)),
+                f"--- a/{path}",
+                f"+++ b/{path}",
             ]
+            for ln in old.split("\n"):
+                lines.append(f"-{ln}")
+            if new != "":  # an empty new_string deletes the old text: no additions
+                for ln in new.split("\n"):
+                    lines.append(f"+{ln}")
         else:
             lines = [
                 f"📄 File: {path}",
                 "Operation: read",
             ]
         return "\n".join(lines)
+
+    def approval_language(self, arguments: dict[str, Any]) -> str | None:
+        """Label the ``replace`` detail as a diff so the client highlights it.
+
+        A ``replace`` is rendered as a git-style diff (see
+        :meth:`approval_detail`), so it is highlighted as ``diff``. A ``read`` has
+        no diff body — just the file name and the operation — so it is left
+        unlabelled (no highlight).
+        """
+        if arguments.get("operation") == "replace":
+            return "diff"
+        return None
 
     def _resolve(self, path: str) -> Path:
         """Resolve ``path`` to a real path *inside* ``self._root``.

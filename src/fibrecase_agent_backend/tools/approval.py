@@ -67,6 +67,11 @@ class ApprovalRequest:
       (the default) means "render the arguments as the generic pretty-JSON block";
       a non-empty value is rendered in its place. It carries the same
       show-on-card-only / never-in-logs constraint as ``arguments``.
+    * ``language`` — the code-block language hint for a non-empty ``detail`` (see
+      :meth:`Tool.approval_language`): a Pygments language name (e.g. ``diff``,
+      ``bash``) so the client highlights the ``Action:`` block, or empty for no
+      label. It is a tool-declared, fixed value (never argument content) and the
+      provider sanitises it before it reaches the markup.
     """
 
     request_id: str
@@ -78,6 +83,8 @@ class ApprovalRequest:
     arguments: dict[str, Any] = field(default_factory=dict)
     # Optional friendly argument view (plain text); empty → generic JSON block.
     detail: str = ""
+    # Code-block language hint for a non-empty detail (Pygments name); empty → none.
+    language: str = ""
     # Extra context the provider may need (kept opaque; nothing sensitive).
     metadata: dict[str, Any] = field(default_factory=dict)
 

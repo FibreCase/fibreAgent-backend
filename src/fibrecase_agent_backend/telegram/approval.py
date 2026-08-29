@@ -97,6 +97,20 @@ _ARGUMENTS_MAX_CHARS = 3700
 _ARGUMENTS_TRUNCATED_MARK = "\n\n[Arguments truncated to fit the message]"
 
 
+def _language_class(language: str) -> str:
+    """A safe ``class="language-…"`` attribute for a code block, or ``""``.
+
+    ``language`` is a tool-declared Pygments name (e.g. ``diff`` / ``bash`` /
+    ``json``) — never argument content — but it is still sanitised before it is
+    interpolated into the card's HTML: only ``[A-Za-z0-9_-]`` survives (lowercased,
+    length-capped), so a stray quote/space/tag cannot break the ``class``
+    attribute or inject markup. Telegram's HTML supports the language class on
+    ``<pre>`` only, with these Pygments identifiers.
+    """
+    cleaned = "".join(ch for ch in language if ch.isalnum() or ch in "-_")[:24].lower()
+    return f' class="language-{cleaned}"' if cleaned else ""
+
+
 def _html_escape(text: str) -> str:
     """Escape ``& < >`` so interpolated values can't form a Telegram-HTML tag.
 
@@ -130,19 +144,23 @@ def _arguments_block(arguments: dict[str, Any]) -> str | None:
     """The card's ``Arguments:`` section as Telegram HTML, or ``None`` when the
     call has no arguments (an empty mapping) — in which case the whole section
     is omitted. The value is the **already schema-validated** arguments
-    formatted as readable, pretty-printed JSON and wrapped in ``<pre><code>``
-    (Telegram's code-block tags, which preserve the newlines). It is escaped so
-    no argument content can form a tag, and **bounded** (see
-    :func:`_bound_arguments`) so the whole card stays under Telegram's
-    single-message limit and is never unapprovable. ``ensure_ascii=False`` keeps
-    non-ASCII (e.g. CJK) values readable instead of ``\\uXXXX``; ``default=str``
-    is a backstop for any non-JSON value (validated args are JSON-native, so this
-    normally never fires).
+    formatted as readable, pretty-printed JSON and wrapped in
+    ``<pre class="language-json"><code>`` — the language class labels it JSON so
+    the client highlights it instead of guessing — and Telegram's ``<pre>`` is
+    the only tag that accepts the language class. It is escaped so no argument
+    content can form a tag, and **bounded** (see :func:`_bound_arguments`) so the
+    whole card stays under Telegram's single-message limit and is never
+    unapprovable. ``ensure_ascii=False`` keeps non-ASCII (e.g. CJK) values
+    readable instead of ``\\uXXXX``; ``default=str`` is a backstop for any
+    non-JSON value (validated args are JSON-native, so this normally never fires).
     """
     if not arguments:
         return None
     pretty = json.dumps(arguments, indent=2, ensure_ascii=False, default=str)
-    return f"<b>Arguments:</b>\n<pre><code>{_bound_arguments(pretty)}</code></pre>"
+    return (
+        f"<b>Arguments:</b>\n"
+        f'<pre{_language_class("json")}><code>{_bound_arguments(pretty)}</code></pre>'
+    )
 
 
 def _card_text(request: ApprovalRequest, footer: str, *, show_arguments: bool = True) -> str:
@@ -157,14 +175,15 @@ def _card_text(request: ApprovalRequest, footer: str, *, show_arguments: bool = 
     the argument section **only when ``show_arguments`` is set**, then the footer.
     The argument section is either the tool's friendly plain-text ``detail``
     (shown under an ``Action:`` label, when the tool supplies one via
-    :meth:`Tool.approval_detail`) or, otherwise, the generic readable-JSON
-    ``Arguments:`` block — and is omitted for an argument-free call with no
-    detail. The prompt shows it (the owner needs it to judge the call); the
-    in-place finalisation passes ``show_arguments=False`` so the resolved card —
-    with its buttons already removed — drops it too. Every interpolated *data*
-    value (tool name, summary, the arguments/detail) is HTML-escaped and bounded
-    so nothing can break the markup, inject a tag, or overflow Telegram's
-    single-message limit.
+    :meth:`Tool.approval_detail`, in a code block labelled with the tool's
+    ``language`` hint) or, otherwise, the generic readable-JSON ``Arguments:``
+    block (labelled ``language-json``) — and is omitted for an argument-free
+    call with no detail. The prompt shows it (the owner needs it to judge the
+    call); the in-place finalisation passes ``show_arguments=False`` so the
+    resolved card — with its buttons already removed — drops it too. Every
+    interpolated *data* value (tool name, summary, the arguments/detail, the
+    language hint) is HTML-escaped / sanitised and bounded so nothing can break
+    the markup, inject a tag, or overflow Telegram's single-message limit.
     """
     lines = [
         _APPROVAL_TITLE,
@@ -175,10 +194,17 @@ def _card_text(request: ApprovalRequest, footer: str, *, show_arguments: bool = 
     if show_arguments:
         if request.detail:
             # The tool provided a friendly, faithful plain-text view of the
-            # arguments (e.g. edit's structured diff). It is HTML-escaped and
+            # arguments (e.g. edit's git-style diff). It is HTML-escaped and
             # bounded exactly like the JSON block, and wrapped in <pre><code> so
-            # its newlines (the exact old_string/new_string) are preserved.
-            block = f"<b>Action:</b>\n<pre><code>{_bound_arguments(request.detail)}</code></pre>"
+            # its newlines (the exact old_string/new_string) are preserved. The
+            # <pre> carries a language class (from request.language, sanitised)
+            # so the client highlights it correctly instead of guessing; a tool
+            # that returns no language leaves the block unlabelled.
+            block = (
+                f"<b>Action:</b>\n"
+                f"<pre{_language_class(request.language)}><code>"
+                f"{_bound_arguments(request.detail)}</code></pre>"
+            )
         else:
             block = _arguments_block(request.arguments)
         if block is not None:

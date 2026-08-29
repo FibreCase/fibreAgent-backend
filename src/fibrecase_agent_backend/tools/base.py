@@ -101,3 +101,20 @@ class Tool(abc.ABC):
         """
         return None
 
+    def approval_language(self, arguments: dict[str, Any]) -> str | None:
+        """The programming language of a pending call's argument view.
+
+        Shown on the approval card as a code-block language hint so the client
+        highlights the arguments correctly instead of guessing. It only takes
+        effect for a tool that overrides :meth:`approval_detail` (the ``Action:``
+        block) — the generic JSON ``Arguments:`` block is always labelled
+        ``json`` by the provider. It must return a **Pygments language name**
+        (the identifier Telegram's HTML ``<pre class="language-…">`` block
+        understands, e.g. ``diff``, ``bash``, ``json``), or ``None`` to leave the
+        block unlabelled (no highlight). The value is a tool-declared, fixed
+        vocabulary — never derived from the argument *content* — and the provider
+        sanitises it before it reaches the markup, so it cannot inject HTML. The
+        default is ``None``.
+        """
+        return None
+

@@ -102,7 +102,7 @@ class _FakeUpdate:
         self.effective_user = type("U", (), {"id": user_id})()
 
 
-def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None, arguments=None, detail=None):
+def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", seconds=60, summary=None, arguments=None, detail=None, language=None):
     return ApprovalRequest(
         request_id=request_id,
         conversation_id=5,
@@ -112,6 +112,7 @@ def _request(request_id="req1", *, scope=f"telegram:{USER_A}", tool="risky", sec
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=seconds),
         arguments=arguments if arguments is not None else {},
         detail=detail if detail is not None else "",
+        language=language if language is not None else "",
     )
 
 
@@ -573,10 +574,11 @@ def test_arguments_block_renders_readable_json_and_omits_when_empty():
     # No arguments → the whole "Arguments:" section is omitted.
     assert _arguments_block({}) is None
 
-    # With arguments → readable, pretty-printed JSON in <pre><code>, HTML-escaped.
+    # With arguments → readable, pretty-printed JSON in a language-labelled
+    # <pre><code> (labelled "json" so the client highlights it), HTML-escaped.
     block = _arguments_block({"city": "北京", "lat": 39.9, "ok": True})
     assert "<b>Arguments:</b>" in block
-    assert "<pre><code>" in block and "</code></pre>" in block
+    assert '<pre class="language-json"><code>' in block and "</code></pre>" in block
     assert '"city": "北京"' in block
     assert '"lat": 39.9' in block
     assert '"ok": true' in block
@@ -649,6 +651,37 @@ def test_detail_shown_under_action_label_and_escaped():
     # The exact old/new values are present, newlines preserved (faithful).
     assert "foo" in text and "bar" in text
     assert "── old_string ──" in text and "── new_string ──" in text
+
+
+def test_detail_language_labels_the_code_block():
+    # A detail that carries a language hint is wrapped in a <pre> labelled with
+    # it (so the client highlights the block instead of guessing).
+    req = _request(detail="-old\n+new", arguments={}, language="diff")
+    text = _card_text(req, "<i>hint</i>")
+    assert '<pre class="language-diff"><code>' in text
+    assert "-old" in text and "+new" in text
+
+
+def test_detail_without_language_is_unlabelled():
+    # No language hint → the code block has no class attribute (plain <pre><code>).
+    req = _request(detail="📄 File: notes.md\nOperation: read", arguments={}, language="")
+    text = _card_text(req, "<i>hint</i>")
+    assert "<pre><code>" in text
+    assert 'class="language-' not in text
+
+
+def test_detail_language_is_sanitised():
+    # A tool-supplied language is a fixed vocabulary, but it is still sanitised
+    # before reaching the markup: only [A-Za-z0-9_-] survives (lowercased), so a
+    # hostile value cannot break the class attribute or inject a tag.
+    text = _card_text(_request(detail="x", arguments={}, language='diff" class="x'), "<i>hint</i>")
+    # The injected quote / nested attribute is defused: quotes are stripped, so
+    # the whole thing becomes ONE class attribute — no `class="x` breakout.
+    assert 'class="language-diffclassx"' in text  # a single, well-formed class
+    assert 'class="x' not in text  # no injected second attribute
+    # A language with no word characters at all is dropped entirely (no label).
+    none_text = _card_text(_request(detail="x", arguments={}, language="<>!!"), "<i>hint</i>")
+    assert 'class="language-' not in none_text
 
 
 def test_detail_is_html_escaped_and_bounded():

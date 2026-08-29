@@ -237,10 +237,11 @@ def test_approval_summary_never_echoes_arguments(tmp_path):
     assert "/secrets" not in s
 
 
-def test_approval_detail_replace_is_faithful(tmp_path):
+def test_approval_detail_replace_is_a_git_diff(tmp_path):
     # The detail view (shown on the approval card in place of the JSON block)
-    # lays out the EXACT old/new text verbatim — newlines and all — so the owner
-    # approves precisely what will be matched and what it becomes.
+    # renders the edit as a git-style diff: every old_string line prefixed "-"
+    # and every new_string line prefixed "+", under --- a/<path> / +++ b/<path>
+    # headers — so the owner sees exactly what is removed and what replaces it.
     tool = EditTool(workdir=str(tmp_path), max_string_chars=2000, max_read_chars=100)
     old = "timeout: 30\nretries: 1"
     new = "timeout: 60\nretries: 3"
@@ -251,34 +252,49 @@ def test_approval_detail_replace_is_faithful(tmp_path):
     assert "Operation: replace" in detail
     # replace_all defaults to no.
     assert "replace_all: no" in detail
-    # The exact values appear, verbatim and in order (old before new).
-    assert old in detail and new in detail
-    assert "── old_string ──" in detail and "── new_string ──" in detail
-    assert detail.index(old) < detail.index("── new_string ──")
+    # git-diff structure…
+    assert "--- a/config/settings.yaml" in detail
+    assert "+++ b/config/settings.yaml" in detail
+    # …each old line prefixed "-" and each new line prefixed "+", verbatim.
+    assert "-timeout: 30" in detail and "-retries: 1" in detail
+    assert "+timeout: 60" in detail and "+retries: 3" in detail
+    # The removed (old) lines come before the added (new) lines.
+    assert detail.index("-timeout: 30") < detail.index("+timeout: 60")
+    # A replace is labelled a diff so the card highlights it as such.
+    assert (
+        tool.approval_language({"operation": "replace", "path": "x", "old_string": "a", "new_string": "b"})
+        == "diff"
+    )
 
 
 def test_approval_detail_replace_all_and_empty_new(tmp_path):
     tool = EditTool(workdir=str(tmp_path), max_string_chars=100, max_read_chars=100)
-    # replace_all=true is surfaced; an empty new_string means "delete old_string".
+    # replace_all=true is surfaced in the operation line…
     all_detail = tool.approval_detail(
         {"operation": "replace", "path": "f.txt", "old_string": "x", "new_string": "y", "replace_all": True}
     )
     assert "replace_all: yes" in all_detail
 
+    # …and an empty new_string means "delete old_string": the diff carries the
+    # removed "-" line but no added "+" line (a pure deletion).
     delete_detail = tool.approval_detail(
         {"operation": "replace", "path": "f.txt", "old_string": "x", "new_string": ""}
     )
     assert "replace_all: no" in delete_detail
-    assert "deletes old_string" in delete_detail
+    lines = delete_detail.split("\n")
+    assert "-x" in lines  # the old text, removed
+    assert not any(l.startswith("+") and l != "+++ b/f.txt" for l in lines)  # no additions
 
 
 def test_approval_detail_read_shows_file_only(tmp_path):
-    # A read has no old/new text to show — just the target file and the operation.
+    # A read has no diff to show — just the target file and the operation. It is
+    # left unlabelled (approval_language → None) since there is no diff body.
     tool = EditTool(workdir=str(tmp_path), max_string_chars=100, max_read_chars=100)
     detail = tool.approval_detail({"operation": "read", "path": "notes.md"})
     assert "notes.md" in detail
     assert "Operation: read" in detail
     assert "old_string" not in detail and "new_string" not in detail
+    assert tool.approval_language({"operation": "read", "path": "notes.md"}) is None
 
 
 # ===========================================================================

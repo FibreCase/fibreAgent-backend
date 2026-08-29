@@ -183,3 +183,13 @@ def test_exec_approval_detail_none_when_command_absent():
     # requires "command", so this is only a defensive path.
     tool = ExecTool(max_output_chars=100, workdir=None)
     assert tool.approval_detail({}) is None
+
+
+def test_exec_approval_language_is_bash():
+    # The detail view is a shell command, so it is labelled "bash" for the card's
+    # code-block highlighting. Fixed vocabulary — not derived from the command.
+    from fibrecase_agent_backend.tools.builtin import ExecTool
+
+    tool = ExecTool(max_output_chars=100, workdir=None)
+    assert tool.approval_language({"command": "ls -la"}) == "bash"
+    assert tool.approval_language({}) == "bash"

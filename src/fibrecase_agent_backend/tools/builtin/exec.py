@@ -157,6 +157,11 @@ class ExecTool(Tool):
             return None
         return f"$ {command}"
 
+    def approval_language(self, arguments: dict[str, Any]) -> str:
+        # The detail view is a shell command, so label it bash for highlighting.
+        # (Fixed vocabulary — never derived from the command's content.)
+        return "bash"
+
     async def execute(self, arguments: dict[str, Any]) -> str:
         command = arguments["command"]
 

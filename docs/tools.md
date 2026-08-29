@@ -18,7 +18,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 **默认关闭**（`ENABLE_EXEC_TOOL=false`）——不开则不注册、不广告给模型、默认部署仍是"零子进程"。开启后它是唯一会**真正 spawn 子进程**的内置工具，也是**通用性最强**的状态变更能力（任意 shell 工作），防御纵深（全部在 `execute` 内，loop 不动）：
 
-- **恒 `ask`**：每次调用都需一次性人工审批，命令**逐字**显示在审批卡上（模型无法自批）。`exec` 覆写了可选的 `approval_detail` 钩子，把命令以 **bash 命令块**（`$ <command>`，多行命令换行原样保留）呈现，替换默认的 `Arguments:` JSON——属主读到的是即将执行的那条 shell 行，而不是 `{"command": "…"}`（该视图仍经 HTML 转义 + 长度有界，收尾时与 `Arguments:` 一并移除）。
+- **恒 `ask`**：每次调用都需一次性人工审批，命令**逐字**显示在审批卡上（模型无法自批）。`exec` 覆写了可选的 `approval_detail` 钩子，把命令以 **bash 命令块**（`$ <command>`，多行命令换行原样保留）呈现，替换默认的 `Arguments:` JSON——属主读到的是即将执行的那条 shell 行，而不是 `{"command": "…"}`；该代码块经 `approval_language` 钩子标注为 `bash`（见下），让 Telegram 按 bash 语法高亮而非猜测（该视图仍经 HTML 转义 + 长度有界，收尾时与 `Arguments:` 一并移除）。
 - **静态兜底**（`tools/exec_policy.py`）：一组保守的灾难性命令正则（递归 `rm` `/`/`$HOME`、`--no-preserve-root`、fork bomb、`curl`/`wget | sh`、`dd`/`mkfs`/裸写块设备、`shutdown`/`reboot`/`halt`/`init 0/6`、`chmod 777 /`）在 **spawn 之前**拦截——**即便你刚点了批准**也生效（防审批疲劳误批）。它是**兜底不是沙箱**：无法理解意图，故意小而保守。
 - **参数向量 spawn**：`create_subprocess_exec("/bin/sh", "-c", cmd, …)`，**绝不** `shell=True`。
 - **进程组杀**：`start_new_session=True` 让 `sh -c` 及所有子孙同处一个进程组；超时/取消时整组 `SIGKILL`（不留孤儿）。
@@ -36,7 +36,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 防御纵深（全部在 `execute` 内，loop 不动）：
 
-- **恒 `ask`**：每次调用都需一次性人工审批，`path` / `old_string` / `new_string` **逐字**显示在审批卡上（模型无法自批）。`edit` 覆写了可选的 `approval_detail` 钩子，用一段**结构化的 `Action:` 块**（`📄 File:` + `🔁 Operation:` + `── old_string ──` / `── new_string ──` 逐字展示）替换默认的 `Arguments:` JSON——`old`/`new` 的**换行/空白原样保留**，便于属主精确比对将要匹配与替换的内容（该视图仍经 HTML 转义 + 长度有界，收尾时与 `Arguments:` 一并移除）。
+- **恒 `ask`**：每次调用都需一次性人工审批，`path` / `old_string` / `new_string` **逐字**显示在审批卡上（模型无法自批）。`edit` 覆写了可选的 `approval_detail` 钩子，把 `replace` 以 **git diff 风格**呈现在 `Action:` 块里（`📄 File:` + `🔁 Operation:` 行 + `--- a/<path>` / `+++ b/<path>` 头，随后 `old_string` 每行前缀 `-`、`new_string` 每行前缀 `+`；`new_string` 为空 = 纯删除，只有 `-` 没有 `+`）替换默认的 `Arguments:` JSON——属主像读任何 diff 一样审批这次改动（**换行/空白原样保留**），便于精确比对将要移除与替换的内容。`read` 没有 diff 可展示，只显示目标文件与操作。该代码块同时经 `approval_language` 钩子标注为 `diff`（见下），让 Telegram 按 diff 语法高亮而非猜测（该视图仍经 HTML 转义 + 长度有界，收尾时与 `Arguments:` 一并移除）。
 - **路径受限（核心安全属性）**：`path` 解析（含 `..` 与**符号链接**）后必须落在 `EDIT_WORKDIR` 内，否则**在任何读/写之前**即被拒（`edit_path_escape`）——`../` 逃逸、指向 root 外的绝对路径、指向外部的符号链接都逃不出去，**即便你刚点了批准**也读不写不出。正因如此 `EDIT_WORKDIR` 启用时**必填**（须为已存在目录，config 拒绝无它启动）。
 - **原子写**：新内容先写入**同目录** temp（`fsync` + `os.replace`），中途被杀不留半截文件（与附件存储、MCP 权限文件同一惯例）。
 - **输出/参数有界**：`read` 内容尾截断到 `MAX_EDIT_READ_CHARS`（加 `[N chars … truncated]` 标记，**不是**报错）；`old_string`/`new_string` 各自受 `MAX_EDIT_STRING_CHARS` 约束，且**同时**烧进参数 schema 的 `maxLength`——约束模型提案，也约束审批卡尺寸。
@@ -83,7 +83,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 由 `telegram/approval.py::TelegramApprovalBroker` 实现（唯一的 Telegram 知识来源，通过 `ToolApprovalProvider` 协议注入给渠道无关的 loop）：
 
-- 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息含固定标题、工具名、工具的安全**用途摘要**（`What it does:` 一行——描述工具**做什么**：内置工具各给一句固定的用途描述，MCP 工具展示其 `description`（用途）；摘要**本身**绝不回显参数），**若这次调用有参数**再另有一段参数视图——默认把**已 schema 校验**的参数以易读 JSON 展示在 `Arguments:` 的 `<pre><code>` 里（无参数且无详情则整段省略；值经 HTML 转义，无法注入标签）；工具若覆写可选的 `approval_detail` 钩子（如 `edit`），则改以它返回的**结构化纯文本**展示在 `Action:` 块里（同样转义 + 有界、`<pre><code>` 保留换行）——与过期提示。**参数/详情只出现在这张给主人看的审批卡片上**，卡片本身**不含** scope、chat id、密钥；参数**从不**写入日志、审计表，或面向模型的回退文案。
+- 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息含固定标题、工具名、工具的安全**用途摘要**（`What it does:` 一行——描述工具**做什么**：内置工具各给一句固定的用途描述，MCP 工具展示其 `description`（用途）；摘要**本身**绝不回显参数），**若这次调用有参数**再另有一段参数视图——默认把**已 schema 校验**的参数以易读 JSON 展示在 `Arguments:` 的 `<pre><code>` 里（无参数且无详情则整段省略；值经 HTML 转义，无法注入标签）；工具若覆写可选的 `approval_detail` 钩子（如 `edit`），则改以它返回的**结构化纯文本**展示在 `Action:` 块里（同样转义 + 有界、`<pre><code>` 保留换行）——与过期提示。**代码块语言标注**：`<pre>` 带一个 `class="language-…"` 属性，让 Telegram 按该语言做语法高亮而非猜测其语言——通用 `Arguments:` 块固定标 `json`，`Action:` 块用工具经 `approval_language` 钩子声明的**固定** Pygments 语言名（`edit` 的 `replace` → `diff`、`read` 无 diff 故不标注；`exec` → `bash`）；provider 只保留 `[A-Za-z0-9_-]`、截断到 24 字符并小写，所以该值无法注入第二个 `class`/闭合标签，返回空则不加标注。**参数/详情只出现在这张给主人看的审批卡片上**，卡片本身**不含** scope、chat id、密钥；参数**从不**写入日志、审计表，或面向模型的回退文案。
 - 每个 pending 请求绑定到「**发起者 + 原会话**」：用不可逆的 `hash_scope` 指纹比对发起者（从不持有原始 user id），并要求同一 chat。**其他用户——即使是 allow-list 里的——都收到同样的「已过期/无效」安全答复，且永远不能批准**（不泄露请求是否存在）。
 - **一次性**：首个有效决定即消费；重复点击、未知 id、上个进程留下的陈旧按钮、已过期请求都得到安全的「expired/invalid」，**绝不执行**。
 - **卡片原地收尾**：决定（批准 / 拒绝）或超时后，**同一条**消息（按 `message_id` 定位）被**原地编辑**一次——Approve / Deny 按钮（标为 **✅ Approve** / **❌ Deny**）被移除（空 `InlineKeyboardMarkup([])`，线上序列化为 `{}`，即 Bot API「移除键盘」信号；传 `None` 会被 PTB 丢掉、按钮残留），原来的「This approval is one-time and will expire shortly.」提示行被替换为一个**加粗、带 emoji 的状态词**——`<b>✅ Approved.</b>` / `<b>❌ Denied.</b>` / `<b>⏰ Expired (no decision in time).</b>`（不加 `Status:` 前缀），**`Arguments:` / `Action:` 段也一并移除**（按钮已消失，收尾卡片只保留标题、工具名、用途摘要与状态词），不再另发一条跟进消息。收尾是 best-effort：编辑失败绝不改变已决定的结果、不抛异常、不发消息。
@@ -144,7 +144,14 @@ class MyTool(Tool):
         # ——provider 会 HTML 转义 + 长度有界并放进 <pre><code>（保留换行）；**逐字**展示
         # 真实参数值，不要有损改写。默认返回 None → 用通用 JSON 块（MCP/echo/… 均不覆盖）。
         # 已用它覆写的内置工具：`exec`（命令以 `$ <command>` bash 块呈现）、
-        # `edit`（old/new 串以结构化 diff 呈现）。
+        # `edit`（old/new 串以 git diff 风格呈现：`-`/`+` 逐行、`--- a/` / `+++ b/` 头）。
+        return None
+
+    def approval_language(self, arguments) -> str | None:
+        # 可选：`Action:` 代码块的语言标注（**Pygments 语言名**，如 `diff`/`bash`/`json`），
+        # Telegram 据此做语法高亮而非猜测。必须是工具固定的词表（**不从参数内容推导**），
+        # provider 会清洗成安全的 `class="language-…"` 属性；返回 None → 代码块不加标注。
+        # `edit` 的 `replace` 返回 `diff`、`exec` 返回 `bash`；通用 `Arguments:` 块固定标 `json`。
         return None
 
     async def execute(self, arguments) -> str:
