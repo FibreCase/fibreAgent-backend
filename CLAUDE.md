@@ -52,6 +52,16 @@ decorator); config is in `pyproject.toml` `[tool.pytest.ini_options]`.
 
 ---
 
+## Working style
+
+- **Edit directly in the main checkout — do not create git worktrees for this
+  project.** The project is small; a worktree buys isolation it doesn't need and only
+  adds rebase/merge bookkeeping. Make changes and run tests from the repo root
+  (`/Users/fibrecase/Code/agent-backend`). This overrides the default "isolate each
+  task in a worktree" behaviour for this repo.
+
+---
+
 ## Configuration & secrets
 
 Everything external comes from env vars / `.env` (`config.py::load_config`).
