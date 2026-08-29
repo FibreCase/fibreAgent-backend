@@ -9,6 +9,7 @@ in one turn, and the infinite-loop iteration cap.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -124,8 +125,9 @@ async def test_single_tool_call_round_trip():
     assert assistant["tool_calls"][0]["function"]["name"] == "get_current_time"
     tool = second[-1]
     assert tool["tool_call_id"] == "call_1"
-    # get_current_time returns "YYYY-MM-DD HH:MM:SS".
-    assert len(tool["content"]) == 19
+    # get_current_time returns an ISO-8601 local timestamp with a UTC offset
+    # (e.g. "2026-08-29 13:37:37+08:00").
+    assert datetime.fromisoformat(tool["content"]).utcoffset() is not None
 
 
 # ---------------------------------------------------------------------------

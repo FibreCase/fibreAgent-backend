@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import platform
+from datetime import datetime
 
 import pytest
 
@@ -139,10 +140,20 @@ async def test_registry_execute_tolerates_missing_arguments():
 # ---------------------------------------------------------------------------
 # built-in tool sanity
 # ---------------------------------------------------------------------------
-async def test_get_current_time_returns_datetime_string():
+async def test_get_current_time_returns_datetime_with_timezone():
+    # The value is an ISO-8601 *local* timestamp carrying a UTC offset
+    # (e.g. "2026-08-29 13:37:37+08:00"), so it is unambiguous without also
+    # needing to know the machine's timezone.
     out = await GetCurrentTimeTool().execute({})
-    assert len(out) == 19  # "YYYY-MM-DD HH:MM:SS"
-    assert out[4] == "-" and out[10] == " "
+    assert out[4] == "-" and out[10] == " "  # "YYYY-MM-DD HH:MM:SS..."
+    parsed = datetime.fromisoformat(out)
+    assert parsed.utcoffset() is not None  # an explicit offset is present
+    # The date/time prefix matches the machine's current local time to the
+    # second (allow a 1s boundary-crossing race), and the offset matches the
+    # machine's own local offset.
+    now = datetime.now().astimezone()
+    assert abs((now - parsed).total_seconds()) <= 1
+    assert parsed.utcoffset() == now.astimezone().utcoffset()
 
 
 async def test_echo_returns_input_verbatim():
