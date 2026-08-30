@@ -280,6 +280,14 @@ class Config:
     max_file_read_chars: int = 8000
     max_file_list_entries: int = 1000
 
+    # Streaming replies: when on, *private* chats get a live "draft" compose-box
+    # preview (Bot API ``sendMessageDraft``) that updates as the model generates.
+    # Group / channel chats always degrade to the normal chunked reply (no
+    # draft), and a disabled value makes every chat behave exactly as before.
+    # Stopping a generation still uses the existing ``/stop`` command; the
+    # Bot API 10.3 in-message Stop button is a later phase.
+    enable_streaming: bool = True
+
     # Phase 9 (Automation, first slice): time-triggered scheduling. ``schedules``
     # is the parsed, validated list, read from the **default**
     # ``config/schedules.json`` when that file is present, the explicit
@@ -1476,6 +1484,9 @@ def load_config() -> Config:
     max_file_string_chars = _parse_int(os.environ.get("MAX_FILE_STRING_CHARS", ""), 2000)
     max_file_read_chars = _parse_int(os.environ.get("MAX_FILE_READ_CHARS", ""), 8000)
     max_file_list_entries = _parse_int(os.environ.get("MAX_FILE_LIST_ENTRIES", ""), 1000)
+    # Streaming replies (private chats): on by default; a bad value fails fast
+    # like every other bool knob.
+    enable_streaming = _parse_bool(os.environ.get("ENABLE_STREAMING", ""), True)
     return Config(
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         allowed_user_ids=_parse_user_ids(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")),
@@ -1518,6 +1529,7 @@ def load_config() -> Config:
         max_file_string_chars=max_file_string_chars,
         max_file_read_chars=max_file_read_chars,
         max_file_list_entries=max_file_list_entries,
+        enable_streaming=enable_streaming,
         schedules=schedules,
         schedule_timezone=schedule_timezone,
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",

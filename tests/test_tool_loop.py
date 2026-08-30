@@ -34,15 +34,19 @@ class FakeToolLLM:
         self.results = list(results)
         self.calls: list[dict[str, Any]] = []
 
-    async def complete(self, messages, *, tools=None):
+    async def complete(self, messages, *, tools=None, on_text_delta=None):
         self.calls.append(
-            {"messages": [m.to_dict() for m in messages], "tools": tools}
+            {"messages": [m.to_dict() for m in messages], "tools": tools, "on_text_delta": on_text_delta}
         )
         if not self.results:
             raise AssertionError("FakeToolLLM exhausted: no more scripted results")
         item = self.results.pop(0)
         if isinstance(item, Exception):
             raise item
+        # Mirror the real client: a content-bearing result forwards its text to
+        # the delta callback (tool-call-only results, with empty content, do not).
+        if on_text_delta is not None and isinstance(item, LLMResult) and item.text:
+            await on_text_delta(item.text)
         return item
 
 
@@ -250,3 +254,58 @@ async def test_unknown_tool_request_yields_error_result_not_crash():
     # JSON error with the ``unknown_tool`` code — never a raw trace/exception.
     payload = json.loads(tool_msg["content"])
     assert payload == {"error": {"code": "unknown_tool", "message": "This tool is not available."}}
+
+
+# ---------------------------------------------------------------------------
+# streaming passthrough (on_text_delta)
+# ---------------------------------------------------------------------------
+async def test_loop_forwards_on_text_delta_to_complete():
+    # The loop must pass the delta callback through to every llm.complete call.
+    calls: list[str] = []
+
+    async def cb(text):
+        calls.append(text)
+
+    llm = FakeToolLLM([LLMResult(content="just chat")])
+    result = await run_tool_loop(llm, _context(), None, max_iterations=5, on_text_delta=cb)
+
+    # The single fast-path completion saw the callback.
+    assert llm.calls[0]["on_text_delta"] is cb
+    # The callback fired once with the content (the fake forwards content text).
+    assert calls == ["just chat"]
+    # The loop still returns the final result unchanged.
+    assert result.text == "just chat"
+
+
+async def test_loop_only_final_content_turn_streams():
+    # With tools: the tool-call turn (empty content) must NOT forward text; only
+    # the final content-bearing turn does.
+    calls: list[str] = []
+
+    async def cb(text):
+        calls.append(text)
+
+    llm = FakeToolLLM(
+        [
+            LLMResult(content=None, tool_calls=[_tc("get_current_time", {})]),
+            LLMResult(content="It is the time."),
+        ]
+    )
+    reg = build_default_tools()
+    result = await run_tool_loop(llm, _context(), reg, max_iterations=5, on_text_delta=cb)
+
+    # Both completions received the callback...
+    assert llm.calls[0]["on_text_delta"] is cb
+    assert llm.calls[1]["on_text_delta"] is cb
+    # ...but it only fired for the content-bearing (final) turn, never the
+    # tool-call turn.
+    assert calls == ["It is the time."]
+    assert result.text == "It is the time."
+
+
+async def test_loop_no_callback_keeps_existing_behaviour():
+    # Default (no on_text_delta): every completion sees None, nothing streams.
+    llm = FakeToolLLM([LLMResult(content="plain")])
+    result = await run_tool_loop(llm, _context(), None, max_iterations=5)
+    assert llm.calls[0]["on_text_delta"] is None
+    assert result.text == "plain"

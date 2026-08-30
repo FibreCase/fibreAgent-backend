@@ -88,6 +88,6 @@ uv run python -m fibrecase_agent_backend
 
 ## 当前开发状态
 
-已在 Telegram 上跑通、全部通过测试的最小个人 Agent backend。核心能力：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio，默认 `ask`）+ **MCP 用户级 OAuth**、**只读基础设施观测（SSH）**、**定时任务（cron）**（启动配置声明、到点自动跑一次、专属全新会话、复用既有安全边界）、**可选的 `exec` shell 工具**与**可选的 `file` 文件工具集**（两者均**默认关闭**；`file` 里 `file_read` / `file_ls` 只读免审批，其余每次调用恒需人工审批）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。
+已在 Telegram 上跑通、全部通过测试的最小个人 Agent backend。核心能力：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio，默认 `ask`）+ **MCP 用户级 OAuth**、**只读基础设施观测（SSH）**、**定时任务（cron）**（启动配置声明、到点自动跑一次、专属全新会话、复用既有安全边界）、**流式回复**（`ENABLE_STREAMING`，默认开——私聊输入框的实时草稿预览随模型生成逐词更新，完整回复仍照常发送；群组/频道自动降级为「正在输入…」+ 分块回复）、**可选的 `exec` shell 工具**与**可选的 `file` 文件工具集**（两者均**默认关闭**；`file` 里 `file_read` / `file_ls` 只读免审批，其余每次调用恒需人工审批）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。
 
 > **默认部署零子进程、零文件写入、零联网扫描**——两个状态变更能力 `exec` / `file` 是 opt-in 的（`ENABLE_EXEC_TOOL` / `ENABLE_FILE_TOOL`），且各自带静态兜底（`exec` 的危险命令 denylist、`file` 的 `FILE_WORKDIR` 路径受限）与逐次审批。**完整的能力清单、安全说明、有意不做 / 限制与下一步，见 [当前开发状态](docs/status.md)；`exec` / `file` 的安全细节见 [工具与工具安全](docs/tools.md)。**

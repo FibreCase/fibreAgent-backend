@@ -40,6 +40,7 @@ implemented, mocked-tested, and released:
 - **Phase 5.1 (Read-Only Infrastructure Observation via SSH)** — implemented and mocked-tested on top of that (release pending)
 - An **opt-in `exec` shell tool** (default off, always `ask`, with a static catastrophic-command backstop) — implemented and tested on top of that
 - An **opt-in `file` toolset** (default off; `file_read`/`file_ls` read-only `allow`, the other seven tools always `ask`; confined to `FILE_WORKDIR` against `../` and symlink escape, precise replace + narrow non-overwriting file/directory operations) — implemented and tested on top of that
+- **Streaming replies** (Bot API 10.0 `sendMessageDraft`; `ENABLE_STREAMING`, default on) — a live draft-preview in a private chat's compose box that animates as the model generates, with the full reply still delivered as a normal message; group/channel chats and a disabled knob degrade to the classic "typing…" + chunked reply. The Bot API 10.3 Stop button is a later phase (stop stays on `/stop`). Implemented and mocked-tested on top of that.
 
 ### Phase 1
 
@@ -672,6 +673,95 @@ audited.** Five config knobs (`config.py`): `ENABLE_FILE_TOOL` (default `false`)
 knobs are validated **only when enabled**. `main.py` registers the toolset in
 `build_default_tools(...)` **only when** `ENABLE_TOOLS` and `ENABLE_FILE_TOOL` are
 both true (added last, after `exec`).
+
+---
+
+### Streaming replies (Bot API 10.0 `sendMessageDraft`)
+
+A **private** chat with `ENABLE_STREAMING=true` (default) shows a live Telegram
+*draft* in the compose box that animates as the model generates, **in parallel
+with** the "typing…" keep-alive — the typing action is the fallback that stays
+visible if the draft can't be shown (the bot isn't on Telegram's streaming
+allowlist, so `send_message_draft` is rejected fail-soft). Group/channel chats and
+a disabled knob always degrade to the classic "typing…" + chunked final reply.
+The full reply is still **always** delivered as a normal message afterwards — the
+draft is a *preview only*.
+
+**The channel-agnostic `on_text_delta` seam.** Streaming is expressed as a callback
+that is threaded down three layers, keeping `AgentService` free of any transport
+import and `process_message`'s `-> str` return shape intact:
+
+1. **`llm/client.py::LLMClient.complete`** now takes
+   `on_text_delta: Callable[[str], Awaitable[None]] | None = None`. `None` → the
+   unchanged non-streaming path. Set → the request is sent with `stream=True` and
+   `complete` async-iterates `client.chat.completions.create(..., stream=True)`,
+   accumulating `chunk.choices[0].delta.content` and awaiting
+   `on_text_delta(<accumulated-so-far text>)` on every non-empty content piece.
+   `delta.tool_calls` fragments (keyed by `.index`; the first fragment supplies
+   `id`/`type`/`name`, later ones append `arguments`) are reassembled via
+   `_accumulate_tool_call_fragment`, so a streamed tool-call turn yields the same
+   `LLMResult.tool_calls` a non-streaming turn would. The four exception→`LLMError`
+   mappings (timeout / http_error / connection / empty_response) are unchanged;
+   `usage` is `None` on the streaming path (a draft is not a billable final
+   completion). `complete` still returns the full `LLMResult` — `process_message`
+   persists it exactly as before.
+2. **`agent/tool_loop.py::run_tool_loop`** and **`agent/service.py::process_message`**
+   each take the same `on_text_delta` and forward it to the LLM `complete`. Because
+   only content-bearing *final* turns emit `delta.content` (a tool-call turn's
+   `content` is empty), text is streamed only on the answer turn, automatically.
+   **Forwarding is conditional**: the callback is passed to `complete` *only when it
+   is not `None`*, so an LLM client (or a test fake) that has no notion of
+   `on_text_delta` still works when a caller doesn't stream.
+3. **`telegram/bot.py`** (the only layer that knows about Telegram) builds the
+   callback via `_DraftStreamer` and hands it to
+   `service.process_message(..., on_text_delta=streamer.on_delta)`. It is the
+   **only** place that decides *when* a chat streams:
+   `streaming = bool(config.enable_streaming) and chat.type == ChatType.PRIVATE`.
+
+**`_DraftStreamer`** (in `telegram/bot.py`) coalesces the burst of per-token deltas
+into throttled, fail-soft `send_message_draft(chat_id, draft_id, text)` updates:
+
+- **Throttle**: a delta is pushed only if `>= DRAFT_REFRESH_SECONDS` (0.3 s) since
+  the last push; `finalize(text)` does one trailing push of the *complete* reply so
+  the preview ends showing the full answer before the real message lands.
+- **Preview cap**: `send_message_draft` is called with the *tail* of the
+  accumulated text (`_tail_preview`, capped at `CHUNK_SIZE`) — a draft only shows
+  its tail, and we never send an oversized text. The **final** message is delivered
+  whole via `_send_long` regardless of length.
+- **Fail-soft**: a `TelegramError` from a draft update (the most common cause — the
+  bot not being on Telegram's streaming allowlist) is logged *without* a traceback
+  and swallowed. The turn keeps running and the full reply is always sent as a
+  normal message, so a draft failure costs the user nothing.
+- **Privacy**: a push logs only the chat id and the *class* of any error — **never
+  the draft body** (message content must not reach the logs/audit, per the privacy
+  invariant).
+- **Cancellable**: `on_delta` deliberately does **not** catch `CancelledError`. A
+  `/stop` mid-generation cancels the turn; the cancellation propagates through the
+  in-flight `await on_text_delta(...)` and `handle_message`'s existing
+  `except asyncio.CancelledError` posts the "⛔️ **Interrupted.**" notice.
+- **Typing keep-alive runs in parallel**: the streaming branch also wraps
+  `process_message` in `_with_typing`, so the "typing…" action fires alongside the
+  draft. The draft is the *preferred* indicator; the typing action is the *fallback*
+  that stays visible when the draft can't be shown (the bot is not on Telegram's
+  streaming allowlist, so `send_message_draft` is rejected fail-soft). Without this,
+  such a deployment would have **no** "the bot is working" feedback at all. When the
+  draft *can* be shown the typing action is at worst a harmless duplicate (and if
+  Telegram rejects a typing action while a draft is up, `_typing_loop` already
+  swallows that error).
+- Each streaming turn gets a fresh positive, non-zero `draft_id` from a
+  module-level `itertools.count(1)`. The draft is ephemeral (~30 s after the last
+  update), so ids are never persisted.
+
+**The Bot API 10.3 Stop button is a later phase.** PTB 22.8 exposes
+`send_message_draft` but **not** the 10.3 stop-button primitives (`can_stop` /
+`keep_on_stop` / `MessageGenerationStopped`). So the interactive *stop* path is the
+existing `/stop` command (which cancels the in-flight turn), not a per-message Stop
+button. Adding the 10.3 button is a follow-on once PTB ships those APIs.
+
+**The scheduler path stays non-streaming.** `main.py::_run_schedule` calls
+`process_message` **without** `on_text_delta`, so scheduled (cron) runs always use
+the non-streaming path and deliver their notification via `deliver_markdown` — there
+is no compose-box venue for a scheduled run, and no callback is wired.
 
 ---
 
@@ -1563,6 +1653,24 @@ Two non-obvious rules:
   message. Hitting it raises a `ToolLoopLimitError`, surfaced to the user as a generic,
   user-safe "too many tool calls" message (category `tool_limit`).
 
+### Streaming replies knob (Bot API 10.0 `sendMessageDraft`)
+
+- **`ENABLE_STREAMING`** (default **`true`**): the opt-in switch for *streaming*
+  (draft-preview) replies. When on, a **private** chat shows a live Telegram *draft*
+  in the compose box that animates as the model generates (via
+  `telegram.ext`'s `sendMessageDraft`), **in parallel with** the "typing…" keep-alive
+  (the typing action is the fallback that stays visible if the draft can't be shown —
+  i.e. the bot isn't on Telegram's streaming allowlist). **Group/channel chats always
+  degrade** to the classic "typing…" + chunked final reply (a draft only applies to
+  private chats). When off, every chat uses the classic "typing…" + chunked reply
+  path. Parsed as a strict boolean like every other knob (`ConfigError` on a bad
+  value, fail-fast).
+
+  The full mechanism is described in the
+  [Streaming replies](#streaming-replies--bot-api-100-sendmessagedraft) phase note below
+  and the module reference entries for `llm/client.py` (the `on_text_delta` seam) and
+  `telegram/bot.py` (`_DraftStreamer`).
+
 ### Multimodal-input knob (phase 2.2)
 
 - **`MAX_IMAGE_SIZE_MB`** (default `10`): a Telegram photo larger than this is refused
@@ -2372,6 +2480,28 @@ A map of which behaviours each phase covers:
   disabled/none/multiple branches, calendar-impossible → "never (untriggerable)",
   **only** name + cron + next-fire rendered — **never** prompt/chat_id/user_id,
   unauthorised → silent, and it never triggers a run / calls the LLM).
+
+### Streaming replies — behaviour coverage
+
+`tests/test_streaming_config.py` (the `ENABLE_STREAMING` knob: default **on**,
+explicit on/off, case-insensitive, bad value → `ConfigError`),
+`tests/test_llm_client.py` (the `on_text_delta` seam: accumulates + forwards
+*accumulated-so-far* text and ends at the full reply; forwards content not
+tool-calls; `None` stays non-streaming; timeout / http_error / connection /
+empty_response all still translate to `LLMError` mid-stream; a tool-call-only
+stream is *not* an `empty_response`), `tests/test_tool_loop.py` (the callback is
+forwarded to `complete` on every turn, only the final content turn streams, and
+no callback keeps the existing behaviour), `tests/test_agent.py`
+(`process_message` streams accumulated text and returns the same final string;
+no callback is unchanged; streaming flows through the tool loop), and
+`tests/test_telegram.py` (`_tail_preview` keeps the tail beyond the cap;
+`_DraftStreamer` throttles a delta burst and pushes the complete reply on
+`finalize`; a draft `TelegramError` fails soft and **never** logs the draft body;
+**private + `ENABLE_STREAMING=true`** → a draft with a positive `draft_id`, **no**
+typing, and the full reply still sent as a normal message; **group** (and
+**`ENABLE_STREAMING=false`**) → no draft, typing keep-alive fires; a rejected draft
+still leaves the full final message delivered; the reply body never reaches the
+logs). **All mocked** — no real LLM/Telegram/network.
 
 ---
 

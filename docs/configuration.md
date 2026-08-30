@@ -215,6 +215,23 @@ TOOL_TIMEOUT_SECONDS=30
 
 **说明**：单个工具调用的最长执行秒数；超时即取消该工具并回给模型「工具超时」。必须为正数。（无需单独开关启用审计日志：只要 `ENABLE_TOOLS=true` 审计即开启，事件可用 `/tool_audit` 查看。）
 
+### Streaming replies
+
+#### `ENABLE_STREAMING`
+
+**默认值**：`true`
+
+**示例**
+
+```
+ENABLE_STREAMING=true
+```
+
+**说明**：是否启用**流式（draft 预览）回复**。`true` 时，**私聊**会随模型生成逐词更新一个 Telegram **草稿（compose-box 预览，Bot API `sendMessageDraft`）**，**同时**保留「正在输入…」指示作为兜底（草稿能显示时草稿为主、typing 为辅；草稿被拒时 typing 仍在，用户始终能看到「bot 在工作」）；**群组 / 频道**始终自动降级为原有的「正在输入…」+ 分块最终回复（draft 只适用于私聊）。设为 `false` 则完全退回「正在输入…」+ 分块回复（所有聊天都走这条老路径）。
+
+- 草稿是**临时的**（约 30 秒无更新即过期），且**只是预览**：完整回复**始终**照常作为普通消息发出，因此即便你的 bot 尚未被 Telegram 加入流式白名单（`sendMessageDraft` 会被拒），也**无损**——草稿失败被静默吞掉（typing 指示照常兜底），日志只记录错误类别（**永不**记录回复正文），最终消息照常送达。
+- **停止**中途生成仍用 `/stop`（取消当前回合）；本旋钮不改变停止语义。
+
 ### Remote MCP tools（Streamable HTTP + stdio）
 
 #### `MCP_SERVERS`

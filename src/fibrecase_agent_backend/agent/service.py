@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 
 from ..attachments import AttachmentStore, AttachmentStoreError
@@ -551,6 +552,7 @@ class AgentService:
         *,
         memory_scope: str | None = None,
         delivery_chat_id: int | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """Process one inbound message and return the assistant reply text.
 
@@ -581,6 +583,15 @@ class AgentService:
         ``metadata`` so the approval broker delivers the card there instead of
         resolving the conversation's own chat. When ``None`` (every interactive
         caller) the path is byte-for-byte unchanged.
+
+        ``on_text_delta`` (optional) is a channel-agnostic streaming hook. When
+        given, it is threaded down to the LLM call and awaited with the
+        accumulated-so-far assistant text after each content delta, so a
+        transport (e.g. the Telegram adapter's draft preview) can mirror
+        in-progress output. It is **forwarded, not inspected**: this method
+        never imports or knows about any transport, and its return value is the
+        same final ``str`` regardless of whether streaming was requested. When
+        ``None`` the path is byte-for-byte unchanged.
         """
         # Normalise a plain string to a single-part text message so both entry
         # points share one code path; a string with no text short-circuits.
@@ -744,6 +755,12 @@ class AgentService:
                         exc_info=True,
                     )
 
+            # The streaming callback is forwarded to the LLM only when a transport
+            # actually supplied one; a caller that doesn't stream passes ``None``
+            # and the kwarg is omitted, so an LLM client that has no notion of
+            # ``on_text_delta`` still works.
+            _delta_kwargs = {"on_text_delta": on_text_delta} if on_text_delta is not None else {}
+
             try:
                 if self._enable_tools:
                     result = await run_tool_loop(
@@ -759,10 +776,11 @@ class AgentService:
                         conversation_id=conversation_id,
                         scope=memory_scope,
                         delivery_chat_id=delivery_chat_id,
+                        on_text_delta=on_text_delta,
                     )
                 else:
                     # Phase-one path: one completion, no tools.
-                    result = await self._llm.complete(context)
+                    result = await self._llm.complete(context, **_delta_kwargs)
             except LLMError as exc:
                 logger.error(
                     "llm failure",

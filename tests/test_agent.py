@@ -69,6 +69,92 @@ async def test_process_message_saves_and_returns(repo):
     ]
 
 
+class StreamingFakeLLM:
+    """A no-tools LLM fake that forwards its reply as incremental deltas.
+
+    When ``complete`` receives a non-None ``on_text_delta`` it emits the reply
+    word by word as the *accumulated* text (mirroring the real client), then
+    returns the full reply as the final :class:`LLMResult`.
+    """
+
+    def __init__(self, reply: str):
+        self._reply = reply
+
+    async def complete(self, messages, **kwargs):
+        on_text_delta = kwargs.get("on_text_delta")
+        words = self._reply.split(" ")
+        if on_text_delta is not None:
+            parts = words.copy()
+            accumulated = ""
+            for i, w in enumerate(parts):
+                accumulated = w if i == 0 else accumulated + " " + w
+                await on_text_delta(accumulated)
+        return LLMResult(content=self._reply)
+
+
+async def test_process_message_streams_accumulated_text_and_returns_final(repo):
+    conv = await repo.get_or_create_conversation(1, 1)
+    reply_text = "The quick brown fox"
+    service = _service(repo, StreamingFakeLLM(reply_text))
+
+    seen: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        seen.append(text)
+
+    reply = await service.process_message(conv.id, "go", on_text_delta=on_delta)
+
+    # The callback saw the growing accumulated text, ending at the full reply.
+    assert seen == ["The", "The quick", "The quick brown", "The quick brown fox"]
+    assert seen[-1] == reply_text
+    # The return value is the same final string, and it was persisted.
+    assert reply == reply_text
+    records = await repo.get_messages(conv.id)
+    assert [(r.role, r.content) for r in records] == [
+        ("user", "go"),
+        ("assistant", reply_text),
+    ]
+
+
+async def test_process_message_no_callback_is_unchanged(repo):
+    conv = await repo.get_or_create_conversation(1, 1)
+    service = _service(repo, StreamingFakeLLM("just a reply"))
+    reply = await service.process_message(conv.id, "hi")
+    assert reply == "just a reply"
+
+
+async def test_process_message_streams_through_tool_loop(repo):
+    # A tools-enabled service must forward on_text_delta through the loop; only
+    # the final content-bearing turn emits text, the tool-call turn does not.
+    conv = await repo.get_or_create_conversation(1, 1)
+
+    class ToolThenAnswerLLM:
+        def __init__(self):
+            self._n = 0
+
+        async def complete(self, messages, **kwargs):
+            on_text_delta = kwargs.get("on_text_delta")
+            self._n += 1
+            if self._n == 1:
+                return LLMResult(content=None, tool_calls=[_tc("get_current_time", {})])
+            final = "Now I know the time."
+            if on_text_delta is not None:
+                for acc in ["Now", "Now I know", "Now I know the time."]:
+                    await on_text_delta(acc)
+            return LLMResult(content=final)
+
+    service = _service(repo, ToolThenAnswerLLM(), enable_tools=True, registry=build_default_tools())
+    seen: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        seen.append(text)
+
+    reply = await service.process_message(conv.id, "time?", on_text_delta=on_delta)
+    # Only the final turn streamed; the tool-call turn contributed nothing.
+    assert seen == ["Now", "Now I know", "Now I know the time."]
+    assert reply == "Now I know the time."
+
+
 async def test_process_message_rebuilds_context_across_turns(repo):
     conv = await repo.get_or_create_conversation(1, 1)
     llm = FakeLLM(replies=["ok"])

@@ -14,16 +14,18 @@ from unittest.mock import AsyncMock, patch
 
 from telegram import Chat, Message, Update, User
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import CallbackContext
 
 from fibrecase_agent_backend import __version__
 from fibrecase_agent_backend.telegram.bot import (
     CHUNK_SIZE,
     _COMMANDS,
+    _DraftStreamer,
     _IN_FLIGHT,
     _is_authorized,
     _send_long,
+    _tail_preview,
     cmd_context,
     cmd_forget,
     cmd_help,
@@ -46,15 +48,22 @@ from fibrecase_agent_backend.telegram.bot import (
 class _StubBot:
     def __init__(self) -> None:
         self.actions = 0
+        self.drafts: list[dict] = []  # one entry per send_message_draft call
 
     async def send_chat_action(self, chat_id, action):  # pragma: no cover - trivial
         self.actions += 1
 
+    async def send_message_draft(self, chat_id, draft_id, text=None, **kwargs):
+        # Records the preview update. Tests may override this on an instance to
+        # raise (to exercise the fail-soft path).
+        self.drafts.append({"chat_id": chat_id, "draft_id": draft_id, "text": text})
+        return True
 
-def _make(user_id, chat_id, text=None, *, allowed=(1,)):
+
+def _make(user_id, chat_id, text=None, *, allowed=(1,), chat_type="private"):
     """Build a real Update + CallbackContext (like PTB would deliver)."""
     user = None if user_id is None else User(id=user_id, first_name="U", is_bot=False)
-    chat = Chat(id=chat_id, type="private")
+    chat = Chat(id=chat_id, type=chat_type)
     message = (
         Message(message_id=1, date=0, chat=chat, from_user=user, text=text)
         if text is not None
@@ -94,6 +103,7 @@ class _FakeService:
         self.delay = delay
         self.calls = []
         self.reset_calls = []
+        self.on_text_delta = None  # set by process_message when a callback is handed in
         # Phase 2.5 memory command state (mutable, in-memory).
         self._memories = {}
         self._mem_seq = 0
@@ -102,10 +112,19 @@ class _FakeService:
         self.forget_calls = []
         self.forget_all_calls = []
 
-    async def process_message(self, conv_id, text, *, memory_scope=None):
+    async def process_message(self, conv_id, text, *, memory_scope=None, on_text_delta=None):
         self.calls.append((conv_id, text))
+        self.on_text_delta = on_text_delta  # last callback handed in (if any)
         if self.delay:
             await asyncio.sleep(self.delay)
+        if on_text_delta is not None:
+            # Mimic the real service: hand the accumulated-so-far text through,
+            # word by word, ending at the full reply.
+            words = self.reply.split(" ")
+            acc = ""
+            for i, w in enumerate(words):
+                acc = w if i == 0 else acc + " " + w
+                await on_text_delta(acc)
         return self.reply
 
     async def conversation_status(self, conv_id):
@@ -184,6 +203,11 @@ class _FakeMemoryRecord:
 class _FakeConfig:
     openai_model = "test-model"
     max_image_size_bytes = 10_000_000
+    enable_streaming = False  # off by default in tests; streaming tests opt in
+
+    def __init__(self, *, enable_streaming=False):
+        # A per-instance override so the streaming tests can flip it on.
+        self.enable_streaming = enable_streaming
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +277,7 @@ async def test_handle_message_surfaces_user_safe_llm_error():
     from fibrecase_agent_backend.agent.service import AgentError
 
     class _ErrorService(_FakeService):
-        async def process_message(self, conv_id, text, *, memory_scope=None):
+        async def process_message(self, conv_id, text, *, memory_scope=None, on_text_delta=None):
             raise AgentError("模型请求超时，请稍后重试。", "timeout")
 
     update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
@@ -865,3 +889,147 @@ async def test_schedule_status_never_triggers_a_run():
     with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
         await cmd_schedule_status(update, context)
     assert "nightly" in _sent_text(send)[0]
+
+
+# ---------------------------------------------------------------------------
+# streaming replies (Bot API 10.0 ``sendMessageDraft``)
+#
+# A *private* chat with ``ENABLE_STREAMING=true`` shows a live draft preview
+# (``_DraftStreamer`` → ``send_message_draft``) *in parallel with* the "typing…"
+# keep-alive — the typing action is the fallback that stays visible if the draft
+# is rejected (the bot isn't on Telegram's streaming allowlist). Group/channel
+# chats and a disabled knob always degrade to the classic typing + chunked final
+# reply. The draft is *fail-soft* (a rejected draft costs nothing — the full
+# reply is always sent as a normal message) and *private* (the draft body never
+# reaches the logs).
+# ---------------------------------------------------------------------------
+def test_tail_preview_keeps_tail_beyond_limit():
+    assert _tail_preview("short", limit=10) == "short"
+    # Over the limit: the tail is kept, prefixed with "…\n", and the result is
+    # exactly ``limit`` long.
+    preview = _tail_preview("x" * 50, limit=10)
+    assert preview == "…\n" + "x" * 8
+    assert len(preview) == 10
+
+
+async def test_draft_streamer_throttles_and_pushes_final():
+    bot = _StubBot()
+    streamer = _DraftStreamer(bot, chat_id=1, draft_id=7)
+    # Feed a burst of accumulated-so-far text: only the first call (and the
+    # explicit finalize) should reach the API, the mid-burst deltas coalesce.
+    for acc in ["a", "ab", "abc"]:
+        await streamer.on_delta(acc)
+    await streamer.finalize("abc")
+
+    assert len(bot.drafts) >= 2  # at least the first delta + the final
+    assert all(d["draft_id"] == 7 for d in bot.drafts)
+    assert all(d["chat_id"] == 1 for d in bot.drafts)
+    # The final preview shows the complete answer.
+    assert bot.drafts[-1]["text"] == "abc"
+
+
+async def test_draft_streamer_fail_soft_swallows_telegram_error(caplog):
+    from telegram.error import BadRequest
+
+    bot = _StubBot()
+    bot.send_message_draft = AsyncMock(side_effect=BadRequest("not on allowlist"))
+    streamer = _DraftStreamer(bot, chat_id=1, draft_id=7)
+
+    # Neither the delta nor the finalize raises — the failure is swallowed.
+    await streamer.on_delta("The secret answer body")
+    await streamer.finalize("The secret answer body")
+
+    # The draft body must NOT appear in any log record (privacy invariant);
+    # only the class of the error is logged, never the text.
+    assert "The secret answer body" not in caplog.text
+
+
+async def test_private_streaming_shows_draft_and_typing_fallback():
+    reply = "The quick brown fox"
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
+    service = _FakeService(reply=reply, delay=0.1)  # long enough for typing to fire
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = service
+    app.bot_data["config"] = _FakeConfig(enable_streaming=True)
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await handle_message(update, context)
+
+    # A live draft preview was pushed (draft_id is a positive, non-zero int).
+    assert len(bot.drafts) >= 1
+    assert all(d["draft_id"] >= 1 for d in bot.drafts)
+    # The "typing…" keep-alive runs *in parallel* as a fallback: it stays visible
+    # if the draft is rejected (bot not on the streaming allowlist). So even on
+    # the streaming branch a typing action fires.
+    assert bot.actions >= 1
+    # The full reply was *also* delivered as a normal (final) message, quoting
+    # the user's message.
+    assert send.await_args_list
+    assert reply in _sent_text(send)
+
+
+async def test_group_never_streams_uses_typing():
+    reply = "hello group"
+    update, chat, context, app, bot = _make(
+        user_id=1, chat_id=1, text="hi", allowed=(1,), chat_type="group"
+    )
+    service = _FakeService(reply=reply, delay=0.1)  # long enough for typing to fire
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = service
+    app.bot_data["config"] = _FakeConfig(enable_streaming=True)  # on, but group ⇒ degrade
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await handle_message(update, context)
+
+    # Group chats degrade: no draft preview, but the classic typing keep-alive.
+    assert bot.drafts == []
+    assert bot.actions >= 1
+    assert reply in _sent_text(send)
+
+
+async def test_streaming_disabled_private_no_draft():
+    reply = "plain reply"
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
+    service = _FakeService(reply=reply, delay=0.1)
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = service
+    app.bot_data["config"] = _FakeConfig(enable_streaming=False)  # private but knob off
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await handle_message(update, context)
+
+    assert bot.drafts == []
+    assert bot.actions >= 1  # fell back to typing
+    assert reply in _sent_text(send)
+
+
+async def test_draft_failure_still_sends_final_message():
+    from telegram.error import BadRequest
+
+    reply = "still delivered"
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
+    service = _FakeService(reply=reply)
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = service
+    app.bot_data["config"] = _FakeConfig(enable_streaming=True)
+    # The bot isn't on the streaming allowlist: every draft is rejected. The
+    # handler must swallow it (fail-soft) and still deliver the full reply.
+    bot.send_message_draft = AsyncMock(side_effect=BadRequest("not on allowlist"))
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await handle_message(update, context)  # must not raise
+
+    # No draft ever landed (all rejected)…
+    assert bot.drafts == []
+    # …but the normal final message still went out with the full reply.
+    assert reply in _sent_text(send)
+
+
+async def test_streaming_final_log_does_not_leak_reply_body(caplog):
+    reply = "TOP-SECRET-REPLY-BODY-XYZ"
+    update, chat, context, app, bot = _make(user_id=1, chat_id=1, text="hello", allowed=(1,))
+    service = _FakeService(reply=reply)
+    app.bot_data["repository"] = _FakeRepo()
+    app.bot_data["agent_service"] = service
+    app.bot_data["config"] = _FakeConfig(enable_streaming=True)
+    with patch.object(Chat, "send_message", new_callable=AsyncMock):
+        with caplog.at_level("DEBUG", logger="telegram"):
+            await handle_message(update, context)
+    # The model reply is delivered, but it must never be written to the logs.
+    assert reply not in caplog.text

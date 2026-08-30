@@ -25,13 +25,15 @@ chat and message from the ``Update`` object (``update.effective_user``,
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
 from telegram import BotCommand, Chat, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
@@ -61,6 +63,19 @@ TELEGRAM_MESSAGE_LIMIT = 4096
 CHUNK_SIZE = 4000
 # Telegram only displays "typing…" for ~5 seconds, so refresh a bit faster.
 TYPING_REFRESH_SECONDS = 4.0
+
+# --- Streaming replies (Bot API 10.0 ``sendMessageDraft``) ---------------------
+# A private chat with ``ENABLE_STREAMING=true`` shows a live "draft" preview in
+# the compose box that animates as the model generates. We push updates at most
+# once per interval (coalescing the burst of per-token deltas) and keep the
+# preview within the same length cap we use for final delivery.
+DRAFT_REFRESH_SECONDS = 0.3
+DRAFT_PREVIEW_LIMIT = CHUNK_SIZE
+# A process-wide, monotonically increasing supply of non-zero ``draft_id``
+# values. Each streaming turn gets a fresh id; reusing one id animates, and a
+# fresh id per turn keeps turns independent. (The draft is ephemeral — it
+# expires ~30s after the last update — so ids are never persisted.)
+_DRAFT_IDS = itertools.count(1)
 
 # Single source of truth for the command list: rendered by ``cmd_help`` and
 # advertised to Telegram's native "/" menu. ``(command, short_description)``.
@@ -220,6 +235,90 @@ def _is_authorized(update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         )
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# streaming draft preview (Bot API 10.0 ``sendMessageDraft``)
+# ---------------------------------------------------------------------------
+def _tail_preview(text: str, limit: int = DRAFT_PREVIEW_LIMIT) -> str:
+    """Return ``text`` if it fits the preview cap, else its tail.
+
+    A draft is a *live preview* — only its tail is visible in the compose box.
+    When the accumulated reply outgrows the cap we keep the most recent part
+    and prefix it with a "…" so the user sees the newest tokens, not an old
+    opening. (The *final* message is always delivered whole via ``_send_long``.)
+    """
+    if len(text) <= limit:
+        return text
+    return "…\n" + text[-(limit - 2):]
+
+
+class _DraftStreamer:
+    """Coalesces the Agent service's ``on_text_delta`` stream into throttled,
+    fail-soft ``sendMessageDraft`` updates for one chat, then finalises.
+
+    The Agent service hands us **accumulated-so-far** text on every token
+    (many calls per second). Pushing each to Telegram verbatim would hammer
+    the API and, on a bot that isn't on the streaming allowlist, fail every
+    call. So we:
+
+    * keep the latest text and *throttle* pushes to at most one per
+      ``interval`` seconds (a trailing push guarantees the last chunk lands), and
+    * **fail soft**: a draft update that Telegram rejects (the most common
+      cause — the bot not being on the streaming allowlist — a
+      ``TelegramError``) is logged without a traceback and swallowed. The
+      turn keeps running and the full reply is always sent as a normal
+      message by the caller, so a draft failure costs the user nothing.
+
+    Privacy: a push logs only the chat id and *class* of any error — never the
+    draft body (message content must not reach the logs/audit, per the
+    privacy invariant).
+    """
+
+    def __init__(self, bot, chat_id: int, draft_id: int, *, interval: float = DRAFT_REFRESH_SECONDS) -> None:
+        self._bot = bot
+        self._chat_id = chat_id
+        self._draft_id = draft_id
+        self._interval = interval
+        self._pending: str | None = None
+        self._last_push = 0.0
+
+    async def on_delta(self, text: str) -> None:
+        """Accumulated-so-far callback — the ``on_text_delta`` we hand down.
+
+        Stashes the latest text and pushes when due. Must **not** swallow
+        ``CancelledError``: a ``/stop`` mid-generation cancels the turn, and
+        that must propagate so the caller's cleanup runs.
+        """
+        self._pending = text
+        now = time.monotonic()
+        if now - self._last_push >= self._interval:
+            await self._flush(now)
+
+    async def finalize(self, final_text: str) -> None:
+        """Send one last draft update with the *complete* reply, so the preview
+        ends showing the full answer just before the real message is sent."""
+        self._pending = final_text
+        await self._flush(time.monotonic())
+
+    async def _flush(self, now: float) -> None:
+        if self._pending is None:
+            return
+        self._last_push = now
+        try:
+            await self._bot.send_message_draft(
+                self._chat_id,
+                draft_id=self._draft_id,
+                text=_tail_preview(self._pending),
+            )
+        except TelegramError:
+            # Fail soft: e.g. the bot isn't on the streaming allowlist. Log the
+            # class only — never the draft body (privacy invariant).
+            logger.debug(
+                "draft update not delivered; continuing to normal send",
+                extra={"chat_id": self._chat_id},
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -919,11 +1018,45 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     bot_data.setdefault(_IN_FLIGHT, {})[chat.id] = asyncio.current_task()
     try:
         try:
-            reply = await _with_typing(
-                context.bot,
-                chat.id,
-                service.process_message(conversation_id, agent_message, memory_scope=_memory_scope(update)),
-            )
+            # Streaming replies: a *private* chat with ``ENABLE_STREAMING=true``
+            # shows a live "draft" preview that animates as the model generates.
+            # Group / channel chats (and a disabled knob) always degrade to the
+            # classic "typing…" keep-alive + chunked final reply. *Both* branches
+            # keep the "typing…" indicator alive (see the streaming branch
+            # below): the draft is the *preferred* indicator, but the typing
+            # action is the fallback that stays visible when the draft can't be
+            # shown (the bot is not on Telegram's streaming allowlist).
+            streaming = bool(config.enable_streaming) and chat.type == ChatType.PRIVATE
+            if streaming:
+                streamer = _DraftStreamer(context.bot, chat.id, next(_DRAFT_IDS))
+                # Run the "typing…" keep-alive in parallel with the draft. The
+                # draft is rejected (fail-soft, inside ``_DraftStreamer``) unless
+                # the bot is on Telegram's streaming allowlist — without this
+                # fallback there'd be *no* "the bot is working" feedback at all
+                # for such a deployment. When the draft *can* be shown the typing
+                # action is at worst a harmless duplicate (and, if Telegram
+                # rejects a typing action while a draft is up, ``_typing_loop``
+                # already swallows that error).
+                reply = await _with_typing(
+                    context.bot,
+                    chat.id,
+                    service.process_message(
+                        conversation_id,
+                        agent_message,
+                        memory_scope=_memory_scope(update),
+                        on_text_delta=streamer.on_delta,
+                    ),
+                )
+                # Show the complete answer in the preview, then send the real
+                # message. A draft failure here (e.g. bot not allowlisted) is
+                # fail-soft inside ``finalize`` and never suppresses the send.
+                await streamer.finalize(reply)
+            else:
+                reply = await _with_typing(
+                    context.bot,
+                    chat.id,
+                    service.process_message(conversation_id, agent_message, memory_scope=_memory_scope(update)),
+                )
         except AgentError as exc:
             logger.info(
                 "llm error surfaced to user",
@@ -953,9 +1086,10 @@ async def handle_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # can proceed. Send a short, bold notice as a **Telegram Reply quoting the
         # user's interrupted message** (like the final answer quotes its question),
         # then re-raise so the task is observed as cancelled: PTB never treats a
-        # cancelled handler as an error, and the typing keep-alive in
-        # ``_with_typing``'s ``finally`` stops before this point. The notice is
-        # best-effort — a failed send never changes the cancellation outcome.
+        # cancelled handler as an error, and (in the non-streaming branch) the
+        # typing keep-alive in ``_with_typing``'s ``finally`` stops before this
+        # point; in the streaming branch the draft is simply left to expire. The
+        # notice is best-effort — a failed send never changes the cancellation outcome.
         logger.info("turn cancelled by /stop", extra={"conversation_id": conversation_id})
         try:
             await chat.send_message(

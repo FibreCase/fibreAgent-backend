@@ -43,6 +43,7 @@ import logging
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, runtime_checkable
 
 from ..mcp.auth.principal import active_principal
@@ -101,6 +102,7 @@ class ToolCallingLLM(Protocol):
         messages: list[ChatMessage],
         *,
         tools: list[dict[str, Any]] | None = None,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> Any:
         ...
 
@@ -186,6 +188,7 @@ async def run_tool_loop(
     conversation_id: int | None = None,
     scope: str | None = None,
     delivery_chat_id: int | None = None,
+    on_text_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> Any:
     """Run the model + tools until a final text answer is produced.
 
@@ -222,19 +225,24 @@ async def run_tool_loop(
     # When no policy is supplied, every tool is allowed (the pre-phase-3, safe
     # built-in behaviour). A supplied policy re-resolves on every call.
     _policy = policy
+    # Forward the streaming callback only when it's set. Streaming is an opt-in
+    # concern of the *transport* layer (the Telegram adapter passes it; a plain
+    # non-streaming caller does not), so omitting it keeps a ``complete`` that
+    # doesn't know about ``on_text_delta`` (e.g. a tool-loop test fake) working.
+    _delta_kwargs = {"on_text_delta": on_text_delta} if on_text_delta is not None else {}
 
     if registry is None:
-        return await llm.complete(messages)
+        return await llm.complete(messages, **_delta_kwargs)
 
     advertised = registry.names() if _policy is None else _policy.advertised_names(registry.names())
     tools = registry.to_openai_schema(advertised) or None
     if tools is None:
         # No (allowed) tools to advertise: a single completion, no loop.
-        return await llm.complete(messages)
+        return await llm.complete(messages, **_delta_kwargs)
 
     working = list(messages)
     for iteration in range(1, max_iterations + 1):
-        result = await llm.complete(working, tools=tools)
+        result = await llm.complete(working, tools=tools, **_delta_kwargs)
 
         # A message with no tool calls is the final answer.
         if not getattr(result, "tool_calls", None):
