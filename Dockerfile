@@ -49,7 +49,7 @@ RUN apt-get update \
         procps \
         htop \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --user-group --uid 10001 --shell /usr/sbin/nologin agent
+    && useradd --create-home --user-group --uid 1000 --shell /usr/sbin/nologin agent
 
 # ---------------------------------------------------------------------------
 # project environment — uv + the exact locked deps
