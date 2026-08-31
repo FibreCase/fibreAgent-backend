@@ -249,6 +249,17 @@ class AgentBackend:
         # ever created (isomorphic to the other optional providers).
         self._qq_client = None
         self._qq_task: "asyncio.Task | None" = None
+        # Task *ids* already pending on the loop *before* the QQ subsystem
+        # starts. The shutdown teardown (:meth:`_qq_shutdown_tasks`) cancels
+        # every QQ-spawned background task (the SDK's connection-runner, websocket
+        # and heartbeat coroutines all live on our shared PTB loop, and
+        # ``botpy``'s ``Client.close()`` never cancels any of them) by diffing
+        # the loop's current task set against this baseline — any task whose id is
+        # *not* in it was created after the baseline and is attributed to the QQ
+        # subsystem. Storing ids (not task objects) keeps the snapshot small and
+        # avoids holding references. Captured in ``_post_init`` immediately before
+        # the task is started, so the snapshot is taken on the running loop.
+        self._qq_pending_before: frozenset = frozenset()
         application = build_application(
             config,
             self.service,
@@ -491,6 +502,47 @@ class AgentBackend:
         if not task.cancelled() and task.exception() is not None:
             logger.error("qq task ended with exception", exc_info=True)
 
+    async def _qq_shutdown_tasks(self) -> None:
+        """Cancel every background task the QQ subsystem spawned, then drain.
+
+        ``botpy``'s ``Client.close()`` only closes the HTTP client — it never
+        cancels the websocket / connection / heartbeat coroutines it spawned on
+        *our shared PTB loop* (the ``ConnectionSession._runner``, the
+        ``BotWebSocket`` receive loop and the ``_send_heart`` heartbeat). The
+        outer ``_qq_task`` (``_qq_run``) is suspended inside ``asyncio.wait`` on
+        those, and ``asyncio.wait`` swallows the cancellation — so cancelling the
+        outer task alone leaves the inner coroutines pending, and the loop's
+        teardown later destroys them mid-``aiohttp``-teardown, surfacing as
+        ``Task was destroyed but it is pending`` and
+        ``RuntimeError: coroutine ignored GeneratorExit``.
+
+        To cancel them we diff the loop's current task set against
+        :attr:`_qq_pending_before` (captured just before ``_qq_task`` started), so
+        we target only QQ-created tasks without touching unrelated in-flight work
+        (an in-progress Telegram approval callback, a scheduled run, the OAuth
+        callback server) that happens to be pending on the same loop. The task
+        currently running this teardown (the ``post_shutdown`` task, created at
+        shutdown and hence *after* the baseline) is excluded explicitly — it is
+        what ``gather`` awaits, so cancelling it would deadlock the drain.
+
+        Best-effort: a teardown failure is logged (by class) and swallowed so it
+        can never block the LLM/DB close.
+        """
+        try:
+            current_task = asyncio.current_task()
+            current = asyncio.all_tasks()
+            qq_tasks = [
+                t
+                for t in current
+                if id(t) not in self._qq_pending_before and t is not current_task
+            ]
+            for t in qq_tasks:
+                t.cancel()
+            if qq_tasks:
+                await asyncio.gather(*qq_tasks, return_exceptions=True)
+        except Exception:
+            logger.error("qq task teardown failed", exc_info=True)
+
     # PTB lifecycle hooks (run inside the application's own event loop) ------
     async def _post_init(self, application) -> None:
         await init_db(self.engine)
@@ -597,6 +649,13 @@ class AgentBackend:
                     self.mcp_manager,
                     approval_broker=self._qq_approval_broker,
                 )
+                # Snapshot the ids of the loop's tasks *before* the QQ subsystem
+                # starts, so shutdown can identify the SDK's own background tasks
+                # (the connection-runner, websocket and heartbeat coroutines the
+                # SDK spawns on this loop) as "created after" and cancel them.
+                self._qq_pending_before = frozenset(
+                    id(t) for t in asyncio.all_tasks()
+                )
                 self._qq_task = asyncio.create_task(self._qq_run(self._qq_client, secret))
                 self._qq_task.add_done_callback(self._qq_task_done)
             else:
@@ -644,22 +703,18 @@ class AgentBackend:
         # Phase 10 (multi-channel): stop the QQ client *after* the approval
         # broker and scheduler (so any in-flight QQ turn is first unblocked) and
         # *before* the LLM client / engine close (so no QQ turn is abandoned
-        # mid-call). ``close()`` is idempotent and breaks ``start()``'s loop
-        # cleanly; cancelling the task is a bounded safety net in case the loop
-        # doesn't exit promptly — a hang here must never block the whole
-        # shutdown. Both are best-effort (swallowed) so a QQ teardown failure
+        # mid-call). ``close()`` only closes the HTTP client — the websocket,
+        # connection-runner and heartbeat coroutines the SDK spawned on this loop
+        # are cancelled by ``_qq_shutdown_tasks`` (which also drains the outer
+        # ``_qq_task``), so nothing is left pending for the loop teardown to
+        # destroy. Both are best-effort (swallowed) so a QQ teardown failure
         # can't stop the DB/LLM from closing.
         if self._qq_client is not None:
             try:
                 await self._qq_client.close()
             except Exception:
                 logger.error("qq client close failed", exc_info=True)
-            if self._qq_task is not None:
-                self._qq_task.cancel()
-                try:
-                    await self._qq_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await self._qq_shutdown_tasks()
         # Stop the OAuth callback listener before the MCP sessions (idempotent,
         # never raises) — an in-flight callback after this is rejected by the
         # manager as invalid/expired state, not by a dead loop.

@@ -1018,6 +1018,134 @@ async def test_ensure_global_menu_swallows_errors():
 
 
 # ---------------------------------------------------------------------------
+# shutdown teardown (main.py::_qq_shutdown_tasks) — cancel the QQ tasks the SDK
+# spawns on the shared PTB loop, leaving unrelated in-flight work untouched.
+#
+# This is the regression for the Ctrl+C "Task was destroyed but it is pending"
+# + "RuntimeError: coroutine ignored GeneratorExit" noise: botpy's
+# Client.close() only closes the HTTP client, so the connection-runner /
+# websocket / heartbeat coroutines it spawned on our loop must be cancelled
+# explicitly by the backend, keyed off the pre-start task baseline.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# shutdown teardown (main.py::_qq_shutdown_tasks) — cancel the QQ tasks the SDK
+# spawns on the shared PTB loop, leaving unrelated in-flight work untouched.
+#
+# This is the regression for the Ctrl+C "Task was destroyed but it is pending"
+# + "RuntimeError: coroutine ignored GeneratorExit" noise: botpy's
+# Client.close() only closes the HTTP client, so the connection-runner /
+# websocket / heartbeat coroutines it spawned on our loop must be cancelled
+# explicitly by the backend, keyed off the pre-start task *id* baseline.
+# ---------------------------------------------------------------------------
+def _bare_backend():
+    # A minimal object carrying only the attribute the teardown reads; the method
+    # is the real bound one, so we don't build a full AgentBackend (which would
+    # construct an engine/LLM/registry).
+    from fibrecase_agent_backend.main import AgentBackend
+
+    return AgentBackend.__new__(AgentBackend)
+
+
+def _id_baseline(exclude=()):
+    """The production baseline shape: a frozenset of task *ids* (not tasks)."""
+    return frozenset(id(t) for t in asyncio.all_tasks() if t not in exclude)
+
+
+async def test_qq_shutdown_tasks_cancels_qq_tasks_not_unrelated():
+    backend = _bare_backend()
+
+    # The "unrelated" task that was already pending *before* the QQ subsystem
+    # started (e.g. an in-progress Telegram approval callback or scheduled run).
+    unrelated_started = asyncio.Event()
+
+    async def _unrelated():
+        unrelated_started.set()
+        await asyncio.sleep(30)
+
+    unrelated = asyncio.create_task(_unrelated())
+    await unrelated_started.wait()
+
+    # Snapshot the baseline now (task ids): the current test task + ``unrelated``
+    # are all "pre-QQ". Everything created after this is attributed to QQ.
+    backend._qq_pending_before = _id_baseline()
+
+    # The QQ outer task plus the SDK's own background tasks (connection-runner +
+    # heartbeat), all created *after* the baseline — mirroring ``_post_init``.
+    async def _qq_loop():
+        while True:
+            await asyncio.sleep(30)
+
+    qq_task = asyncio.create_task(_qq_loop())
+    inner_a = asyncio.create_task(_qq_loop())
+    inner_b = asyncio.create_task(_qq_loop())
+    await asyncio.sleep(0)  # let the post-baseline tasks start
+
+    await backend._qq_shutdown_tasks()
+
+    # The outer QQ task and both SDK-spawned inner tasks are cancelled.
+    assert qq_task.cancelled(), "the outer QQ task must be cancelled"
+    assert inner_a.cancelled() and inner_b.cancelled(), "the SDK's inner tasks must be cancelled"
+    # The unrelated task (pending before the QQ baseline) is left running.
+    assert not unrelated.cancelled(), "unrelated in-flight work must not be cancelled"
+    unrelated.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await unrelated
+
+
+async def test_qq_shutdown_tasks_with_no_qq_tasks_is_noop():
+    backend = _bare_backend()
+
+    # QQ never started: the baseline covers the whole task set, so the teardown's
+    # diff is empty — it cancels nothing and does not hang. An in-flight
+    # unrelated task must survive.
+    async def _unrelated():
+        await asyncio.sleep(30)
+
+    unrelated = asyncio.create_task(_unrelated())
+    await asyncio.sleep(0)
+    backend._qq_pending_before = _id_baseline()  # everything is "pre-QQ"
+
+    await backend._qq_shutdown_tasks()  # must not raise or hang
+
+    assert not unrelated.cancelled(), "with no QQ tasks, nothing unrelated may be cancelled"
+    unrelated.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await unrelated
+
+
+async def test_qq_shutdown_tasks_collects_a_raising_task_without_raising():
+    backend = _bare_backend()
+
+    # A QQ task that ends in an *exception* must be collected safely by the
+    # teardown (``gather(..., return_exceptions=True)``) — it must not raise out
+    # of the shutdown and must not drag down unrelated in-flight work. This
+    # guards the invariant that a misbehaving QQ teardown can never abort the
+    # LLM/DB close.
+    async def _explode():
+        raise RuntimeError("boom")
+
+    bad = asyncio.create_task(_explode())
+    await asyncio.sleep(0)
+
+    async def _unrelated():
+        await asyncio.sleep(30)
+
+    unrelated = asyncio.create_task(_unrelated())
+    await asyncio.sleep(0)
+    # Baseline = every task except ``bad``: so the teardown's diff targets only
+    # ``bad`` (the QQ task), leaving ``unrelated`` and the current task untouched.
+    backend._qq_pending_before = _id_baseline(exclude=(bad,))
+
+    await backend._qq_shutdown_tasks()  # must not raise
+
+    assert bad.done(), "the raising QQ task is collected (not left pending)"
+    assert not unrelated.cancelled(), "unrelated work must not be cancelled"
+    unrelated.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await unrelated
+
+
+# ---------------------------------------------------------------------------
 # tool approval (QQ button-interaction transport — the QQApprovalBroker)
 # ---------------------------------------------------------------------------
 class _FakeApi:

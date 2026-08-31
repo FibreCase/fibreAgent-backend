@@ -1013,7 +1013,9 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   `_post_init` (on the PTB running loop, because `botpy.Client.__init__` grabs the
   running loop) and drives it as an `asyncio.Task` via `async with client: await
   client.start(app_id, secret)` — the SDK's own `run()` is blocking (it owns a loop) and
-  cannot be used; the task is `close()`-d + cancelled in `_post_shutdown`. **Privacy:**
+  cannot be used; in `_post_shutdown` the client is `close()`-d and the QQ task tree
+  it spawned on the loop is cancelled (see the "botpy owns its event loop" entry
+  above — `close()` alone leaves the SDK's websocket/heartbeat tasks pending). **Privacy:**
   the QQ adapter logs only the synthetic conversation id, the QQ *message id*, a text
   length, and (for a command) the command *name* — **never** the raw `user_openid` (a
   user identity), a command *argument* (which can carry memory content), or the message
@@ -1756,8 +1758,19 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   must be **constructed and started on the running PTB loop** (`main.py::_post_init`)
   — its `__init__` grabs `asyncio.get_event_loop()` and `run()` is **blocking** (it
   owns a loop via `run_until_complete`), so the backend drives it as an `asyncio.Task`
-  via `async with client: await client.start(app_id, secret)` and `close()`s + cancels
-  it in `_post_shutdown` (never call the blocking `run()`). And pass
+  via `async with client: await client.start(app_id, secret)`. In `_post_shutdown`
+  the backend `close()`s the client and then cancels **every task the QQ subsystem
+  spawned on that loop** — not just the outer task (never call the blocking
+  `run()`). `close()` only closes the HTTP client; the SDK's own `ConnectionSession`
+  runner, `BotWebSocket` receive loop and `_send_heart` heartbeat coroutines
+  outlive it, and the outer task (suspended in `asyncio.wait`) swallows its own
+  cancellation, so without an explicit teardown the loop's close destroys them
+  mid-`aiohttp`-teardown (`Task was destroyed but it is pending` /
+  `RuntimeError: coroutine ignored GeneratorExit` on Ctrl+C). The teardown
+  (`main.py::_qq_shutdown_tasks`) diffs `asyncio.all_tasks()` against a baseline
+  snapshot taken just before the QQ task started, so it cancels only QQ-created
+  tasks and leaves unrelated in-flight work (a Telegram approval callback, a
+  scheduled run, the OAuth callback server) untouched. And pass
   `ext_handlers=False` in `build_qq_client` — botpy's **default** `ext_handlers=True`
   installs a `TimedRotatingFileHandler` that writes a rotating `botpy.log` into the
   *current working directory* (repo root in dev, `/app` under Docker); `bot_log=True`
