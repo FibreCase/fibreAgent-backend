@@ -109,6 +109,7 @@ class AgentBackend:
                 max_file_string_chars=config.max_file_string_chars,
                 max_file_read_chars=config.max_file_read_chars,
                 max_file_list_entries=config.max_file_list_entries,
+                max_file_content_chars=config.max_file_content_chars,
             )
         else:
             registry = None

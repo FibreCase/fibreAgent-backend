@@ -39,7 +39,7 @@ implemented, mocked-tested, and released:
 - **Phase 4.x (User-Level OAuth for MCP)** — implemented and mocked-tested on top of v1.8.0 (release pending)
 - **Phase 5.1 (Read-Only Infrastructure Observation via SSH)** — implemented and mocked-tested on top of that (release pending)
 - An **opt-in `exec` shell tool** (default off, always `ask`, with a static catastrophic-command backstop) — implemented and tested on top of that
-- An **opt-in `file` toolset** (default off; `file_read`/`file_ls` read-only `allow`, the other seven tools always `ask`; confined to `FILE_WORKDIR` against `../` and symlink escape, precise replace + narrow non-overwriting file/directory operations) — implemented and tested on top of that
+- An **opt-in `file` toolset** (default off; `file_read`/`file_ls` read-only `allow`, the other nine tools always `ask`; confined to `FILE_WORKDIR` against `../` and symlink escape, precise replace + whole-file write/append + narrow non-overwriting file/directory operations) — implemented and tested on top of that
 - **Streaming replies** (Bot API 10.0 `sendMessageDraft`; `ENABLE_STREAMING`, default on) — a live draft-preview in a private chat's compose box that animates as the model generates, with the full reply still delivered as a normal message; group/channel chats and a disabled knob degrade to the classic "typing…" + chunked reply. The Bot API 10.3 Stop button is a later phase (stop stays on `/stop`). Implemented and mocked-tested on top of that.
 - **Phase 10 (Multi-Channel: QQ C2C plain text + commands)** — the first non-Telegram channel. A plain-text **C2C (private-chat) send/receive** adapter over the official `botpy` SDK, off by default (on when `QQ_APP_ID` is set). It normalises an incoming QQ C2C message into `AgentMessage(source="qq")`, calls the same channel-agnostic `AgentService.process_message`, and delivers the reply over the QQ websocket — so tool calling, the tool-security gate, context budgeting, and long-term memory all work unchanged. On top of plain send/receive it offers the **same slash-command surface** as the Telegram bot (core set + read-only `/mcp_status` + `/user_status`), **reply-quoting** of the user's message (`message_reference`, first chunk only), a **native command panel** (best-effort, idempotent create-or-update), a **global C2C custom menu** (`PUT /v2/menu`, best-effort, idempotent by replace), and **tool approval via QQ button cards** — a `qq/approval.py` broker (botpy-free) that, for a QQ-scoped `ask` request, sends an *active* C2C Markdown message with a `keyboard` of callback buttons, resolves the `INTERACTION_CREATE` the click produces (acked within 3 s), and is selected per-request by a scope-prefix `QQScopedApprovalRouter` co-resident with the Telegram broker in the one `AgentService`. Command *replies* render in **Chinese** (the Telegram adapter renders the same commands in English); delivery type follows the reply's shape — **simple** receipts as plain text (`msg_type=0`), **structured** displays as Markdown (`msg_type=2`). Conversations are keyed by a deterministic synthetic id in a reserved range disjoint from (and below) the schedule range. `qq/bot.py` is the only module that imports `botpy`; `qq/commands.py` and `qq/approval.py` are pure / botpy-free. **Limitations:** C2C plain text only (no group/guild, no images, no streaming draft), no `/start` (no QQ concept) and no `/mcp` / `/mcp auth` (OAuth is Telegram-bound). `deny` tools are still rejected on a QQ turn (`ask` is approvable via the button card). Implemented and mocked-tested on top of that.
 
@@ -627,53 +627,71 @@ both true.
 
 The second, **narrower** of the two state-changing local capabilities: where `exec`
 is "run an arbitrary command", the `file` toolset lets the model do file/directory
-operations — read, list, precise-edit, move, copy, create, delete, touch — *without
-writing any shell*. It is **nine tools** (a shared `_FileTool` base holds the
-confinement root + helpers; each is a first-class `Tool`, `additionalProperties:
-false`): `file_read` (UTF-8 file content, tail-truncated) and `file_ls` (directory
-entries, dirs `/`-suffixed) both declare **`allow`** (read-only, no per-call
-approval); `file_edit` (swap the **unique** `old_string` for `new_string`, or every
-occurrence with `replace_all`; `new_string` may be empty = delete that span),
-`file_mv` (move/rename a file or dir; target must not exist), `file_cp` (copy a file
-or directory tree; dirs need `recursive=true`; target must not exist), `file_rm`
-(delete a **regular file** only — never a directory), `file_mkdir` (create a dir;
-`parents=true` makes intermediates), `file_rmdir` (delete an **empty** directory
-only), and `file_touch` (create an empty file or update mtime) all declare **`ask`**
-— every call needs a one-time human Approve. Single-path tools use
+operations — read, list, precise-edit, write, append, move, copy, create, delete,
+touch — *without writing any shell*. It is **eleven tools** (a shared `_FileTool`
+base holds the confinement root + helpers; each is a first-class `Tool`,
+`additionalProperties: false`): `file_read` (UTF-8 file content, tail-truncated) and
+`file_ls` (directory entries, dirs `/`-suffixed) both declare **`allow`** (read-only,
+no per-call approval); `file_edit` (swap the **unique** `old_string` for
+`new_string`, or every occurrence with `replace_all`; `new_string` may be empty =
+delete that span), `file_write` (create a file or replace its **entire** content —
+shell `>`), `file_append` (append content, creating the file if absent — shell
+`>>`), `file_mv` (move/rename a file or dir; target must not exist), `file_cp` (copy
+a file or directory tree; dirs need `recursive=true`; target must not exist),
+`file_rm` (delete a **regular file** only — never a directory), `file_mkdir` (create
+a dir; `parents=true` makes intermediates), `file_rmdir` (delete an **empty**
+directory only), and `file_touch` (create an empty file or update mtime) all declare
+**`ask`** — every call needs a one-time human Approve. Single-path tools use
 `required=["path"]`; `file_mv`/`file_cp` use `required=["source","target"]`;
 `file_edit` uses `required=["path","old_string","new_string"]` with
-`old_string`/`new_string` bounded by `maxLength`. It is **off by default**
-(`ENABLE_FILE_TOOL=false`), so the default deployment stays write-free. `file_edit`
-overrides the optional `approval_detail` hook so the approval card shows the replace
-as a **faithful `Action:` block rendered in git-diff style** — a `📄 File:` /
-`🔁 Operation:` header, then `--- a/<path>` / `+++ b/<path>`, with each `old_string`
-line `-`-prefixed and each `new_string` line `+`-prefixed (newlines preserved; an
-empty `new_string` is a pure deletion with no `+` lines) — **in place of** the
-generic `Arguments:` JSON, and labelled `diff` via the `approval_language` hook so
-Telegram highlights it as a diff rather than guessing (the detail is plain text; the
-provider HTML-escapes + length-bounds it, wraps it in `<pre><code>`, and drops it on
-card finalisation exactly like the JSON block). The other tools override only
-`approval_summary` (a fixed, argument-free purpose line) and ride the generic
-`Arguments:` JSON block. Defence in depth, all *inside* each `execute` (the tool loop
-is untouched):
+`old_string`/`new_string` bounded by `maxLength`; `file_write`/`file_append` use
+`required=["path","content"]` with `content` bounded by `maxLength`. It is **off by
+default** (`ENABLE_FILE_TOOL=false`), so the default deployment stays write-free.
+`file_edit`, `file_write`, and `file_append` override the optional `approval_detail`
+hook so the approval card shows the change as a **faithful `Action:` block rendered
+in git-diff style** — a `📄 File:` / `🔁 Operation:` header, then
+`--- a/<path>` / `+++ b/<path>`, with `file_edit` showing each `old_string` line
+`-`-prefixed and each `new_string` line `+`-prefixed (newlines preserved; an empty
+`new_string` is a pure deletion with no `+` lines), `file_write` showing every
+`content` line `+`-prefixed (a pure addition — the existing content is discarded,
+matching `>`), and `file_append` showing the `content` to be added `+`-prefixed
+under a `+++ b/<path>` header (the existing content is *not* dumped — the owner can
+read it with `file_read`) — **in place of** the generic `Arguments:` JSON, and
+labelled `diff` via the `approval_language` hook so Telegram highlights it as a diff
+rather than guessing (the detail is plain text; the provider HTML-escapes +
+length-bounds it, wraps it in `<pre><code>`, and drops it on card finalisation
+exactly like the JSON block). The other tools override only `approval_summary` (a
+fixed, argument-free purpose line) and ride the generic `Arguments:` JSON block.
+Defence in depth, all *inside* each `execute` (the tool loop is untouched):
 
 1. **Path confinement — the core safety property** — `_resolve` resolves every
    `path` / `source` / `target` (collapsing `..` *and* following **symlinks**) and
    refuses anything that does not land inside `FILE_WORKDIR` *before any I/O*
    (`file_path_escape`), so a `../` escape, an out-of-root absolute path, or a symlink
-   pointing out of the root is **never read or written even after the owner approves**.
-2. **Narrow verbs, no overwrite** — `file_rm` never deletes a directory
+   pointing out of the root is **never read or written even after the owner approves**
+   (this covers `file_write`/`file_append` too, so a shell-`>`-style write cannot
+   target a file outside the root).
+2. **Narrow verbs, no tree clobber** — `file_rm` never deletes a directory
    (`file_is_directory`), `file_rmdir` only an empty one (`file_not_empty`), and
    `file_mv`/`file_cp` refuse an existing target (`file_already_exists`) — so the model
-   cannot clobber or delete a whole tree.
-3. **Atomic write** — `file_edit` writes new content to a same-directory
+   cannot delete or rename a whole tree. (`file_write`/`file_append` *do* replace or
+   extend a single file's content, which is exactly their `>` / `>>` purpose — but they
+   can only ever name one file inside the root.)
+3. **Atomic write** — `file_edit` and `file_write` write new content to a same-directory
    `tempfile.mkstemp` + `fsync` + `os.replace`, so a mid-write crash never leaves a
-   half-written file (the attachment-store / permissions-file idiom).
+   half-written file (the attachment-store / permissions-file idiom). `file_append`
+   reads the existing content (if any) and atomically writes the concatenation, so an
+   append is crash-safe too (old content or full new content, never a half-appended
+   tail).
 4. **Bounding** — a `file_read` result is tail-truncated to `MAX_FILE_READ_CHARS` with
    the `[N chars … truncated]` marker (truncation, not an error); `file_ls` entries are
    capped at `MAX_FILE_LIST_ENTRIES` (extra entries dropped, a `truncated` flag set);
    `file_edit`'s `old_string`/`new_string` are bounded by `MAX_FILE_STRING_CHARS`
-   (also the schema `maxLength`).
+   (also the schema `maxLength`); `file_write`'s/`file_append`'s `content` is bounded
+   by `MAX_FILE_CONTENT_CHARS` (also the schema `maxLength`), and `file_append`
+   additionally enforces `MAX_FILE_CONTENT_CHARS` on the **resulting** file size
+   (`existing + content` → `file_result_too_large`) so a large pre-existing file cannot
+   be grown past the cap.
 
 `FILE_WORKDIR` is **required** when the toolset is enabled (must be an existing
 directory, else a startup `ConfigError`) — deliberately stricter than the optional
@@ -681,16 +699,17 @@ directory, else a startup `ConfigError`) — deliberately stricter than the opti
 only file-specific result codes are `file_path_escape`, `file_not_found`,
 `file_not_a_file`, `file_not_a_directory`, `file_is_directory`, `file_read_failed`,
 `file_invalid_path`, `file_invalid_args`, `file_not_replaced`, `file_not_unique`,
-`file_write_failed`, `file_not_empty`, `file_already_exists`, and `file_fs_failed`,
-all **returned** (not raised) so the specific code reaches the model. **The path,
-file content, and old/new strings go to the model only — never logged, never
-audited.** Five config knobs (`config.py`): `ENABLE_FILE_TOOL` (default `false`),
-`FILE_WORKDIR` (required existing dir when enabled), `MAX_FILE_STRING_CHARS` (default
-`2000`, `>= 1`, also the schema `maxLength`), `MAX_FILE_READ_CHARS` (default `8000`,
-`>= 1`), and `MAX_FILE_LIST_ENTRIES` (default `1000`, `>= 1`); the four non-flag
-knobs are validated **only when enabled**. `main.py` registers the toolset in
-`build_default_tools(...)` **only when** `ENABLE_TOOLS` and `ENABLE_FILE_TOOL` are
-both true (added last, after `exec`).
+`file_write_failed`, `file_result_too_large`, `file_not_empty`, `file_already_exists`,
+and `file_fs_failed`, all **returned** (not raised) so the specific code reaches the
+model. **The path, file content, and old/new strings go to the model only — never
+logged, never audited.** Six config knobs (`config.py`): `ENABLE_FILE_TOOL` (default
+`false`), `FILE_WORKDIR` (required existing dir when enabled), `MAX_FILE_STRING_CHARS`
+(default `2000`, `>= 1`, also the schema `maxLength`), `MAX_FILE_READ_CHARS` (default
+`8000`, `>= 1`), `MAX_FILE_LIST_ENTRIES` (default `1000`, `>= 1`), and
+`MAX_FILE_CONTENT_CHARS` (default `20000`, `>= 1`, also the schema `maxLength` and the
+`file_append` result-size cap); the five non-flag knobs are validated **only when
+enabled**. `main.py` registers the toolset in `build_default_tools(...)` **only when**
+`ENABLE_TOOLS` and `ENABLE_FILE_TOOL` are both true (added last, after `exec`).
 
 ---
 
@@ -1097,9 +1116,11 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   safe **purpose** summary under a `What it does:` line + a readable **argument view**
   when the call has arguments — either the default pretty-JSON **`Arguments:`** block
   (labelled `json`), or, when the tool overrides the optional `approval_detail` hook
-  (`file_edit`, `exec`), a tool-supplied plain-text view under an **`Action:`** label
-  (labelled by the tool's `approval_language` hook — `diff` for `file_edit`,
-  `bash` for `exec` — so Telegram highlights it by language rather than guessing); both
+  (`file_edit` / `file_write` / `file_append`, `exec`), a tool-supplied plain-text view
+  under an **`Action:`** label
+  (labelled by the tool's `approval_language` hook — `diff` for the three `file_*`
+  writers, `bash` for `exec` — so Telegram highlights it by language rather than
+  guessing); both
   rendered in `<pre><code>` — the `<pre>` carrying a sanitised `class="language-…"`
   attribute (the tool-declared language is kept to `[A-Za-z0-9_-]`, capped at 24 chars,
   lowercased; a hostile value can't inject a second `class` or close the tag, and an
@@ -1264,15 +1285,19 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   → the generic JSON block; the state-changing built-ins `file_edit` (a faithful
   **git-style diff** of its `old_string`/`new_string` — `--- a/<path>`/`+++ b/<path>`
   headers, each old line `-`-prefixed, each new line `+`-prefixed, empty
-  `new_string` a pure deletion) and `exec` (the command as a `$ …` bash block)
-  override it), an optional `approval_language(arguments) -> str | None` (a fixed
+  `new_string` a pure deletion), `file_write` (the new content as a pure
+  **addition** — every line `+`-prefixed), `file_append` (the content to be added as
+  a `+`-prefixed block, existing content not dumped), and `exec` (the command as a
+  `$ …` bash block) override it), an optional `approval_language(arguments) ->
+  str | None` (a fixed
   **Pygments language name** — `diff` / `bash` / `json` / … — that the provider
   sanitises into a `<pre class="language-…">` attribute so Telegram syntax-highlights
   the code block instead of guessing its language; the tool declares a fixed
   vocabulary, **never** a value derived from argument content, so it cannot inject a
   second `class`/close the tag; the provider keeps only `[A-Za-z0-9_-]`, caps it at 24
   chars, lowercases it, and drops the label when empty; the **default** is `None` →
-  unlabelled, `file_edit` returns `diff`, and `exec` returns `bash`; the generic
+  unlabelled, `file_edit` / `file_write` / `file_append` return `diff`, and `exec`
+  returns `bash`; the generic
   `Arguments:` JSON block is always labelled `json`), and `async execute(arguments)
   -> str`; `spec()` builds the inner `function` block. `registry.ToolRegistry` does `register`/`add`/`get`/`names` (a
   `register()` of an invalid declared schema is a `ValueError`, checked with
@@ -2303,10 +2328,10 @@ and the "QQ 会话用保留区间的合成 id" invariant in [architecture.md](ar
 ### File toolset knobs (opt-in)
 
 - **`ENABLE_FILE_TOOL`** (default **`false`**): the opt-in switch for the `file`
-  toolset. Off → the nine `file_*` tools are never registered, never advertised to the
-  model, and the other file knobs are not validated (a default deployment stays
+  toolset. Off → the eleven `file_*` tools are never registered, never advertised to
+  the model, and the other file knobs are not validated (a default deployment stays
   write-free). On + `ENABLE_TOOLS=true` → `build_default_tools(...)` adds the `file`
-  toolset (`file_read` / `file_ls` `allow`, the other seven always `ask`).
+  toolset (`file_read` / `file_ls` `allow`, the other nine always `ask`).
 - **`FILE_WORKDIR`** (default `None`): the confinement root every `path` / `source` /
   `target` must resolve inside (relative to the working directory). **Required** when
   the toolset is enabled — it must be an **existing directory**, else a startup
@@ -2325,6 +2350,14 @@ and the "QQ 会话用保留区间的合成 id" invariant in [architecture.md](ar
 - **`MAX_FILE_LIST_ENTRIES`** (default `1000`): the cap on how many entries one
   `file_ls` call returns; over it, entries are dropped and a `truncated` flag is set
   (not an error). Must be `>= 1`; validated only when enabled.
+- **`MAX_FILE_CONTENT_CHARS`** (default `20000`): the cap on the whole-file
+  writers' `content` — `file_write` and `file_append` — **also baked into the
+  parameter schema's `maxLength`** (bounding the model's proposal and, with it, the
+  approval card's argument block). For `file_append` it additionally caps the
+  **resulting** file size (`existing + content` → `file_result_too_large`), which the
+  `content` cap alone would not cover. It is a *separate* knob from
+  `MAX_FILE_STRING_CHARS` (a larger default) because a whole file is bigger than a
+  single replace string. Must be `>= 1`; validated only when enabled.
 
 The exec and file knobs come only from these startup-time settings; the model can never
 set them, and what it proposes (a command, or a path / source / target + old/new
@@ -2984,7 +3017,7 @@ drains both. **All mocked** — no real QQ/LLM/network/subprocess.
   backstopped by a static denylist) and the `file` toolset (confined file/directory
   operations in `FILE_WORKDIR`) are the two state-changing local capabilities, both
   opt-in** (`exec` always `ask`; the `file` toolset is `allow` for `file_read` /
-  `file_ls` and always `ask` for the other seven).
+  `file_ls` and always `ask` for the other nine).
 - **Argument validation is enforced** (phase 3): `function.arguments` is parsed as JSON
   and **schema-validated with `jsonschema` before `execute`** — malformed / non-object
   / missing-required / wrong-type / extra-property payloads are rejected (stable
@@ -3055,38 +3088,48 @@ drains both. **All mocked** — no real QQ/LLM/network/subprocess.
   command is the account the bot runs under, so it should not run as root, and the
   denylist is a last line, not a substitute for reading the approval card.
 - **`file` (opt-in) is the second state-changing local capability, and deliberately a
-  much narrower one than `exec`.** It is a **toolset of nine** tools that lets the
+  much narrower one than `exec`.** It is a **toolset of eleven** tools that lets the
   model do file/directory operations *without writing shell*: `file_read` (a UTF-8
   file's content) and `file_ls` (a directory's entries) are **`allow`** (read-only, no
   per-call approval); `file_edit` (a **precise** edit — swap a **unique**
   `old_string` for `new_string`, or every occurrence with `replace_all`),
+  `file_write` (create a file or replace its **entire** content — shell `>`),
+  `file_append` (append content, creating the file if absent — shell `>>`),
   `file_mv` / `file_cp` (move / copy a file or dir, **no** overwrite; copying a dir
   needs `recursive`), `file_rm` (delete a **regular file** only), `file_mkdir`
   (create a dir, `parents` for intermediates), `file_rmdir` (delete an **empty** dir
   only), and `file_touch` (create/refresh a file) are all **`ask`** — so the model can
-  read and minimally manage files *without writing shell*. There is **no** whole-file
-  write / append (those belong to `exec`). Limits: **off by default**
+  read and minimally manage files *without writing shell*. `file_write` /
+  `file_append` are the **deliberate exception** to "no whole-file write": they let
+  the model put arbitrary content into a *single* file, but only inside the root and
+  behind per-call approval (the remaining gap is still no deleting/renaming a whole
+  tree, no arbitrary shell — those belong to `exec`). Limits: **off by default**
   (`ENABLE_FILE_TOOL=false` — a default deploy performs no file write at all), the
-  seven mutating tools are **always `ask`** (every call needs a one-time human Approve;
-  `path` / `source` / `target` / `old_string` / `new_string` are shown verbatim on the
-  approval card — `file_edit` overrides the optional `approval_detail` hook to lay
-  them out as a faithful **git-diff-style** `Action:` block in place of the generic
-  JSON, labelled `diff` for syntax highlighting — the model can never grant itself
-  approval), **path confinement to `FILE_WORKDIR`** (the core safety property:
-  `_resolve` collapses `..` and follows **symlinks** and refuses anything outside the
-  root *before any I/O* → `file_path_escape`, **even after the owner approves**;
-  `FILE_WORKDIR` is a **required** existing directory when the toolset is enabled —
-  stricter than the optional `EXEC_WORKDIR`), **narrow verbs, no overwrite**
-  (`file_rm` never deletes a directory, `file_rmdir` only an empty one,
-  `file_mv` / `file_cp` refuse an existing target), **atomic writes** in `file_edit`
-  (same-dir temp + `fsync` + `os.replace`, so a mid-write crash never leaves a
-  half-written file), **exact-match semantics** (`old_string` must be unique unless
-  `replace_all` → `file_not_found` / `file_not_unique`), and **three caps**
+  nine mutating tools are **always `ask`** (every call needs a one-time human Approve;
+  `path` / `source` / `target` / `old_string` / `new_string` / `content` are shown
+  verbatim on the approval card — `file_edit` / `file_write` / `file_append` override
+  the optional `approval_detail` hook to lay them out as a faithful **git-diff-style**
+  `Action:` block in place of the generic JSON, labelled `diff` for syntax
+  highlighting — the model can never grant itself approval), **path confinement to
+  `FILE_WORKDIR`** (the core safety property: `_resolve` collapses `..` and follows
+  **symlinks** and refuses anything outside the root *before any I/O* →
+  `file_path_escape`, **even after the owner approves**; `FILE_WORKDIR` is a
+  **required** existing directory when the toolset is enabled — stricter than the
+  optional `EXEC_WORKDIR`), **narrow verbs, no tree clobber** (`file_rm` never
+  deletes a directory, `file_rmdir` only an empty one, `file_mv` / `file_cp` refuse an
+  existing target), **atomic writes** in `file_edit` / `file_write` (same-dir temp +
+  `fsync` + `os.replace`, so a mid-write crash never leaves a half-written file) and
+  `file_append` (reads then atomically writes the concatenation — old or full content,
+  never a half-appended tail), **exact-match semantics** (`old_string` must be unique
+  unless `replace_all` → `file_not_found` / `file_not_unique`), and **four caps**
   (`MAX_FILE_STRING_CHARS` on the replace strings, also the schema `maxLength`;
   `MAX_FILE_READ_CHARS` on a `file_read` result, tail-truncated with the `[N chars …
   truncated]` marker; `MAX_FILE_LIST_ENTRIES` on a `file_ls` result, extra entries
-  dropped with a `truncated` flag). The path, file content, and old/new strings are
-  returned to the model **only** — never logged, never in the audit table.
+  dropped with a `truncated` flag; `MAX_FILE_CONTENT_CHARS` on `file_write` /
+  `file_append` `content` — also the schema `maxLength` — and, for `file_append`, on
+  the resulting file size → `file_result_too_large`). The path, file content, and
+  old/new strings are returned to the model **only** — never logged, never in the
+  audit table.
 - Not implemented (out of scope so far): RAG, Web Search, streaming, and the
   autonomous self-driven loop.
 

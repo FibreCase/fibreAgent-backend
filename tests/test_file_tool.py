@@ -1,6 +1,6 @@
 """File toolset — real (hermetic) filesystem behaviour.
 
-These tests exercise the nine :mod:`fibrecase_agent_backend.tools.builtin.file`
+These tests exercise the eleven :mod:`fibrecase_agent_backend.tools.builtin.file`
 tools against the **real** filesystem, confined to ``tmp_path`` — the only way a
 file-manipulating tool can be meaningfully tested. Every test is local (no
 network, no LLM, no Telegram, no DB). The path-confinement tests (the toolset's
@@ -20,6 +20,7 @@ import os
 import pytest
 
 from fibrecase_agent_backend.tools.builtin.file import (
+    FileAppendTool,
     FileCpTool,
     FileEditTool,
     FileLsTool,
@@ -29,6 +30,7 @@ from fibrecase_agent_backend.tools.builtin.file import (
     FileRmTool,
     FileRmdirTool,
     FileTouchTool,
+    FileWriteTool,
 )
 from fibrecase_agent_backend.tools.policy import ToolPermission
 
@@ -43,6 +45,14 @@ def _ls(root, max_list_entries: int = 1000) -> FileLsTool:
 
 def _edit(root, max_string_chars: int = 2000, max_read_chars: int = 100_000) -> FileEditTool:
     return FileEditTool(workdir=str(root), max_string_chars=max_string_chars, max_read_chars=max_read_chars)
+
+
+def _write(root, max_content_chars: int = 100_000) -> FileWriteTool:
+    return FileWriteTool(workdir=str(root), max_content_chars=max_content_chars)
+
+
+def _append(root, max_content_chars: int = 100_000) -> FileAppendTool:
+    return FileAppendTool(workdir=str(root), max_content_chars=max_content_chars)
 
 
 def _mv(root) -> FileMvTool:
@@ -84,6 +94,8 @@ def test_read_and_ls_declare_allow(tmp_path):
 def test_mutating_tools_declare_ask(tmp_path):
     for tool in (
         _edit(tmp_path),
+        _write(tmp_path),
+        _append(tmp_path),
         _mv(tmp_path),
         _cp(tmp_path),
         _rm(tmp_path),
@@ -236,6 +248,104 @@ async def test_edit_directory_is_not_a_file(tmp_path):
     (tmp_path / "s").mkdir()
     data = _parse(await _edit(tmp_path).execute({"path": "s", "old_string": "a", "new_string": "b"}))
     assert data["error"]["code"] == "file_not_a_file"
+
+
+# ===========================================================================
+# file_write — shell '>' semantics (create or replace entire content)
+# ===========================================================================
+async def test_write_creates_a_new_file(tmp_path):
+    data = _parse(await _write(tmp_path).execute({"path": "new.txt", "content": "hello\nworld"}))
+    assert data["path"] == "new.txt"
+    assert data["bytes"] == len(b"hello\nworld")
+    assert (tmp_path / "new.txt").read_text(encoding="utf-8") == "hello\nworld"
+
+
+async def test_write_replaces_existing_content(tmp_path):
+    f = tmp_path / "w.txt"
+    f.write_text("old content, much longer than the new one", encoding="utf-8")
+    data = _parse(await _write(tmp_path).execute({"path": "w.txt", "content": "new"}))
+    assert data["bytes"] == 3
+    assert f.read_text(encoding="utf-8") == "new"  # whole content replaced, not merged
+
+
+async def test_write_empty_content_truncates_to_empty(tmp_path):
+    f = tmp_path / "w2.txt"
+    f.write_text("to be emptied", encoding="utf-8")
+    await _write(tmp_path).execute({"path": "w2.txt", "content": ""})
+    assert f.read_text(encoding="utf-8") == ""  # an empty write = a zero-byte file
+
+
+async def test_write_refuses_a_directory(tmp_path):
+    (tmp_path / "d").mkdir()
+    data = _parse(await _write(tmp_path).execute({"path": "d", "content": "x"}))
+    assert data["error"]["code"] == "file_not_a_file"
+
+
+async def test_write_missing_content_is_invalid(tmp_path):
+    data = _parse(await _write(tmp_path).execute({"path": "w.txt"}))
+    assert data["error"]["code"] == "file_invalid_args"
+
+
+async def test_write_content_utf8_byte_count(tmp_path):
+    # bytes reports the UTF-8 byte length, not the character count.
+    data = _parse(await _write(tmp_path).execute({"path": "u.txt", "content": "é中文"}))
+    assert data["bytes"] == len("é中文".encode("utf-8"))
+    assert (tmp_path / "u.txt").read_text(encoding="utf-8") == "é中文"
+
+
+# ===========================================================================
+# file_append — shell '>>' semantics (create if absent, else append)
+# ===========================================================================
+async def test_append_creates_a_new_file(tmp_path):
+    data = _parse(await _append(tmp_path).execute({"path": "fresh.txt", "content": "first"}))
+    assert data["path"] == "fresh.txt"
+    assert data["bytes"] == len(b"first")
+    assert (tmp_path / "fresh.txt").read_text(encoding="utf-8") == "first"
+
+
+async def test_append_appends_to_existing_content(tmp_path):
+    f = tmp_path / "log.txt"
+    f.write_text("line1\n", encoding="utf-8")
+    data = _parse(await _append(tmp_path).execute({"path": "log.txt", "content": "line2\n"}))
+    assert data["bytes"] == len(b"line1\nline2\n")
+    assert f.read_text(encoding="utf-8") == "line1\nline2\n"  # existing preserved + appended
+
+
+async def test_append_does_not_truncate_existing(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("keep", encoding="utf-8")
+    await _append(tmp_path).execute({"path": "a.txt", "content": "-me"})
+    assert f.read_text(encoding="utf-8") == "keep-me"  # '>>' never discards the old content
+
+
+async def test_append_refuses_a_directory(tmp_path):
+    (tmp_path / "d").mkdir()
+    data = _parse(await _append(tmp_path).execute({"path": "d", "content": "x"}))
+    assert data["error"]["code"] == "file_not_a_file"
+
+
+async def test_append_missing_content_is_invalid(tmp_path):
+    data = _parse(await _append(tmp_path).execute({"path": "a.txt"}))
+    assert data["error"]["code"] == "file_invalid_args"
+
+
+async def test_append_rejects_resulting_file_over_cap(tmp_path):
+    # The schema caps only the *appended* content; the *resulting* file size is
+    # enforced separately, so a large pre-existing file blocks an append that
+    # would push the total past the cap.
+    f = tmp_path / "big.txt"
+    f.write_text("A" * 100, encoding="utf-8")
+    data = _parse(await _append(tmp_path, max_content_chars=150).execute({"path": "big.txt", "content": "B" * 51}))
+    assert data["error"]["code"] == "file_result_too_large"
+    assert f.read_text(encoding="utf-8") == "A" * 100  # untouched
+
+
+async def test_append_allows_result_at_cap(tmp_path):
+    f = tmp_path / "big2.txt"
+    f.write_text("A" * 100, encoding="utf-8")
+    data = _parse(await _append(tmp_path, max_content_chars=150).execute({"path": "big2.txt", "content": "B" * 50}))
+    assert data["bytes"] == 150  # exactly at the cap is allowed
+    assert f.read_text(encoding="utf-8") == "A" * 100 + "B" * 50
 
 
 # ===========================================================================
@@ -443,6 +553,28 @@ async def test_symlink_escape_blocks_a_write(tmp_path):
     assert outside.read_text(encoding="utf-8") == "original"
 
 
+async def test_write_dotdot_escape_is_rejected_and_untouched(tmp_path):
+    outside = tmp_path.parent / "outside_write2.txt"
+    outside.write_text("secret", encoding="utf-8")
+    assert _parse(await _write(tmp_path).execute({"path": "../outside_write2.txt", "content": "pwned"}))["error"]["code"] == "file_path_escape"
+    assert outside.read_text(encoding="utf-8") == "secret"  # never overwritten
+
+
+async def test_append_symlink_escape_is_rejected_and_untouched(tmp_path):
+    outside = tmp_path.parent / "outside_append.txt"
+    outside.write_text("secret", encoding="utf-8")
+    link = tmp_path / "alink.txt"
+    os.symlink(outside, link)
+    assert _parse(await _append(tmp_path).execute({"path": "alink.txt", "content": "-pwned"}))["error"]["code"] == "file_path_escape"
+    assert outside.read_text(encoding="utf-8") == "secret"  # never appended to
+
+
+async def test_write_absolute_path_outside_root_is_rejected(tmp_path):
+    # A relative path with an out-of-root absolute target is refused outright.
+    assert _parse(await _write(tmp_path).execute({"path": str(tmp_path.parent / "abs_new.txt"), "content": "x"}))["error"]["code"] == "file_path_escape"
+    assert not (tmp_path.parent / "abs_new.txt").exists()
+
+
 async def test_mv_cannot_move_out_of_root(tmp_path):
     (tmp_path / "src.txt").write_text("x", encoding="utf-8")
     outside = tmp_path.parent / "moved_out.txt"
@@ -464,6 +596,14 @@ async def test_no_temp_file_left_after_edit(tmp_path):
     assert f.read_text(encoding="utf-8") == "ONE two"
 
 
+async def test_no_temp_file_left_after_write_or_append(tmp_path):
+    await _write(tmp_path).execute({"path": "w.txt", "content": "brand new"})
+    await _append(tmp_path).execute({"path": "w.txt", "content": " + more"})
+    leftovers = [p for p in os.listdir(tmp_path) if p.endswith(".tmp")]
+    assert leftovers == []
+    assert (tmp_path / "w.txt").read_text(encoding="utf-8") == "brand new + more"
+
+
 # ===========================================================================
 # declarations / schema
 # ===========================================================================
@@ -482,8 +622,17 @@ def test_single_path_schemas(tmp_path):
         assert tool.parameters["additionalProperties"] is False
 
 
+def test_write_and_append_schema_shapes(tmp_path):
+    for tool in (_write(tmp_path, max_content_chars=77), _append(tmp_path, max_content_chars=77)):
+        assert tool.parameters["required"] == ["path", "content"]
+        assert tool.parameters["additionalProperties"] is False
+        assert tool.parameters["properties"]["content"]["type"] == "string"
+        assert tool.parameters["properties"]["content"]["maxLength"] == 77
+
+
 # ===========================================================================
-# approval views (file_edit is the one with a structured detail)
+# approval views (file_edit / file_write / file_append render a structured
+# git-diff detail; the rest ride the generic JSON Arguments block)
 # ===========================================================================
 def test_edit_approval_summary_never_echoes_arguments(tmp_path):
     tool = _edit(tmp_path)
@@ -518,10 +667,54 @@ def test_edit_approval_detail_replace_all_and_empty_new(tmp_path):
     assert not any(l.startswith("+") and l != "+++ b/f.txt" for l in lines)  # no additions
 
 
+def test_write_approval_summary_never_echoes_arguments(tmp_path):
+    tool = _write(tmp_path)
+    s = tool.approval_summary({"path": "/secrets/top", "content": "TOPSECRET"})
+    assert s == tool.approval_summary({})
+    assert "TOPSECRET" not in s
+    assert "/secrets" not in s
+
+
+def test_write_approval_detail_is_a_git_addition(tmp_path):
+    tool = _write(tmp_path)
+    content = "timeout: 60\nretries: 3"
+    detail = tool.approval_detail({"path": "config/settings.yaml", "content": content})
+    assert "config/settings.yaml" in detail
+    assert "write (replace entire content)" in detail
+    assert "--- a/config/settings.yaml" in detail
+    assert "+++ b/config/settings.yaml" in detail
+    assert "+timeout: 60" in detail and "+retries: 3" in detail
+    # every content line is an addition (a new file); there are no deletions
+    lines = detail.split("\n")
+    assert not any(l.startswith("-") and l != "--- a/config/settings.yaml" for l in lines)
+    assert tool.approval_language({"path": "x", "content": "y"}) == "diff"
+
+
+def test_append_approval_detail_shows_appended_lines(tmp_path):
+    tool = _append(tmp_path)
+    detail = tool.approval_detail({"path": "log.txt", "content": "extra line"})
+    assert "log.txt" in detail
+    assert "append" in detail
+    assert "existing content preserved" in detail
+    assert "+++ b/log.txt" in detail
+    assert "+extra line" in detail
+    assert tool.approval_language({"path": "x", "content": "y"}) == "diff"
+
+
+def test_append_approval_summary_never_echoes_arguments(tmp_path):
+    tool = _append(tmp_path)
+    s = tool.approval_summary({"path": "/secrets/top", "content": "TOPSECRET"})
+    assert "TOPSECRET" not in s
+    assert "/secrets" not in s
+
+
 def test_other_tools_have_purpose_summaries_not_details(tmp_path):
-    # Every file tool has a purpose line; only file_edit overrides approval_detail
-    # (a structured diff) — the rest fall back to the generic JSON Arguments block.
+    # Every file tool has a purpose line; only file_edit / file_write /
+    # file_append override approval_detail (a structured diff) — the rest fall
+    # back to the generic JSON Arguments block.
     assert _edit(tmp_path).approval_detail({"path": "f", "old_string": "a", "new_string": "b"}) is not None
+    assert _write(tmp_path).approval_detail({"path": "f", "content": "c"}) is not None
+    assert _append(tmp_path).approval_detail({"path": "f", "content": "c"}) is not None
     for tool in (_read(tmp_path), _ls(tmp_path), _mv(tmp_path), _cp(tmp_path), _rm(tmp_path), _mkdir(tmp_path), _rmdir(tmp_path), _touch(tmp_path)):
         assert tool.approval_summary({})  # a non-empty purpose line
         assert tool.approval_detail({}) is None
@@ -536,5 +729,17 @@ def test_build_default_tools_adds_file_only_when_enabled(tmp_path):
     off = build_default_tools()
     assert "file_read" not in off.names() and "file_edit" not in off.names()
     on = build_default_tools(enable_file=True, file_workdir=str(tmp_path))
-    expected = ["file_read", "file_ls", "file_edit", "file_mv", "file_cp", "file_rm", "file_mkdir", "file_rmdir", "file_touch"]
-    assert on.names()[-9:] == expected  # the nine file tools, in order, after the read-only built-ins (and exec)
+    expected = [
+        "file_read",
+        "file_ls",
+        "file_edit",
+        "file_write",
+        "file_append",
+        "file_mv",
+        "file_cp",
+        "file_rm",
+        "file_mkdir",
+        "file_rmdir",
+        "file_touch",
+    ]
+    assert on.names()[-11:] == expected  # the eleven file tools, in order, after the read-only built-ins (and exec)

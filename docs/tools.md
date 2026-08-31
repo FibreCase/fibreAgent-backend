@@ -13,6 +13,8 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 | `file_read`（**可选**） | `{"path": str}` | `allow` | 读 `FILE_WORKDIR` 内 UTF-8 文本文件 |
 | `file_ls`（**可选**） | `{"path": str}` | `allow` | 列出 `FILE_WORKDIR` 内某目录的条目 |
 | `file_edit`（**可选**） | `{"path": str, "old_string": str, "new_string": str, "replace_all"?}` | **`ask`**（恒） | 在 `FILE_WORKDIR` 内把唯一出现的 `old_string` 换成 `new_string`（或 `replace_all`） |
+| `file_write`（**可选**） | `{"path": str, "content": str}` | **`ask`**（恒） | 在 `FILE_WORKDIR` 内新建文件 / **整体替换**其内容（shell `>` 语义） |
+| `file_append`（**可选**） | `{"path": str, "content": str}` | **`ask`**（恒） | 在 `FILE_WORKDIR` 内向文件追加内容，不存在则先新建（shell `>>` 语义） |
 | `file_mv`（**可选**） | `{"source": str, "target": str}` | **`ask`**（恒） | 在 `FILE_WORKDIR` 内移动 / 重命名文件或目录（不覆盖） |
 | `file_cp`（**可选**） | `{"source": str, "target": str, "recursive"?}` | **`ask`**（恒） | 在 `FILE_WORKDIR` 内复制文件或目录树（不覆盖） |
 | `file_rm`（**可选**） | `{"path": str}` | **`ask`**（恒） | 删除 `FILE_WORKDIR` 内一个**普通文件**（不删目录） |
@@ -37,11 +39,13 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 ### `file`（可选的文件 / 目录工具集）
 
-**默认关闭**（`ENABLE_FILE_TOOL=false`）——不开则不注册、不广告给模型、默认部署仍是"零文件写入"。`exec` 是"跑任意命令"的**通用**能力；`file` 工具集是**更窄、更可控**的一组文件 / 目录操作——模型无需拼 shell 就能安全地读文件、精确改文件、移动 / 复制 / 新建 / 删除。九个工具（`required = [path]` 或 `[source, target]`、`additionalProperties: false`），全部限定在 `FILE_WORKDIR` 内：
+**默认关闭**（`ENABLE_FILE_TOOL=false`）——不开则不注册、不广告给模型、默认部署仍是"零文件写入"。`exec` 是"跑任意命令"的**通用**能力；`file` 工具集是**更窄、更可控**的一组文件 / 目录操作——模型无需拼 shell 就能安全地读文件、精确改文件、整写 / 追加、移动 / 复制 / 新建 / 删除。十一个工具（`required = [path]` 或 `[source, target]` 或 `[path, content]`、`additionalProperties: false`），全部限定在 `FILE_WORKDIR` 内：
 
 - **`file_read`**（`allow`）：读 `path` 指向的 UTF-8 文本文件，返回其内容（尾截断到 `MAX_FILE_READ_CHARS`）。
 - **`file_ls`**（`allow`）：列出某目录的直接条目（文件 + 目录，目录以 `/` 结尾），超过 `MAX_FILE_LIST_ENTRIES` 截断并置 `truncated` 标志。
 - **`file_edit`**（`ask`）：把文件里唯一出现的 `old_string` 替换为 `new_string`（`old_string` 须**恰好出现一次**，除非 `replace_all`；`new_string` 可为空串 = 删除该片段）。无模糊匹配、无整文件重写。
+- **`file_write`**（`ask`）：新建文件，或**整体替换**已有文件的全部内容（shell `>` 语义）。这是"不整文件写"规则里**刻意的例外**——模型可以把任意内容放进**单个**文件，但仅限 root 内、且逐次审批。
+- **`file_append`**（`ask`）：向文件追加内容，不存在则先新建（shell `>>` 语义）。已有内容**保留**（不截断）。
 - **`file_mv`**（`ask`）：在 root 内移动 / 重命名文件或目录；`target` 已存在则拒（不覆盖）。
 - **`file_cp`**（`ask`）：复制文件或目录树（目录需 `recursive=true`）；`target` 已存在则拒（不覆盖）。
 - **`file_rm`**（`ask`）：删除一个**普通文件**；指向目录时拒（删目录用 `file_rmdir`）。
@@ -49,19 +53,19 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 - **`file_rmdir`**（`ask`）：删除一个**空目录**；非空时拒。
 - **`file_touch`**（`ask`）：新建空文件，或更新已存在文件的 mtime。
 
-`file_read` / `file_ls` 只读、声明 `allow`（像 `get_current_time` / `echo` 一样无需每次审批）；**其余七个恒 `ask`**——每次调用都需一次性人工审批（模型无法自批）。
+`file_read` / `file_ls` 只读、声明 `allow`（像 `get_current_time` / `echo` 一样无需每次审批）；**其余九个恒 `ask`**——每次调用都需一次性人工审批（模型无法自批）。
 
 防御纵深（全部在各工具 `execute` 内，loop 不动）：
 
-- **审批视图**：`file_edit` 覆写了可选的 `approval_detail` 钩子，把替换以 **git diff 风格**呈现在 `Action:` 块里（`📄 File:` + `🔁 Operation:` 行 + `--- a/<path>` / `+++ b/<path>` 头，随后 `old_string` 每行前缀 `-`、`new_string` 每行前缀 `+`；`new_string` 为空 = 纯删除，只有 `-` 没有 `+`）替换默认的 `Arguments:` JSON——属主像读任何 diff 一样审批这次改动（**换行/空白原样保留**）。该代码块经 `approval_language` 钩子标注为 `diff`（见下），让 Telegram 按 diff 语法高亮而非猜测。其余文件工具只覆写 `approval_summary`（一句固定用途说明，不回显参数），参数走通用 `Arguments:` JSON 块。
-- **路径受限（核心安全属性）**：每个 `path` / `source` / `target` 解析（含 `..` 与**符号链接**）后必须落在 `FILE_WORKDIR` 内，否则**在任何读/写之前**即被拒（`file_path_escape`）——`../` 逃逸、指向 root 外的绝对路径、指向外部的符号链接都逃不出去，**即便你刚点了批准**也读不写不出。正因如此 `FILE_WORKDIR` 启用时**必填**（须为已存在目录，config 拒绝无它启动）。
-- **窄动词，不覆盖**：`file_rm` 不删目录、`file_rmdir` 只删空目录、`file_mv` / `file_cp` 目标已存在则拒——模型无法用它覆盖或删除一整棵树，无 shell。
-- **原子写**：`file_edit` 的新内容先写入**同目录** temp（`fsync` + `os.replace`），中途被杀不留半截文件（与附件存储、MCP 权限文件同一惯例）。
-- **输出/参数有界**：`file_read` 内容尾截断到 `MAX_FILE_READ_CHARS`（加 `[N chars … truncated]` 标记，**不是**报错）；`file_ls` 条目数超 `MAX_FILE_LIST_ENTRIES` 截断；`file_edit` 的 `old_string`/`new_string` 各自受 `MAX_FILE_STRING_CHARS` 约束，且**同时**烧进参数 schema 的 `maxLength`——约束模型提案，也约束审批卡尺寸。
-- **只回模型**：路径、文件内容、old/new 串**永不进日志、永不进审计表**（审计表结构上只存名字 / 稳定码 / 延迟 + hash scope）。
-- **稳定码**：`file_path_escape` / `file_not_found` / `file_not_a_file` / `file_not_a_directory` / `file_is_directory` / `file_read_failed` / `file_invalid_path` / `file_invalid_args` / `file_not_replaced` / `file_not_unique` / `file_write_failed` / `file_not_empty` / `file_already_exists` / `file_fs_failed`——全部**返回**（非抛出），让具体码到达模型。
+- **审批视图**：`file_edit` / `file_write` / `file_append` 覆写了可选的 `approval_detail` 钩子，把改动以 **git diff 风格**呈现在 `Action:` 块里（`📄 File:` + `🔁 Operation:` 行 + `--- a/<path>` / `+++ b/<path>` 头）——`file_edit` 逐行前缀 `-`（`old_string`）/ `+`（`new_string`；空 `new_string` = 纯删除，只有 `-`）；`file_write` 把 `content` 逐行前缀 `+`（纯新增，已有内容被丢弃，对应 `>`）；`file_append` 只展示**要追加**的 `content`（逐行 `+`，**不**转储已有内容——属主可用 `file_read` 查看）——替换默认的 `Arguments:` JSON，属主像读任何 diff 一样审批这次改动（**换行/空白原样保留**）。该代码块经 `approval_language` 钩子标注为 `diff`（见下），让 Telegram 按 diff 语法高亮而非猜测。其余文件工具只覆写 `approval_summary`（一句固定用途说明，不回显参数），参数走通用 `Arguments:` JSON 块。
+- **路径受限（核心安全属性）**：每个 `path` / `source` / `target` 解析（含 `..` 与**符号链接**）后必须落在 `FILE_WORKDIR` 内，否则**在任何读/写之前**即被拒（`file_path_escape`）——`../` 逃逸、指向 root 外的绝对路径、指向外部的符号链接都逃不出去，**即便你刚点了批准**也读不写不出（`file_write` / `file_append` 同样受限，`>`-式写入无法指向 root 外）。正因如此 `FILE_WORKDIR` 启用时**必填**（须为已存在目录，config 拒绝无它启动）。
+- **窄动词，不删树**：`file_rm` 不删目录、`file_rmdir` 只删空目录、`file_mv` / `file_cp` 目标已存在则拒——模型无法用它**删除或重命名一整棵树**（`file_write` / `file_append` 可以替换 / 扩展**单个**文件的内容，那正是它们 `>` / `>>` 的用途，但只能指向 root 内一个文件）。
+- **原子写**：`file_edit` / `file_write` 的新内容先写入**同目录** temp（`fsync` + `os.replace`），中途被杀不留半截文件（与附件存储、MCP 权限文件同一惯例）；`file_append` 先读已有内容（若有）再原子写入拼接结果，追加同样崩溃安全（要么旧内容、要么完整新内容，绝不留半截追加）。
+- **输出/参数有界**：`file_read` 内容尾截断到 `MAX_FILE_READ_CHARS`（加 `[N chars … truncated]` 标记，**不是**报错）；`file_ls` 条目数超 `MAX_FILE_LIST_ENTRIES` 截断；`file_edit` 的 `old_string`/`new_string` 各自受 `MAX_FILE_STRING_CHARS` 约束，且**同时**烧进参数 schema 的 `maxLength`——约束模型提案，也约束审批卡尺寸；`file_write` / `file_append` 的 `content` 受 `MAX_FILE_CONTENT_CHARS` 约束（同样烧进 schema `maxLength`），且 `file_append` 额外对**拼接后**的文件大小校验（超 → `file_result_too_large`，防已有大文件被撑爆）。
+- **只回模型**：路径、文件内容、old/new 串、write/append 的 `content`**永不进日志、永不进审计表**（审计表结构上只存名字 / 稳定码 / 延迟 + hash scope）。
+- **稳定码**：`file_path_escape` / `file_not_found` / `file_not_a_file` / `file_not_a_directory` / `file_is_directory` / `file_read_failed` / `file_invalid_path` / `file_invalid_args` / `file_not_replaced` / `file_not_unique` / `file_write_failed` / `file_result_too_large` / `file_not_empty` / `file_already_exists` / `file_fs_failed`——全部**返回**（非抛出），让具体码到达模型。
 
-> 有意**不做**：整文件写入 / 追加、删除一整棵树（`file_rm` 只删普通文件、`file_rmdir` 只删空目录）、覆盖式移动 / 复制、任意 shell。这些更激进的操作交给 `exec`（仍逐次审批）。
+> 有意**不做**：删除一整棵树（`file_rm` 只删普通文件、`file_rmdir` 只删空目录）、覆盖式移动 / 复制、任意 shell。这些更激进的操作交给 `exec`（仍逐次审批）。`file_write` / `file_append` 提供**单个文件**的整写 / 追加（受限 + 逐次审批），因此"整文件写入 / 追加"不再是空白，但**删树 / 重命名整树 / 任意 shell** 仍不在 `file` 工具集内。
 
 ## 工具调用循环
 
@@ -103,7 +107,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 Telegram broker：
 
-- 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息含固定标题、工具名、工具的安全**用途摘要**（`What it does:` 一行——描述工具**做什么**：内置工具各给一句固定的用途描述，MCP 工具展示其 `description`（用途）；摘要**本身**绝不回显参数），**若这次调用有参数**再另有一段参数视图——默认把**已 schema 校验**的参数以易读 JSON 展示在 `Arguments:` 的 `<pre><code>` 里（无参数且无详情则整段省略；值经 HTML 转义，无法注入标签）；工具若覆写可选的 `approval_detail` 钩子（如 `file_edit`），则改以它返回的**结构化纯文本**展示在 `Action:` 块里（同样转义 + 有界、`<pre><code>` 保留换行）——与过期提示。**代码块语言标注**：`<pre>` 带一个 `class="language-…"` 属性，让 Telegram 按该语言做语法高亮而非猜测其语言——通用 `Arguments:` 块固定标 `json`，`Action:` 块用工具经 `approval_language` 钩子声明的**固定** Pygments 语言名（`file_edit` → `diff`、`file_read` 无 diff 故不标注；`exec` → `bash`）；provider 只保留 `[A-Za-z0-9_-]`、截断到 24 字符并小写，所以该值无法注入第二个 `class`/闭合标签，返回空则不加标注。**参数/详情只出现在这张给主人看的审批卡片上**，卡片本身**不含** scope、chat id、密钥；参数**从不**写入日志、审计表，或面向模型的回退文案。
+- 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息含固定标题、工具名、工具的安全**用途摘要**（`What it does:` 一行——描述工具**做什么**：内置工具各给一句固定的用途描述，MCP 工具展示其 `description`（用途）；摘要**本身**绝不回显参数），**若这次调用有参数**再另有一段参数视图——默认把**已 schema 校验**的参数以易读 JSON 展示在 `Arguments:` 的 `<pre><code>` 里（无参数且无详情则整段省略；值经 HTML 转义，无法注入标签）；工具若覆写可选的 `approval_detail` 钩子（如 `file_edit`），则改以它返回的**结构化纯文本**展示在 `Action:` 块里（同样转义 + 有界、`<pre><code>` 保留换行）——与过期提示。**代码块语言标注**：`<pre>` 带一个 `class="language-…"` 属性，让 Telegram 按该语言做语法高亮而非猜测其语言——通用 `Arguments:` 块固定标 `json`，`Action:` 块用工具经 `approval_language` 钩子声明的**固定** Pygments 语言名（`file_edit` / `file_write` / `file_append` → `diff`；`exec` → `bash`）；provider 只保留 `[A-Za-z0-9_-]`、截断到 24 字符并小写，所以该值无法注入第二个 `class`/闭合标签，返回空则不加标注。**参数/详情只出现在这张给主人看的审批卡片上**，卡片本身**不含** scope、chat id、密钥；参数**从不**写入日志、审计表，或面向模型的回退文案。
 - 每个 pending 请求绑定到「**发起者 + 原会话**」：用不可逆的 `hash_scope` 指纹比对发起者（从不持有原始 user id），并要求同一 chat。**其他用户——即使是 allow-list 里的——都收到同样的「已过期/无效」安全答复，且永远不能批准**（不泄露请求是否存在）。
 - **一次性**：首个有效决定即消费；重复点击、未知 id、上个进程留下的陈旧按钮、已过期请求都得到安全的「expired/invalid」，**绝不执行**。
 - **卡片原地收尾**：决定（批准 / 拒绝）或超时后，**同一条**消息（按 `message_id` 定位）被**原地编辑**一次——Approve / Deny 按钮（标为 **✅ Approve** / **❌ Deny**）被移除（空 `InlineKeyboardMarkup([])`，线上序列化为 `{}`，即 Bot API「移除键盘」信号；传 `None` 会被 PTB 丢掉、按钮残留），原来的「This approval is one-time and will expire shortly.」提示行被替换为一个**加粗、带 emoji 的状态词**——`<b>✅ Approved.</b>` / `<b>❌ Denied.</b>` / `<b>⏰ Expired (no decision in time).</b>`（不加 `Status:` 前缀），**`Arguments:` / `Action:` 段也一并移除**（按钮已消失，收尾卡片只保留标题、工具名、用途摘要与状态词），不再另发一条跟进消息。收尾是 best-effort：编辑失败绝不改变已决定的结果、不抛异常、不发消息。
@@ -141,11 +145,12 @@ QQ broker（`qq/approval.py::QQApprovalBroker`）——同一 `ToolApprovalProvi
 | `MAX_EXEC_TOOL_RESULT_CHARS` | `8000` | `exec` 单条命令 stdout/stderr 的尾截断上限（超限加 `[N chars … truncated]` 标记，**不是**报错）。`>= 1`；仅在开启时校验。 |
 | `EXEC_WORKDIR` | 空（=进程 cwd） | `exec` 命令运行的固定目录；设置时须为**已存在目录**（否则启动 `ConfigError`）。仅在开启时校验。 |
 | `EXEC_POLICY_DENY_PATTERNS` | 空 | 追加到静态灾难性命令 denylist 的正则（JSON 字符串数组，**add-only**，核心列表不可删）。坏 JSON / 非字符串元素 / 不合法正则 = 启动 `ConfigError`（**始终**校验，即便工具关闭）。 |
-| `ENABLE_FILE_TOOL` | `false` | **可选 `file` 文件工具集的开关**。`false`（默认）→ 不注册、不广告、默认部署零文件写入；`true` + `ENABLE_TOOLS=true` → 注册九个 `file_*` 工具（`file_read` / `file_ls` 为 `allow`，其余恒 `ask`）。 |
+| `ENABLE_FILE_TOOL` | `false` | **可选 `file` 文件工具集的开关**。`false`（默认）→ 不注册、不广告、默认部署零文件写入；`true` + `ENABLE_TOOLS=true` → 注册十一个 `file_*` 工具（`file_read` / `file_ls` 为 `allow`，其余恒 `ask`）。 |
 | `FILE_WORKDIR` | 无 | `file` 工具集的路径受限根目录；**启用时必填**且须为**已存在目录**（否则启动 `ConfigError`）——这是该工具集的安全前提，强制属主显式选择文件根。仅在开启时校验。 |
 | `MAX_FILE_STRING_CHARS` | `2000` | `file_edit` 的 `old_string`/`new_string` 各自长度上限；同时烧进参数 schema 的 `maxLength`（约束模型提案 + 审批卡尺寸）。`>= 1`；仅在开启时校验。 |
 | `MAX_FILE_READ_CHARS` | `8000` | `file_read` 结果内容的**尾截断**上限（超限加 `[N chars … truncated]` 标记，**不是**报错）。`>= 1`；仅在开启时校验。 |
 | `MAX_FILE_LIST_ENTRIES` | `1000` | `file_ls` 单次返回的最大条目数；超出截断并置 `truncated` 标志。`>= 1`；仅在开启时校验。 |
+| `MAX_FILE_CONTENT_CHARS` | `20000` | `file_write` / `file_append` 的 `content` 长度上限；同时烧进参数 schema 的 `maxLength`。`file_append` 额外用它校验**拼接后**文件大小（超 → `file_result_too_large`）。`>= 1`；仅在开启时校验。 |
 
 ## 加一个工具
 
@@ -170,14 +175,15 @@ class MyTool(Tool):
         # ——provider 会 HTML 转义 + 长度有界并放进 <pre><code>（保留换行）；**逐字**展示
         # 真实参数值，不要有损改写。默认返回 None → 用通用 JSON 块（MCP/echo/… 均不覆盖）。
         # 已用它覆写的内置工具：`exec`（命令以 `$ <command>` bash 块呈现）、
-        # `file_edit`（old/new 串以 git diff 风格呈现：`-`/`+` 逐行、`--- a/` / `+++ b/` 头）。
+        # `file_edit` / `file_write` / `file_append`（内容以 git diff 风格呈现：
+        # `-`/`+` 逐行、`--- a/` / `+++ b/` 头）。
         return None
 
     def approval_language(self, arguments) -> str | None:
         # 可选：`Action:` 代码块的语言标注（**Pygments 语言名**，如 `diff`/`bash`/`json`），
         # Telegram 据此做语法高亮而非猜测。必须是工具固定的词表（**不从参数内容推导**），
         # provider 会清洗成安全的 `class="language-…"` 属性；返回 None → 代码块不加标注。
-        # `file_edit` 返回 `diff`、`exec` 返回 `bash`；通用 `Arguments:` 块固定标 `json`。
+        # `file_edit` / `file_write` / `file_append` 返回 `diff`、`exec` 返回 `bash`；通用 `Arguments:` 块固定标 `json`。
         return None
 
     async def execute(self, arguments) -> str:
@@ -189,7 +195,7 @@ class MyTool(Tool):
 - **不要**在任何地方写 `if name == "…"` 分支——registry 是唯一分发点。
 - 想给它自定义审批文案，可覆盖 `approval_summary(arguments)`——写工具**做什么**（用途），**绝不回显 `arguments`**（默认也不回显；内置工具与 MCP 工具都已提供用途行）。
 
-**MCP / SSH / Docker / Pi / `exec` / `file`** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络 / 文件 I/O 都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。**只读 SSH 观测（phase 5.1）也已按此模式接入**（见下）。**可选的 `exec`**（`ENABLE_EXEC_TOOL=true`）是本库第一个真正 spawn 子进程的内置工具——subprocess 同样封装在工具内部、恒 `ask`（见上）。**可选的 `file` 工具集**（`ENABLE_FILE_TOOL=true`）是第二个状态变更本地能力——一组产出九个 `file_*` 工具的小 provider，文件 I/O 封装在工具内部、路径受限（`file_read` / `file_ls` 只读 `allow`、其余恒 `ask`，见上）。Docker / Pi 仍是待建的同类 provider。
+**MCP / SSH / Docker / Pi / `exec` / `file`** 都是同一模式：各是一个 `Tool`（或一个产出若干工具的小 provider），subprocess / 网络 / 文件 I/O 都封装在工具**内部**、绝不进 loop，并在有副作用时走 `ask` 审批。**MCP 已按此模式接入**（见下）：`mcp/` 包在启动时发现 MCP 服务器（远程 Streamable HTTP 端点，或后端 spawn 的本地 stdio 子进程）的工具并包成标准 `Tool`（`mcp_<server>__<remote>` 命名、默认 `ask`），注册进同一个 registry，因此自动复用上面**全部**执行边界（策略 / 校验 / 审批 / 超时 / 审计）。**只读 SSH 观测（phase 5.1）也已按此模式接入**（见下）。**可选的 `exec`**（`ENABLE_EXEC_TOOL=true`）是本库第一个真正 spawn 子进程的内置工具——subprocess 同样封装在工具内部、恒 `ask`（见上）。**可选的 `file` 工具集**（`ENABLE_FILE_TOOL=true`）是第二个状态变更本地能力——一组产出十一个 `file_*` 工具的小 provider，文件 I/O 封装在工具内部、路径受限（`file_read` / `file_ls` 只读 `allow`、其余恒 `ask`，见上）。Docker / Pi 仍是待建的同类 provider。
 
 ## 只读基础设施观测（SSH，phase 5.1）
 
@@ -205,7 +211,7 @@ class MyTool(Tool):
 
 ## 限制
 
-- 本地默认（开启即注册）3 个只读工具（`get_current_time` / `echo` / `system_info`）+ **两个默认关闭的可选状态变更本地能力**：`exec`（`ENABLE_EXEC_TOOL=true`；恒 `ask`、静态 denylist 兜底、进程组杀、输出尾截断，命令与 stdout/stderr 永不入日志/审计表）与 `file` 工具集（`ENABLE_FILE_TOOL=true`；九个 `file_*` 工具——`file_read` / `file_ls` 只读 `allow`、其余七个恒 `ask`，`FILE_WORKDIR` 路径受限防 `../` 与符号链接逃逸、精确替换 / 窄动词不覆盖、原子写，路径/文件内容/old/new 串永不入日志/审计表）。**SSH 只读观测（phase 5.1）** 是固定的 host / disk / service 三个无参工具（严格只读，默认 `allow`、无需每次审批），**不含** shell、任意命令/路径/主机/服务、写操作、持久连接或自动重连；**Docker / Pi 等其它状态变更工具仍未建**（有意为之）——`exec` 已覆盖通用 shell 工作、`file` 工具集已覆盖受限的文件/目录操作，但 `exec` **无沙箱**（爆炸半径 = bot 运行账号）、`file` 被限在 `FILE_WORKDIR` 内。
+- 本地默认（开启即注册）3 个只读工具（`get_current_time` / `echo` / `system_info`）+ **两个默认关闭的可选状态变更本地能力**：`exec`（`ENABLE_EXEC_TOOL=true`；恒 `ask`、静态 denylist 兜底、进程组杀、输出尾截断，命令与 stdout/stderr 永不入日志/审计表）与 `file` 工具集（`ENABLE_FILE_TOOL=true`；十一个 `file_*` 工具——`file_read` / `file_ls` 只读 `allow`、其余九个恒 `ask`，`FILE_WORKDIR` 路径受限防 `../` 与符号链接逃逸、精确替换 / 单文件整写·追加 / 窄动词不删树、原子写，路径/文件内容/old/new 串与 write·append 的 `content` 永不入日志/审计表）。**SSH 只读观测（phase 5.1）** 是固定的 host / disk / service 三个无参工具（严格只读，默认 `allow`、无需每次审批），**不含** shell、任意命令/路径/主机/服务、写操作、持久连接或自动重连；**Docker / Pi 等其它状态变更工具仍未建**（有意为之）——`exec` 已覆盖通用 shell 工作、`file` 工具集已覆盖受限的文件/目录操作，但 `exec` **无沙箱**（爆炸半径 = bot 运行账号）、`file` 被限在 `FILE_WORKDIR` 内。
 - 工具的**完整 transcript 不落库**（无 `tool_calls`/`tool` 消息持久化），无法逐条回放；只有元数据审计。
 - 审批与 pending 状态是**内存态**：进程重启即丢，旧按钮等同未知 id（安全，不会误执行）。
 - 参数校验发生在执行前（`jsonschema`）；但工具**内部**仍要自己防御外部输入。

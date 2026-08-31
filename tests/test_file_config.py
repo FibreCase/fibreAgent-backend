@@ -1,9 +1,9 @@
-"""File toolset — the five config knobs (opt-in, default off).
+"""File toolset — the six config knobs (opt-in, default off).
 
 Local only: no subprocess, no network. Verifies that ``ENABLE_FILE_TOOL``
 (default off), ``FILE_WORKDIR``, ``MAX_FILE_STRING_CHARS``,
-``MAX_FILE_READ_CHARS``, and ``MAX_FILE_LIST_ENTRIES`` are parsed and validated
-correctly.
+``MAX_FILE_READ_CHARS``, ``MAX_FILE_LIST_ENTRIES``, and
+``MAX_FILE_CONTENT_CHARS`` are parsed and validated correctly.
 
 Unlike ``EXEC_WORKDIR`` (optional), ``FILE_WORKDIR`` is **required when the set is
 enabled** — the confinement root is the file toolset's core safety property, so a
@@ -25,6 +25,7 @@ _KNOBS = (
     "MAX_FILE_STRING_CHARS",
     "MAX_FILE_READ_CHARS",
     "MAX_FILE_LIST_ENTRIES",
+    "MAX_FILE_CONTENT_CHARS",
 )
 
 
@@ -120,6 +121,26 @@ def test_file_list_entries_zero_rejected_when_enabled(monkeypatch, tmp_path):
 
 def test_file_list_entries_zero_ignored_when_disabled(monkeypatch):
     assert _load(monkeypatch, MAX_FILE_LIST_ENTRIES="0").max_file_list_entries == 0
+
+
+# ===========================================================================
+# MAX_FILE_CONTENT_CHARS
+# ===========================================================================
+def test_file_content_chars_default(monkeypatch):
+    assert _load(monkeypatch).max_file_content_chars == 20000
+
+
+def test_file_content_chars_custom(monkeypatch, tmp_path):
+    assert _load(monkeypatch, ENABLE_FILE_TOOL="true", FILE_WORKDIR=str(tmp_path), MAX_FILE_CONTENT_CHARS="1000").max_file_content_chars == 1000
+
+
+def test_file_content_chars_zero_rejected_when_enabled(monkeypatch, tmp_path):
+    with pytest.raises(ConfigError, match="MAX_FILE_CONTENT_CHARS"):
+        _load(monkeypatch, ENABLE_FILE_TOOL="true", FILE_WORKDIR=str(tmp_path), MAX_FILE_CONTENT_CHARS="0")
+
+
+def test_file_content_chars_zero_ignored_when_disabled(monkeypatch):
+    assert _load(monkeypatch, MAX_FILE_CONTENT_CHARS="0").max_file_content_chars == 0
 
 
 # ===========================================================================

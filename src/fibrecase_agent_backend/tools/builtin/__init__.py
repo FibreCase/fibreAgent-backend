@@ -9,7 +9,7 @@ The three safe read-only tools (``get_current_time`` / ``echo`` /
 only when their flags are set (driven by their config knobs), so a default
 deployment stays subprocess-free and touch-free: the ``exec`` shell tool
 (``enable_exec``, from ``ENABLE_EXEC_TOOL``) and the ``file`` toolset
-(``enable_file``, from ``ENABLE_FILE_TOOL`` — nine confined file/directory
+(``enable_file``, from ``ENABLE_FILE_TOOL`` — eleven confined file/directory
 tools: ``file_read`` / ``file_ls`` are read-only and ``allow``, the rest are
 ``ask``).
 """
@@ -44,6 +44,7 @@ def build_default_tools(
     max_file_string_chars: int = 2000,
     max_file_read_chars: int = 8000,
     max_file_list_entries: int = 1000,
+    max_file_content_chars: int = 20000,
 ) -> ToolRegistry:
     """Return a registry pre-loaded with the built-in tools.
 
@@ -74,6 +75,7 @@ def build_default_tools(
                 max_string_chars=max_file_string_chars,
                 max_read_chars=max_file_read_chars,
                 max_list_entries=max_file_list_entries,
+                max_content_chars=max_file_content_chars,
             )
         )
     return registry

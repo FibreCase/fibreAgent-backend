@@ -12,9 +12,10 @@ terminal audit).
 * ``file_read`` and ``file_ls`` are strictly read-only and declare
   :attr:`ToolPermission.ALLOW` — they run without a per-call approval, exactly
   like the ``get_current_time`` / ``echo`` built-ins.
-* Every mutating tool (``file_edit`` / ``file_mv`` / ``file_rm`` /
-  ``file_mkdir`` / ``file_rmdir`` / ``file_cp`` / ``file_touch``) declares
-  :attr:`ToolPermission.ASK` — each call needs a one-time human Approve.
+* Every mutating tool (``file_edit`` / ``file_write`` / ``file_append`` /
+  ``file_mv`` / ``file_rm`` / ``file_mkdir`` / ``file_rmdir`` / ``file_cp`` /
+  ``file_touch``) declares :attr:`ToolPermission.ASK` — each call needs a one-time
+  human Approve.
 
 **Defence in depth** (all *inside* each tool's ``execute`` — the tool loop is
 untouched):
@@ -29,12 +30,18 @@ untouched):
 2. **Narrow verbs, no shell.** Each tool does exactly one thing. ``file_rm``
    deletes a *regular file only* (never a directory); ``file_rmdir`` removes an
    *empty* directory only; ``file_mv`` / ``file_cp`` never overwrite an existing
-   target. There is no whole-file write, no arbitrary rename-to-anything, no
-   shell — the model cannot name anything outside the root.
+   target. The two whole-file writers (``file_write`` / ``file_append``) are the
+   one deliberate exception to "no whole-file write": they create a file or
+   replace / append its *entire* content — shell ``>`` / ``>>`` — each confined
+   to the root and gated behind per-call approval, and both bounded. There is no
+   arbitrary rename-to-anything and no shell — the model cannot name anything
+   outside the root.
 3. **Atomic write** — :meth:`_FileTool._atomic_write` writes new content to a
    same-directory temp file (``fsync`` + ``os.replace``), so a mid-write crash
    never leaves a half-written file (the attachment-store / permissions-file
-   idiom).
+   idiom). ``file_write`` uses it directly; ``file_append`` reads the existing
+   content (if any) and atomically writes the concatenation, which keeps the
+   append crash-safe too.
 
 **Output bounding:** a ``file_read`` result is tail-truncated to
 ``max_read_chars`` and a ``file_ls`` result is capped at ``max_list_entries``
@@ -43,6 +50,11 @@ because the read/list was already human-approved or is read-only).
 ``file_edit``'s ``old_string`` / ``new_string`` are bounded by
 ``max_string_chars``, which is also baked into the parameter schema's
 ``maxLength`` so the model's proposal — and the approval card — stays bounded.
+The whole-file writers are bounded by ``max_content_chars``: it caps the
+``file_write`` / ``file_append`` ``content`` (baked into the schema
+``maxLength`` as with the edit strings) and, for ``file_append``, the size of
+the *resulting* file after appending (enforced on the merged content — the
+write side, which the ``content`` cap alone would not cover).
 
 **Logging rule:** paths, file content, and the old/new strings are returned to
 the *model only*. They are **never** logged here and **cannot** reach the audit
@@ -77,6 +89,7 @@ _MESSAGES = {
     "file_not_replaced": "The text to replace was not found in the file.",
     "file_not_unique": "The text to replace is not unique; use replace_all or a more specific string.",
     "file_write_failed": "The file could not be written.",
+    "file_result_too_large": "The resulting file would exceed the maximum content size.",
     "file_not_empty": "The directory is not empty; remove its contents first.",
     "file_already_exists": "A file or directory already exists at that path.",
     "file_fs_failed": "The file operation could not be completed.",
@@ -423,6 +436,202 @@ class FileEditTool(_FileTool):
         )
 
 
+class FileWriteTool(_FileTool):
+    """Create a file or replace its entire content inside the working directory (``ask``).
+
+    Shell ``>`` semantics: the target file is created if absent, or its *whole*
+    content replaced if present. This is the deliberate exception to the set's
+    "no whole-file write" rule — the model can put arbitrary content into a
+    single file, but only inside the root and behind per-call approval.
+    """
+
+    name = "file_write"
+    description = (
+        "Write content to a file inside the working directory, creating it if "
+        "absent or replacing its entire content if it exists (shell '>' "
+        "semantics). The path must stay within the working directory and must "
+        "not be a directory. Every call requires human approval before it runs."
+    )
+    # ``parameters`` is built in ``__init__`` (its ``maxLength`` depends on
+    # config), so there is no class-level default here.
+    parameters: dict[str, object] = {}  # populated per-instance in __init__
+
+    def __init__(self, *, workdir: str, max_content_chars: int) -> None:
+        super().__init__(workdir)
+        # ``maxLength`` on ``content`` bounds the model's proposal and, with it,
+        # the approval card's argument block (same idiom as file_edit's strings).
+        self.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path, absolute or relative to the working directory.",
+                },
+                "content": {
+                    "type": "string",
+                    "maxLength": max_content_chars,
+                    "description": "The complete new content for the file (replaces any existing content).",
+                },
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        }
+
+    def approval_summary(self, arguments: dict[str, Any]) -> str:
+        # Fixed and argument-free. The path + content are shown verbatim in the
+        # card's separate "Action:" block, so they are deliberately NOT echoed
+        # here (secret-free convention).
+        return "Write a file (create it or replace its entire content) within the working directory. Requires approval."
+
+    def approval_detail(self, arguments: dict[str, Any]) -> str:
+        """Render the write as a **git-style addition** on the approval card.
+
+        Shown in place of the generic JSON "Arguments:" block (see
+        :meth:`Tool.approval_detail`): a ``📄 File:`` / ``🔁 Operation:`` header,
+        then a ``--- a/<path>`` / ``+++ b/<path>`` pair followed by every line of
+        the exact ``content`` prefixed ``+`` (a new file is a pure addition; the
+        existing content, if any, is discarded — matching ``>``). Plain text, no
+        markup: the provider HTML-escapes and length-bounds it and wraps it in a
+        code block (which preserves the newlines). See :meth:`approval_language`
+        for the matching ``diff`` label.
+        """
+        path = arguments.get("path")
+        content = "" if arguments.get("content") is None else str(arguments["content"])
+        lines = [
+            f"📄 File: {path}",
+            "🔁 Operation: write (replace entire content)",
+            f"--- a/{path}",
+            f"+++ b/{path}",
+        ]
+        for ln in content.split("\n"):
+            lines.append(f"+{ln}")
+        return "\n".join(lines)
+
+    def approval_language(self, arguments: dict[str, Any]) -> str:
+        # The detail view is a git-style diff, so highlight it as such. (Fixed
+        # vocabulary — never derived from the argument content.)
+        return "diff"
+
+    async def execute(self, arguments: dict[str, Any]) -> str:
+        loc = self._locate(arguments.get("path"))
+        if isinstance(loc, str):
+            return _error(loc)
+        if loc.is_dir():
+            return _error("file_not_a_file")
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            return _error("file_invalid_args")
+        try:
+            self._atomic_write(loc, content)
+        except OSError:
+            return _error("file_write_failed")
+        return json.dumps({"path": self._rel(loc), "bytes": len(content.encode("utf-8"))})
+
+
+class FileAppendTool(_FileTool):
+    """Append content to a file inside the working directory, creating it if absent (``ask``).
+
+    Shell ``>>`` semantics: the file is created (empty then this content) if
+    absent, or the content is appended to the existing content if present.
+    Crash-safe: the merged content is written atomically, so a mid-write crash
+    leaves the file with either the old content or the full new content — never
+    a half-appended tail.
+    """
+
+    name = "file_append"
+    description = (
+        "Append content to a file inside the working directory, creating it "
+        "first if it does not exist (shell '>>' semantics). The path must stay "
+        "within the working directory and must not be a directory. Every call "
+        "requires human approval before it runs."
+    )
+    # ``parameters`` is built in ``__init__`` (its ``maxLength`` depends on
+    # config), so there is no class-level default here.
+    parameters: dict[str, object] = {}  # populated per-instance in __init__
+
+    def __init__(self, *, workdir: str, max_content_chars: int) -> None:
+        super().__init__(workdir)
+        self._max_content = max_content_chars
+        self.parameters = {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path, absolute or relative to the working directory.",
+                },
+                "content": {
+                    "type": "string",
+                    "maxLength": max_content_chars,
+                    "description": "The text to append (the file is created with exactly this content if absent).",
+                },
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        }
+
+    def approval_summary(self, arguments: dict[str, Any]) -> str:
+        # Fixed and argument-free. The path + content are shown verbatim in the
+        # card's separate "Action:" block, so they are deliberately NOT echoed
+        # here (secret-free convention).
+        return "Append content to a file (creating it if absent) within the working directory. Requires approval."
+
+    def approval_detail(self, arguments: dict[str, Any]) -> str:
+        """Render the append on the approval card.
+
+        Shown in place of the generic JSON "Arguments:" block (see
+        :meth:`Tool.approval_detail`): a ``🔁 Operation: append`` line noting the
+        existing content is preserved (or the file is created), then every line
+        of the exact ``content`` to be appended prefixed ``+`` under a
+        ``+++ b/<path>`` header. The existing content is *not* dumped here — the
+        owner can read it with ``file_read`` — but the appended text (the thing
+        this call adds) is shown verbatim, so the owner approves exactly what
+        will be added. Plain text, no markup: the provider HTML-escapes and
+        length-bounds it and wraps it in a code block (which preserves the
+        newlines). See :meth:`approval_language` for the matching ``diff`` label.
+        """
+        path = arguments.get("path")
+        content = "" if arguments.get("content") is None else str(arguments["content"])
+        lines = [
+            f"📄 File: {path}",
+            "🔁 Operation: append (existing content preserved; file created if absent)",
+            f"+++ b/{path}",
+        ]
+        for ln in content.split("\n"):
+            lines.append(f"+{ln}")
+        return "\n".join(lines)
+
+    def approval_language(self, arguments: dict[str, Any]) -> str:
+        # The detail view is a git-style diff, so highlight it as such. (Fixed
+        # vocabulary — never derived from the argument content.)
+        return "diff"
+
+    async def execute(self, arguments: dict[str, Any]) -> str:
+        loc = self._locate(arguments.get("path"))
+        if isinstance(loc, str):
+            return _error(loc)
+        if loc.is_dir():
+            return _error("file_not_a_file")
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            return _error("file_invalid_args")
+        try:
+            existing = loc.read_text(encoding="utf-8") if loc.is_file() else ""
+        except (OSError, UnicodeDecodeError):
+            return _error("file_read_failed")
+        merged = existing + content
+        # The schema bounds only the *appended* content (as characters); the size
+        # of the *resulting* file (existing + appended) is the write side and is
+        # checked explicitly — in characters, matching MAX_FILE_CONTENT_CHARS — so
+        # a large pre-existing file cannot be grown past the cap.
+        if len(merged) > self._max_content:
+            return _error("file_result_too_large")
+        try:
+            self._atomic_write(loc, merged)
+        except OSError:
+            return _error("file_write_failed")
+        return json.dumps({"path": self._rel(loc), "bytes": len(merged.encode("utf-8"))})
+
+
 class FileMvTool(_FileTool):
     """Move / rename a file or directory inside the working directory (``ask``)."""
 
@@ -676,6 +885,8 @@ _ALL_FILE_TOOLS = (
     FileReadTool,
     FileLsTool,
     FileEditTool,
+    FileWriteTool,
+    FileAppendTool,
     FileMvTool,
     FileCpTool,
     FileRmTool,
@@ -691,10 +902,11 @@ def build_file_tools(
     max_string_chars: int,
     max_read_chars: int,
     max_list_entries: int,
+    max_content_chars: int,
 ) -> list[Tool]:
     """Build the full, confined file toolset for ``workdir``.
 
-    Returns the nine tools in a fixed order (read-only ``file_read`` /
+    Returns the eleven tools in a fixed order (read-only ``file_read`` /
     ``file_ls`` first, then the mutating ``ask`` tools) for
     :func:`build_default_tools` to ``registry.add``. ``workdir`` must already be
     a validated existing directory (config enforces this when the set is
@@ -704,6 +916,8 @@ def build_file_tools(
         FileReadTool(workdir=workdir, max_read_chars=max_read_chars),
         FileLsTool(workdir=workdir, max_list_entries=max_list_entries),
         FileEditTool(workdir=workdir, max_string_chars=max_string_chars, max_read_chars=max_read_chars),
+        FileWriteTool(workdir=workdir, max_content_chars=max_content_chars),
+        FileAppendTool(workdir=workdir, max_content_chars=max_content_chars),
         FileMvTool(workdir=workdir),
         FileCpTool(workdir=workdir),
         FileRmTool(workdir=workdir),

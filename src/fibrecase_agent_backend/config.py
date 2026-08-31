@@ -330,25 +330,33 @@ class Config:
 
     # File toolset. ``enable_file_tool`` is an explicit opt-in (default off) —
     # when off the file tools are never registered or advertised. When on it
-    # adds nine confined file/directory tools (``file_read`` / ``file_ls`` /
-    # ``file_edit`` / ``file_mv`` / ``file_cp`` / ``file_rm`` / ``file_mkdir`` /
-    # ``file_rmdir`` / ``file_touch``). The read-only pair
-    # (``file_read`` / ``file_ls``) declares ``allow``; every mutating tool
-    # declares ``ask``. ``file_workdir`` is the *root all file operations are
-    # confined to* (every path must resolve inside it, symlinks included) —
-    # unlike ``exec_workdir`` it is **required** when enabled, because the
-    # confinement is the toolset's core safety property (a missing/misconfigured
-    # root would defeat the confinement, so it refuses to start).
+    # adds eleven confined file/directory tools (``file_read`` / ``file_ls`` /
+    # ``file_edit`` / ``file_write`` / ``file_append`` / ``file_mv`` /
+    # ``file_cp`` / ``file_rm`` / ``file_mkdir`` / ``file_rmdir`` /
+    # ``file_touch``). The read-only pair (``file_read`` / ``file_ls``) declares
+    # ``allow``; every mutating tool declares ``ask``. ``file_workdir`` is the
+    # *root all file operations are confined to* (every path must resolve inside
+    # it, symlinks included) — unlike ``exec_workdir`` it is **required** when
+    # enabled, because the confinement is the toolset's core safety property (a
+    # missing/misconfigured root would defeat the confinement, so it refuses to
+    # start).
     # ``max_file_string_chars`` bounds a ``file_edit`` ``old_string`` /
     # ``new_string`` (it also caps the approval card's Arguments block);
     # ``max_file_read_chars`` tail-truncates a ``file_read`` result;
     # ``max_file_list_entries`` caps a ``file_ls`` listing (exec-style marker /
-    # flag, not an error).
+    # flag, not an error). ``max_file_content_chars`` bounds the whole-file
+    # writers (``file_write`` / ``file_append``): it caps the ``content``
+    # argument (baked into the schema ``maxLength``) and, for ``file_append``,
+    # the size of the resulting file after appending (the write side the
+    # ``content`` cap alone would not cover). It is separate from
+    # ``max_file_string_chars`` (a larger default) because a whole file is
+    # bigger than a single replace string.
     enable_file_tool: bool = False
     file_workdir: str | None = None
     max_file_string_chars: int = 2000
     max_file_read_chars: int = 8000
     max_file_list_entries: int = 1000
+    max_file_content_chars: int = 20000
 
     # Streaming replies: when on, *private* chats get a live "draft" compose-box
     # preview (Bot API ``sendMessageDraft``) that updates as the model generates.
@@ -483,6 +491,8 @@ class Config:
                 raise ConfigError("MAX_FILE_READ_CHARS must be >= 1")
             if self.max_file_list_entries < 1:
                 raise ConfigError("MAX_FILE_LIST_ENTRIES must be >= 1")
+            if self.max_file_content_chars < 1:
+                raise ConfigError("MAX_FILE_CONTENT_CHARS must be >= 1")
         # Phase 9 (Automation): SCHEDULE_TIMEZONE, when set, must be a name the
         # stdlib can resolve — a bad timezone is a startup failure, never a silent
         # fallback to the wrong wall clock. ("" means "use the process-local tz"
@@ -1641,6 +1651,7 @@ def load_config() -> Config:
     max_file_string_chars = _parse_int(os.environ.get("MAX_FILE_STRING_CHARS", ""), 2000)
     max_file_read_chars = _parse_int(os.environ.get("MAX_FILE_READ_CHARS", ""), 8000)
     max_file_list_entries = _parse_int(os.environ.get("MAX_FILE_LIST_ENTRIES", ""), 1000)
+    max_file_content_chars = _parse_int(os.environ.get("MAX_FILE_CONTENT_CHARS", ""), 20000)
     # Streaming replies (private chats): on by default; a bad value fails fast
     # like every other bool knob.
     enable_streaming = _parse_bool(os.environ.get("ENABLE_STREAMING", ""), True)
@@ -1693,6 +1704,7 @@ def load_config() -> Config:
         max_file_string_chars=max_file_string_chars,
         max_file_read_chars=max_file_read_chars,
         max_file_list_entries=max_file_list_entries,
+        max_file_content_chars=max_file_content_chars,
         enable_streaming=enable_streaming,
         qq_app_id=qq_app_id,
         schedules=schedules,
