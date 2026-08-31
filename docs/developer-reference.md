@@ -41,6 +41,7 @@ implemented, mocked-tested, and released:
 - An **opt-in `exec` shell tool** (default off, always `ask`, with a static catastrophic-command backstop) — implemented and tested on top of that
 - An **opt-in `file` toolset** (default off; `file_read`/`file_ls` read-only `allow`, the other seven tools always `ask`; confined to `FILE_WORKDIR` against `../` and symlink escape, precise replace + narrow non-overwriting file/directory operations) — implemented and tested on top of that
 - **Streaming replies** (Bot API 10.0 `sendMessageDraft`; `ENABLE_STREAMING`, default on) — a live draft-preview in a private chat's compose box that animates as the model generates, with the full reply still delivered as a normal message; group/channel chats and a disabled knob degrade to the classic "typing…" + chunked reply. The Bot API 10.3 Stop button is a later phase (stop stays on `/stop`). Implemented and mocked-tested on top of that.
+- **Phase 10 (Multi-Channel: QQ C2C plain text + commands)** — the first non-Telegram channel. A plain-text **C2C (private-chat) send/receive** adapter over the official `botpy` SDK, off by default (on when `QQ_APP_ID` is set). It normalises an incoming QQ C2C message into `AgentMessage(source="qq")`, calls the same channel-agnostic `AgentService.process_message`, and delivers the reply over the QQ websocket — so tool calling, the tool-security gate, context budgeting, and long-term memory all work unchanged. On top of plain send/receive it offers the **same slash-command surface** as the Telegram bot (core set + read-only `/mcp_status`), **reply-quoting** of the user's message (`message_reference`, first chunk only), and a **native command panel** (best-effort, idempotent create-or-update). Conversations are keyed by a deterministic synthetic id in a reserved range disjoint from (and below) the schedule range. `qq/bot.py` + `qq/commands.py` are the only modules that know about `botpy`. **Limitations:** C2C plain text only (no group/guild, no images, no streaming draft), no `/start` (no QQ concept) and no `/mcp` / `/mcp auth` (OAuth is Telegram-bound), and `ask`/`deny` tools fail-closed to DENIED on a QQ turn (approval is a Telegram callback). Implemented and mocked-tested on top of that.
 
 ### Phase 1
 
@@ -861,6 +862,101 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   Startup hooks (command menu + DB init + MCP discovery) are chained with
   `compose_startup_hooks`.
 
+- **`qq/bot.py`** + **`qq/commands.py`** — the *only* modules that know about QQ / the
+  `botpy` SDK (phase 10, multi-channel). They mirror the `telegram/` package: the single
+  knowledge source for the SDK, never touching the OpenAI SDK, Telegram, or ORM. The
+  adapter is a thin, channel-agnostic transport over the same `AgentService` — no
+  images, no streaming draft, **plain-text C2C (private-chat) send/receive** in this
+  slice. On top of that it offers the same **slash-command surface** as the Telegram
+  bot, **reply-quoting** of the user's message, and a **native command panel**. The
+  command *logic* lives in `qq/commands.py` (pure, botpy-free, Telegram-free — a
+  channel never imports another channel): `_QQ_COMMANDS` is the single source of
+  truth (12 commands: the core set + read-only `/mcp_status`, **minus** `/start` (no QQ
+  concept) and `/mcp`/`/mcp auth` (OAuth is Telegram-bound)); `build_c2c_panel_items`
+  maps it to the panel's `command` items, **filtering to the 14-char name cap** (which
+  drops `/schedule_status` — it is still *dispatched* by hand) and the 20-item cap;
+  `known_command_names()` exposes the dispatchable set; and `dispatch(command, args,
+  …)` runs one command by reusing the channel-agnostic `AgentService` methods
+  (`reset` / `conversation_status` / `context_status` / the memory methods /
+  `list_tool_audit_events`) and the startup `Config` + `McpManager`, returning the
+  reply string (or `None`). An `AgentError` becomes its `user_safe` text; any other
+  exception is logged by class and surfaced as a fixed generic notice — the dispatcher
+  never raises. `QQChannel`
+  is a plain class (no `botpy`) so it unit-tests against a fake `C2CMessage` without a
+  live websocket. It holds the `service`, `repository`, `config`, and `mcp_manager`
+  (the last two feed the read-only config commands) **and a QQ-local `_in_flight` dict**
+  (conversation id → the `asyncio.Task` currently generating its reply), the QQ
+  counterpart of the Telegram layer's in-flight registry. `on_c2c_message_create(message)`
+  does, in order: (1) read
+  `message.author.user_openid` — there is **no allow-list** (this is the owner's
+  personal bot and a C2C chat is one-to-one, so any sender is served); a message with
+  a **missing** openid is malformed and is ignored (logged by class only — there is no
+  openid to leak); (2) strip `message.content`, and if blank return (no processing, no
+  reply); (3) **command branch** — if the text starts with `/` and the leading token is
+  a *known* command, it is dispatched and its reply delivered (via `_send_long`, **not**
+  quoted), and the message is **not** stored as a conversation turn (matching Telegram);
+  an **unknown** `/…` falls through to the normal turn (never swallowed); (4) the normal
+  agent turn: key the
+  persistent conversation by the deterministic synthetic `qq_chat_id(openid)` (stored as
+  **both** chat id and user id — QQ has no separate numeric identity), creating it via
+  `repo.get_or_create_conversation`; register `asyncio.current_task()` in `_in_flight`
+  (so a later `/stop` — arriving as its own message/task — can cancel it); build
+  `AgentMessage(contents=[TextContent(text)], source="qq")` and call
+  `service.process_message(cid, agent_message, memory_scope=f"qq:{openid}")` — no
+  `delivery_chat_id`, no `on_text_delta`. An `AgentError` maps to its `user_safe` text
+  (logged by `category` only); any other exception logs by class and replies with a
+  generic "unexpected error" notice; an `asyncio.CancelledError` (`/stop`) logs,
+  sends a short "已停止" notice **quoted** to the interrupted message, and re-raises.
+  The handle is removed in `finally` (completion *and* cancellation). Delivery is
+  `message.reply(msg_type=2, markdown={"content": …}, msg_seq=…)` — a **Markdown**
+  message, with the model's text placed **verbatim** in the nested `markdown.content`
+  field (a Markdown message leaves the top-level `content` unset). There is **no**
+  Markdown→anything conversion or escaping pass on the send path (unlike the Telegram
+  adapter's `telegram/markdown.py` HTML conversion) — the text goes out exactly as the
+  model produced it, and QQ's client renders the Markdown it recognises. Chunks are
+  split by the local `_split_for_qq` (same never-lose-content contract as the Telegram
+  chunker, but **kept local** so a channel never imports another channel); the short
+  error notice (`_safe_reply`) is the one send still sent as plain text (`msg_type=0`).
+  **Reply-quoting:** a normal answer's **first** chunk also carries
+  `message_reference={"message_id": str(message.id), "ignore_get_message_error": True}`
+  (the visible quote), mirroring the Telegram adapter's quote-once; later chunks and
+  command acks do not. `message_reference` is **distinct** from the `msg_id`
+  passive-reply thread — the former is the visible quote, the latter how QQ knows which
+  message is being answered. `msg_seq` increments per chunk (1, 2, 3, …) because the
+  QQ API dedups on `(msg_id, msg_seq)` and would otherwise drop every chunk after the
+  first. `build_qq_client(service, repository, config, mcp_manager)` is the **only**
+  place that imports `botpy` (lazily, so a Telegram-only deploy never loads it): it
+  wraps a fresh `QQChannel` in a `botpy.Client` subclass whose `on_c2c_message_create`
+  delegates to it **and whose `on_ready` best-effort creates-or-updates the native
+  command panel**, with `Intents(public_messages=True)` (bit `1 << 25`, the flag that
+  enables the C2C `c2c_message_create` event) and `ext_handlers=False` (botpy's default
+  would drop a rotating `botpy.log` file into the CWD; `bot_log=True` keeps its
+  lifecycle logs propagating to our already-configured root logger instead).
+  **The command panel:** botpy has **no** `menu`/`panels` wrapper, so `_ensure_c2c_panel`
+  (fired from `on_ready`, after login, when the token is valid) makes raw
+  `self.http.request(Route(…))` calls — the same primitive `botpy`'s own API layer uses:
+  `GET /v2/panels?scope=c2c` → find a record whose `panel.remark` equals our fixed
+  marker (`fibrecase-c2c`) → if found `PUT /v2/panels/{panel_id}` (with the record's
+  `version` for optimistic locking), else `POST /v2/panels` (scope `c2c`,
+  `target_type=all`, items from `build_c2c_panel_items`, the same `remark`). The
+  `remark` marker makes it **idempotent across restarts** (the panel API is not — a
+  blind re-POST stacks up to 20 identical panels). It **never raises**: any failure is
+  logged by class and swallowed so a panel hiccup can never break startup or message
+  handling. **Approval on a QQ turn is a documented limitation, not a bug:** an `ask`
+  tool resolves to the synthetic chat id (no `delivery_chat_id` was handed in), its
+  approval card's `send_message` to that id fails (it is not a real Telegram chat), and
+  the broker **fail-closes to DENIED** — no hang, no leak. So a QQ turn runs `allow`
+  tools freely but can never be approved for `ask` / `deny` tools (approval is, by
+  design, a *Telegram* callback). The composition root (`main.py`) builds the client in
+  `_post_init` (on the PTB running loop, because `botpy.Client.__init__` grabs the
+  running loop) and drives it as an `asyncio.Task` via `async with client: await
+  client.start(app_id, secret)` — the SDK's own `run()` is blocking (it owns a loop) and
+  cannot be used; the task is `close()`-d + cancelled in `_post_shutdown`. **Privacy:**
+  the QQ adapter logs only the synthetic conversation id, the QQ *message id*, a text
+  length, and (for a command) the command *name* — **never** the raw `user_openid` (a
+  user identity), a command *argument* (which can carry memory content), or the message
+  / reply body.
+
 - **`telegram/media.py`** — the *only* module that fetches Telegram media (phase 2.2).
   `normalize_message(msg, max_bytes)` → `AgentMessage`. `extract_image_message` takes
   the **largest** `message.photo[-1]` rendition, downloads it **in memory** via
@@ -1518,7 +1614,10 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   **image bytes, or base64 image data**, an **MCP endpoint/URL**, an **MCP token**, an
   **MCP stdio `command`/`args`/`env`/`cwd`**, any **OAuth token / code / client secret
   / state**, or an **infra host / key path / known-hosts path / mount path / command
-  output** (the LLM client's `_safe()` deliberately strips request headers). Keep it
+  output** (the LLM client's `_safe()` deliberately strips request headers). The **QQ
+  adapter** (`qq/bot.py`) logs only the synthetic conversation id, the QQ *message id*,
+  and a text length — **never** the raw `user_openid` (a user identity), the message
+  **body**, the **reply** body, or `QQ_CLIENT_SECRET`. Keep it
   that way when adding tools, media types, memory commands, MCP servers, OAuth
   providers, or infra targets.
 - **Approval is a callback, not a tool**: the `Approve`/`Deny` decision reaches the
@@ -1528,6 +1627,65 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   emitting text — the only path to approval is the owner pressing the button in the
   bound chat. Don't add an `approve`/`confirm` *tool*; that would let the model grant
   itself approval.
+- **`botpy` owns its event loop and would drop a stray log file**: `botpy.Client`
+  must be **constructed and started on the running PTB loop** (`main.py::_post_init`)
+  — its `__init__` grabs `asyncio.get_event_loop()` and `run()` is **blocking** (it
+  owns a loop via `run_until_complete`), so the backend drives it as an `asyncio.Task`
+  via `async with client: await client.start(app_id, secret)` and `close()`s + cancels
+  it in `_post_shutdown` (never call the blocking `run()`). And pass
+  `ext_handlers=False` in `build_qq_client` — botpy's **default** `ext_handlers=True`
+  installs a `TimedRotatingFileHandler` that writes a rotating `botpy.log` into the
+  *current working directory* (repo root in dev, `/app` under Docker); `bot_log=True`
+  keeps its lifecycle logs propagating to our already-configured root logger instead,
+  so no stray file appears.
+- **QQ turns run `allow` tools but can never be approved for `ask`/`deny` tools.**
+  Approval is, by design, a *Telegram* callback. On a QQ turn there is no
+  `delivery_chat_id`, so an `ask` tool's approval card targets the synthetic
+  `qq_chat_id` (not a real Telegram chat); the card's `send_message` fails and the
+  broker **fail-closes to DENIED** (no hang, no leak). This is a documented limitation
+  of the C2C slice — do not "fix" it by trying to route approval to QQ; the right fix
+  is a channel-aware approval UI, which is out of scope here.
+- **QQ C2C dedups on `(msg_id, msg_seq)`**: a reply is `message.reply(msg_type=2,
+  markdown={"content": …}, msg_seq=…)` keyed to the *incoming* message id. The QQ API
+  **rejects a re-sent identical pair**, so a multi-chunk reply must send each chunk with an
+  incrementing `msg_seq` (1, 2, 3, …) — reusing `msg_seq=1` for every chunk would land
+  only the first. Replies are Markdown (`msg_type=2`, text in the nested `markdown.content`)
+  so the QQ client renders them, sent **verbatim** (no conversion/escape layer); the short
+  error notice is the one plain-text (`msg_type=0`) send.
+- **QQ `message_reference` is a quote, *distinct* from the `msg_id` thread.** `message.reply`
+  always passes the incoming `message.id` as the passive-reply `msg_id` (how QQ knows which
+  message is being answered). The *visible* quote is a separate `message_reference`
+  `{"message_id": str(id), "ignore_get_message_error": True}` — only the answer's **first**
+  chunk carries it (quote-once, mirroring Telegram). Do not conflate the two: dropping the
+  quote is a cosmetic loss, but omitting `msg_id` breaks the passive reply itself.
+- **QQ slash-commands arrive as plain text; only a *known* leading token is intercepted.**
+  QQ has no separate command event — `/new` is just a C2C message whose `content` starts
+  with `/`. The dispatcher intercepts **only** a token in `commands.known_command_names()`;
+  an unknown `/…` **must** fall through to the normal agent turn (never swallowed), so an
+  accidental `/foo` is still answered by the model, not eaten. Command messages are not
+  stored as conversation turns (matching Telegram) — the agent only sees non-command text.
+- **The QQ `/stop` registry is QQ-local (`QQChannel._in_flight`), not shared with Telegram.**
+  botpy invokes each C2C message as its own `asyncio.Task`, so `asyncio.current_task()` at
+  turn start is the cancellable handle; a later `/stop` (a separate message → separate task)
+  pops and cancels it. The handle **must** be removed in a `finally` (completion *and*
+  cancellation) so a finished/stopped turn never lingers as a stale, cancellable handle,
+  and the cancelled turn's own "已停止" notice is best-effort (a failed send must not mask
+  the re-raise). Do not reach across into the Telegram layer's `_IN_FLIGHT` — the two
+  channels have disjoint conversation-id spaces and lifecycles.
+- **The QQ command panel is idempotent via the `remark` marker, and its failures are swallowed.**
+  The panel API is *not* idempotent — a blind `POST /v2/panels` on every restart stacks up to
+  20 identical panels. `_ensure_c2c_panel` first `GET /v2/panels?scope=c2c`, finds the record
+  whose `panel.remark == "fibrecase-c2c"`, and `PUT`s it (with the record's `version` for
+  optimistic locking) or, if absent, `POST`s. It runs from `on_ready` (token valid post-login)
+  and **never raises** — a panel hiccup (network, a 4xx) is logged by class and swallowed so
+  it can never break startup or message handling. botpy has **no** `menu`/`panels` wrapper;
+  the calls are raw `self.http.request(Route(…), json=… / params=…)` (the same primitive
+  botpy's own `api.py` uses), lazy-imported so a Telegram-only deploy never touches `botpy`.
+- **A QQ command's *argument* is logged-unsafe even though its *name* is safe.** `/remember`
+  / `/forget` arguments carry memory content; `/tool_audit`'s is a number; the rest are empty.
+  The QQ adapter logs the command **name** and the synthetic conversation id, but **never**
+  the argument string (nor the raw openid or the reply body) — assert this in the command
+  tests alongside the feature.
 - **Pre-execution audit is fail-closed; terminal audit is best-effort**: `record_pre`
   (the `requested` record) must succeed or the tool does **not** run
   (`audit_unavailable`); a failure writing a *terminal* record (completed/timed_out/
@@ -1633,8 +1791,9 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
 The full, strictly-validated config reference. (User-facing defaults live in
 `configuration.md`; this is the developer's authoritative list of what each knob does,
 its validation, and the cross-knob invariants. All come from `config.py::load_config`
-/ `Config.__post_init__`.) Secrets (`TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`) are
-env-only and must never be committed — `.env` and `data/` are git-ignored.
+/ `Config.__post_init__`.) Secrets (`TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`,
+`QQ_CLIENT_SECRET`) are env-only and must never be committed — `.env` and `data/`
+are git-ignored.
 
 Two non-obvious rules:
 - **`OPENAI_BASE_URL` is the API *prefix*** (e.g. `https://<host>/v1`), **not** the
@@ -1924,6 +2083,44 @@ written to the logs, the audit table, or `/schedule_status` (the `cron` **is** s
 there, alongside the name and next-fire time — the one allowed schedule attribute in
 a command); the notification itself carries the task name + result (content delivered
 to the owner, allowed).
+
+### QQ channel knobs (phase 10 — multi-channel, C2C plain text + commands)
+
+The QQ channel is **off by default** and turns on the moment `QQ_APP_ID` is set —
+the same optional-channel gating as every other opt-in provider (MCP, infra, OAuth,
+schedules). When off, `botpy` is never imported and no websocket is opened; the
+Telegram bot runs unchanged. **There is no separate toggle for the slash-commands or
+the command panel** — they come on with the channel (a QQ channel without commands
+would be the odd one out), so both are always available once `QQ_APP_ID` is set.
+
+- **`QQ_APP_ID`** (default empty): the QQ open-platform app id (a **non-secret**,
+  string of digits). Empty = the QQ channel is **disabled** (no client, no websocket).
+  This is the *gate* — it is read in `config.py` and decides whether the channel
+  exists at all. **There is no allow-list** (unlike the Telegram adapter's
+  `TELEGRAM_ALLOWED_USER_IDS`): the channel is the owner's *personal* bot and a C2C
+  chat is a one-to-one private chat, so any `user_openid` that can DM (or @) the app
+  is served. Access is bounded by the fact that only the owner has the bot's app id +
+  a QQ account that can be added to it — the same trust posture as every other
+  personal deployment of this backend.
+- **`QQ_CLIENT_SECRET`** (env-only **secret**; *not* read by `config.py`): the app's
+  client secret. It is read **only** in `main.py` at client-build time (in `_post_init`),
+  **never** stored on `Config`, **never** logged, and **never** committed. If
+  `QQ_APP_ID` is set but the secret is empty, the channel is skipped with a `warning`
+  (fail-soft — the Telegram bot still runs) rather than a hard startup error. This
+  asymmetry (app id in `Config`, secret read at the composition root) is deliberate:
+  the secret is used exactly once, to start the websocket, and should not ride on the
+  config object that is freely passed around.
+
+**The command set and the panel are config-free.** The 12 slash-commands, their reply
+text, and the native command panel are all derived from the hard-coded
+`qq/commands.py::_QQ_COMMANDS` table (single source of truth for both `/help` and the
+panel) — there is no env var to add, reorder, or disable a QQ command. `config` and
+`mcp_manager` are threaded into `build_qq_client` only so the read-only commands
+(`/status` model, `/mcp_status`, `/infra_status`, `/schedule_status`) can render; they
+are not secrets.
+
+The full mechanism is in the `qq/bot.py` + `qq/commands.py` per-module reference entry
+and the "QQ 会话用保留区间的合成 id" invariant in [architecture.md](architecture.md).
 
 ### Exec shell-tool knobs (opt-in)
 
@@ -2503,6 +2700,67 @@ typing, and the full reply still sent as a normal message; **group** (and
 still leaves the full final message delivered; the reply body never reaches the
 logs). **All mocked** — no real LLM/Telegram/network.
 
+### QQ channel (phase 10, C2C plain text) — behaviour coverage
+
+`tests/test_qq.py` — **all mocked** (a fake `C2CMessage` + `FakeService` /
+`FakeRepo`; no websocket, no `botpy` client run, no network): (1) any openid
+(**no allow-list** — the personal-bot C2C posture) → `process_message` called with
+the `qq_chat_id(openid)` conversation, `memory_scope="qq:<openid>"`, an
+`AgentMessage` with `source="qq"` and the text; the conversation row is created
+keyed by the synthetic id (chat == user); the reply is delivered as one **Markdown**
+(`msg_type=2`, text in the nested `markdown.content`, top-level `content` unset)
+`reply` at `msg_seq=1`. (2) A **missing** openid (malformed) →
+ignored, not processed, no reply. (3) **Blank** content (empty / whitespace /
+newlines) → no processing, no reply. (4) An `AgentError` → its `user_safe` text
+replied. (5) An **unexpected** exception → a generic "unexpected error" notice, and
+the handler does not raise. (6) A **failed send** (`reply` raises) → swallowed, not
+raised. (7) A **long** reply → chunked with `msg_seq` incrementing 1, 2, 3, … (each
+chunk a distinct dedup key), every chunk a Markdown (`msg_type=2`) message, and the
+chunks concatenate back to the full reply (nothing truncated). (8) The local `_split_for_qq` preserves all content /
+hard-splits a huge line / single chunk when short / keeps `QQ_MAX_MESSAGE_CHARS
+<= 4096`. (9) `build_qq_client` returns a real `botpy.Client` with the
+`public_messages` intent bit set and wires `on_c2c_message_create` to the
+`QQChannel` logic. (10) **Privacy** (asserted in the same tests): the raw
+`user_openid`, the message **body**, and the **reply** body **never** appear in any
+log record's fields — only the synthetic conversation id. Plus the `qq_chat_id`
+invariants: deterministic per openid, inside the reserved `[QQ_CHAT_ID_BASE,
+QQ_CHAT_ID_MAX)` range, distinct per openid, and the whole reserved range sits
+**below** the schedule range (`QQ_CHAT_ID_MAX <= SCHEDULE_CHAT_ID_BASE`). **All
+mocked** — no real QQ/LLM/network/subprocess.
+
+**Slash-commands, reply-quoting, and the panel** (same file): (11) **Dispatch** —
+`/new` → `service.reset(cid, cid)` + ack and **no** agent turn / no conversation
+row; `/help` lists all 12 commands; an **unknown** `/…` falls through to the agent
+as a normal `source="qq"` turn (never swallowed); the command *name* is logged but a
+`/remember` **argument** (and the raw openid) is **not** (same test asserts the
+memory scope `qq:<openid>` was used). (12) **Each command** reuses the
+channel-agnostic `AgentService` methods with the `qq:<openid>` scope and renders
+the Telegram phrasing: `/status` (known → `conversation_status` + model/version;
+none-yet branch), `/context` (none-yet branch; metadata-only), `/remember` /
+`/memories` (with `_utc_stamp`) / `/forget <id>` / `/forget all` (CONFIRM two-step
+— without the token it deletes nothing) / `/forget all CONFIRM`, `/tool_audit`
+(limit clamped to 1–50, scope-isolated), `/mcp_status` (manager `status()` +
+`total_tools`; disabled when manager is `None`), `/infra_status` (`local_tool_name`
+per observation; **never** a host/port/path/command — only target name + tool
+names; disabled when no targets), `/schedule_status` (name + cron + next-fire only,
+**never** prompt/chat_id/user_id; disabled when none). (13) **`/stop`** — the turn
+registers its `asyncio.Task` in the QQ-local `_in_flight`; a `/stop` from a *separate*
+message cancels it (asserted via `pytest.raises(CancelledError)` on the turn task),
+the `/stop` sends nothing, the cancelled turn posts a plain-text "已停止" notice
+**quoted** to the interrupted message, and the handle is removed; a `/stop` with
+nothing running replies "Nothing to stop". (14) **Reply-quoting** — a normal answer's
+**first** chunk carries `message_reference={"message_id": str(message.id),
+"ignore_get_message_error": True}`; a **long** reply's later chunks do not; command
+acks and error notices do **not** quote. (15) **Panel** — `build_c2c_panel_items`
+(drops `/schedule_status` over the 14-char name cap, caps at 20, every item
+`{type:"command", name:"/<cmd>", desc}`); `_c2c_panel_payload` (scope `c2c`,
+`target_type=all`, the `fibrecase-c2c` remark, no openid/body); `known_command_names`
+== the command table; `_ensure_c2c_panel` create-or-update against a fake
+`client.http` (`GET`→`POST` when absent, `GET`→`PUT` with the record's `version` when
+the marker is found, `GET`→`POST` when a *different* remark is present, and a
+`request` exception is swallowed); `on_ready` wires the panel (`GET`→`POST`). **All
+mocked** — no real QQ/LLM/network/subprocess.
+
 ---
 
 ## Feature limitations
@@ -2731,6 +2989,50 @@ logs). **All mocked** — no real LLM/Telegram/network.
   is injected, batched before the LLM call. Documented semantics: if the LLM call
   *then* fails, the retrieval still counts. A failed timestamp write is logged and does
   not drop an otherwise-ready turn.
+
+### QQ channel limitations (phase 10, C2C plain text)
+
+- **C2C (private chat) text only.** This slice handles `c2c_message_create`
+  (a user DMing the bot) with **plain-text inbound** and **Markdown outbound**
+  (`msg_type=2`, so the model's Markdown renders; the short error notice is the one
+  `msg_type=0` plain-text send). **群 (group)** and
+  **频道/guild** messages are out of scope for *this slice* (no handler wired). Note
+  the intent situation is not what it looks like: the **same** `public_messages` bit
+  (`1 << 25`, already enabled) also delivers `on_group_at_message_create` — the classic
+  QQ *group* @-message event — so classic groups need only a wired handler + group
+  identity (`member_openid`, which differs per group from the C2C `user_openid`), not a
+  new intent. The newer **频道/guild** system (`guild_id`/`channel_id`, `on_at_message_create`)
+  is a *separate* system on `public_guild_messages` (`1 << 30`) and would need that bit
+  added. Both are natural, contained follow-ups in `qq/bot.py`.
+- **No images / media.** An incoming QQ message is read for its text `content` only;
+  an image or any non-text payload is not downloaded, normalised, or echoed back.
+  (The channel-agnostic core already supports `ImageContent`; the QQ adapter simply
+  does not produce one yet.)
+- **No streaming draft.** There is no `on_text_delta` / draft-preview on QQ — a reply
+  arrives as one (or several, if long) plain-text message(s) after generation
+  completes. The Telegram live-draft preview is Telegram-specific (Bot API 10.0
+  `sendMessageDraft`).
+- **`ask` / `deny` tools cannot be approved on a QQ turn.** Approval is a Telegram
+  callback by design; on a QQ turn the approval card targets the synthetic chat id,
+  the send fails, and the broker **fail-closes to DENIED**. A QQ turn therefore runs
+  `allow` tools freely but is blocked from any `ask` (and all `deny`) tool until a
+  channel-aware approval UI exists.
+- **Command set is the core + read-only `/mcp_status` — not the full Telegram set.**
+  There is no `/start` (QQ has no "start" concept; a C2C chat is the conversation) and
+  no `/mcp` / `/mcp auth` — the MCP **OAuth login is Telegram-bound** (it returns an
+  inline login *button* and a proactive completion notification; QQ has no inline
+  button and its proactive send is rate-limited — 2/channel/day inside a 5-minute
+  passive window — so the login flow is not reliably deliverable). The 12 commands that
+  *are* available: `/new` `/stop` `/help` `/status` `/context` `/remember` `/memories`
+  `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status`.
+- **Reply-quoting covers the answer, not the panel.** A normal answer's first chunk
+  carries a `message_reference` quoting the user's message; command acks and error
+  notices do not (there is nothing to quote for them). `/stop`'s "已停止" notice quotes
+  the interrupted message.
+- **`/schedule_status` is dispatched but omitted from the command panel.** The native
+  panel caps each item's `name` at 14 characters; `/schedule_status` is 16 (incl. the
+  slash), so it is dropped from the panel by the length filter while remaining
+  typeable by hand (and listed in `/help`).
 
 ---
 

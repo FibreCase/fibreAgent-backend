@@ -41,9 +41,9 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 ## 关键分层约束
 
 - **Telegram 层从不直接调用 OpenAI SDK**，只调用 `AgentService.process_message()`。
-- **Agent Service 渠道无关**：未来接 Web UI / Discord / HTTP API 都复用同一个 `AgentService`。
+- **Agent Service 渠道无关**：未来接 Web UI / Discord / HTTP API 都复用同一个 `AgentService`。QQ（C2C）就是第一个非 Telegram 渠道：`qq/bot.py` 把一条 C2C 文本归一化成 `AgentMessage(source="qq")`，调用同一个 `process_message()`，再经 QQ websocket 回发——工具循环、工具安全门、上下文预算、长期记忆对它全部原样工作。QQ 的 slash 命令（`qq/commands.py`，纯 Python、无 `botpy`、不 import `telegram/`）复用**同一批**渠道无关的 `AgentService` 方法（`reset` / `conversation_status` / `context_status` / 记忆方法 / `list_tool_audit_events`）与启动期 `Config` / `McpManager`，只换掉「交付」这一层——与 Telegram 的命令共用核心、各自实现传输，正是不改核心的例子。
 - **只有 `llm/client.py` 知道 OpenAI 协议**；只有 `database/` 知道 ORM/SQL。
-- `attachments/` 与 `memory/` 两个包**不含**任何 Telegram / OpenAI SDK / ORM 依赖（纯 Python + 文件系统）；`mcp/` 同样不含 Telegram / OpenAI SDK / ORM（只依赖 MCP SDK + 其 HTTP client / stdio 子进程）。
+- `attachments/` 与 `memory/` 两个包**不含**任何 Telegram / OpenAI SDK / ORM 依赖（纯 Python + 文件系统）；`mcp/` 同样不含 Telegram / OpenAI SDK / ORM（只依赖 MCP SDK + 其 HTTP client / stdio 子进程）。`qq/` 是唯一 import `botpy` 的包（`build_qq_client` 内懒加载，仅在 QQ 渠道开启时才导入），与 `telegram/` 是唯一 import PTB 的包对称——一个渠道适配器不得 import 另一个渠道。
 - `automation/` **不含**任何 Telegram / OpenAI SDK / ORM / AgentService 依赖：cron 解析（纯 Python，stdlib `zoneinfo`）与后台调度循环只认一个注入的 `runner` 协程；Telegram 专用的 runner（专属会话 → `process_message` → 通知 → 清理）在组合根 `main.py` 里提供。
 - 模块之间低耦合：Telegram / Agent / Tool / LLM / Database 各自单一职责。
 
@@ -54,6 +54,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 | `telegram/bot.py` | 唯一的 Telegram 知识来源：鉴权、命令、渲染、发送 | 只调 `AgentService`，不碰 OpenAI SDK |
 | `telegram/media.py` | 唯一的 Telegram 媒体下载来源：照片 → `AgentMessage` | 不碰 OpenAI SDK / DB |
 | `telegram/markdown.py` | 模型 Markdown → Telegram HTML（含分块、400 回退） | 纯函数 |
+| `qq/bot.py` + `qq/commands.py` | 唯一的 QQ（`botpy` SDK）知识来源：C2C 纯文本鉴权、`AgentMessage` 归一化、分块发送、回复引用（`message_reference`）、slash 命令分派与 `/stop` in-flight、原生指令面板 | 只调渠道无关的 `AgentService` + `config` / `infrastructure` / `automation` / `mcp`（与 `telegram/` 相同的模块），不碰 OpenAI SDK / DB 类型 / `telegram/` |
 | `agent/messages.py` | 渠道无关内容模型：`AgentMessage` + `TextContent`/`ImageContent` | 不碰 Telegram 类型 |
 | `agent/context.py` | 唯一的上下文选择者（纯 Python，无 I/O）：估算 + `plan_context()` | 无 Telegram/SDK/ORM/文件系统 |
 | `agent/service.py` | 渠道无关核心：锁、持久化、记忆检索、驱动 tool loop | 调 LLM、DB、附件、记忆 |
@@ -93,5 +94,6 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - `attachments/` 与 `memory/` 保持无 Telegram / OpenAI SDK / ORM 依赖。
 - 每个按 id 的记忆读/删都在 SQL 里按 `scope + id` 过滤（不泄露存在性）。
 - **定时运行用专属、全新的会话**：每次运行在**保留区间**的合成 `telegram_chat_id`（`schedule_chat_id(name) = BASE + sha256(name)[:8]`，`BASE < id < MAX`）里跑 `reset_conversation`（自愈 + 启动清扫），运行后 `delete_conversation` 删除、不留痕；**绝不**并入用户日常会话、**绝不**用真实 chat_id。`/new` 与重启从不触碰它。
+- **QQ 会话用保留区间的合成 id**：每个 QQ C2C 用户按确定性合成 `telegram_chat_id`（`qq_chat_id(openid) = QQ_CHAT_ID_BASE + sha256("qq:" + openid)[:8]`，`QQ_CHAT_ID_BASE <= id < QQ_CHAT_ID_MAX`）开一行会话，chat id 与 user id 同取该值（QQ 无独立数字身份）。该区间与定时运行区间**不相交且整体更低**（`QQ_CHAT_ID_MAX <= SCHEDULE_CHAT_ID_BASE`），故启动的定时会话清扫（限定在定时区间）**永远碰不到** QQ 会话行，重启后 QQ 会话照旧保留。QQ 侧的 `/new` 走 `service.reset(cid, cid)` 清空该行历史（长期记忆不动），与 Telegram 的 `/new` 同一入口。
 - `ENABLE_TOOLS=false` 仍是一次完整的 Phase-1 降级（定时运行在 tools 关闭时同样工作，只走单次 completion）。
 - 从不按模型名编码模型能力。

@@ -1,8 +1,11 @@
 """Runtime configuration.
 
 All external configuration is read from environment variables (optionally
-loaded from a local ``.env`` file). Secrets (the Telegram bot token and the
-OpenAI API key) come *only* from the environment and must never be committed.
+loaded from a local ``.env`` file). Secrets (the Telegram bot token, the OpenAI
+API key, and the QQ client secret) come *only* from the environment and must
+never be committed. The QQ client secret is read directly from the environment
+at QQ-client build time in the composition root (never stored on
+:class:`Config`), mirroring the Google OAuth client-secret rule.
 """
 
 from __future__ import annotations
@@ -287,6 +290,19 @@ class Config:
     # Stopping a generation still uses the existing ``/stop`` command; the
     # Bot API 10.3 in-message Stop button is a later phase.
     enable_streaming: bool = True
+
+    # Phase 10 (multi-channel): QQ bot. ``qq_app_id`` is the QQ open-platform
+    # app id ("" = the QQ channel is not configured → no client is built, no
+    # websocket is opened — isomorphic to the other optional providers). There is
+    # deliberately **no** allow-list: the channel is the owner's *personal* bot and
+    # QQ's C2C is a one-to-one private chat, so anyone who can DM (or @ in a
+    # group) the app reaches the agent — access is bounded by the fact that only
+    # the owner has the bot's app id + a QQ account that can be added to it.
+    # The client *secret* is also deliberately **not** stored here — it is read
+    # from the environment only when the composition root builds the QQ client, so
+    # no Config object ever carries it and it can never be logged from one (the
+    # same rule the Google OAuth client secret follows).
+    qq_app_id: str = ""
 
     # Phase 9 (Automation, first slice): time-triggered scheduling. ``schedules``
     # is the parsed, validated list, read from the **default**
@@ -1487,6 +1503,13 @@ def load_config() -> Config:
     # Streaming replies (private chats): on by default; a bad value fails fast
     # like every other bool knob.
     enable_streaming = _parse_bool(os.environ.get("ENABLE_STREAMING", ""), True)
+    # Phase 10 (multi-channel): QQ. The app id is optional ("" = channel off →
+    # no client, no websocket). The client secret is intentionally **not** read
+    # here — the composition root reads it from the environment when it builds
+    # the QQ client, so no Config object carries it (and it can never be logged
+    # from one). ``qq_app_id`` is the operator-chosen non-secret identifier and
+    # is stored on the frozen config (it may appear in startup logs).
+    qq_app_id = os.environ.get("QQ_APP_ID", "").strip()
     return Config(
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         allowed_user_ids=_parse_user_ids(os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")),
@@ -1530,6 +1553,7 @@ def load_config() -> Config:
         max_file_read_chars=max_file_read_chars,
         max_file_list_entries=max_file_list_entries,
         enable_streaming=enable_streaming,
+        qq_app_id=qq_app_id,
         schedules=schedules,
         schedule_timezone=schedule_timezone,
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",

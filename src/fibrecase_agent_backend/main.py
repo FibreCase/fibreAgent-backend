@@ -13,6 +13,7 @@ engine, repository, tool registry and service; everything else is passed down.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -42,6 +43,7 @@ from .mcp.auth import (
     OAuthProvider,
     build_oauth_callback_server,
 )
+from .qq import build_qq_client
 from .telegram.approval import TelegramApprovalBroker
 from .telegram.bot import build_application, compose_startup_hooks, deliver_markdown, register_command_menu
 from .tools import FileBackedToolPolicy, build_policy, reconcile_permissions_file
@@ -56,6 +58,13 @@ logger = logging.getLogger("main")
 _GOOGLE_CLIENT_ID_ENV = "GOOGLE_OAUTH_CLIENT_ID"
 _GOOGLE_CLIENT_SECRET_ENV = "GOOGLE_OAUTH_CLIENT_SECRET"
 _GOOGLE_SCOPES_ENV = "GOOGLE_OAUTH_SCOPES"
+
+# Phase 10 (multi-channel): the *only* place that knows the QQ client secret's
+# env-var name. Like the Google client secret, the value is read here (and only
+# here) at QQ-client build time — it is never stored on the frozen Config and
+# never logged. The app id (``QQ_APP_ID``) is non-secret and *is* stored on
+# config (it is logged at startup for attribution).
+_QQ_CLIENT_SECRET_ENV = "QQ_CLIENT_SECRET"
 
 
 class AgentBackend:
@@ -217,6 +226,15 @@ class AgentBackend:
             if config.schedules
             else None
         )
+        # Phase 10 (multi-channel): QQ. The client is built and started in
+        # ``_post_init`` (it must be constructed on the *running* PTB event loop,
+        # because ``botpy.Client`` grabs the loop at construction and its
+        # ``start()`` is driven as a task on that loop) — and **only** when the
+        # channel is configured (an app id plus a client secret in the env). With
+        # neither present, these stay ``None`` and no QQ client or websocket is
+        # ever created (isomorphic to the other optional providers).
+        self._qq_client = None
+        self._qq_task: "asyncio.Task | None" = None
         application = build_application(
             config,
             self.service,
@@ -392,6 +410,35 @@ class AgentBackend:
                     extra={"schedule": spec.name, "conversation_id": conversation.id},
                 )
 
+    # Phase 10 (multi-channel): QQ. The ``botpy`` client is built and started
+    # here, on the running PTB loop, and driven as a task — the SDK's own
+    # ``run()`` is a *blocking* wrapper around ``async with self: await
+    # self.start(...)`` that owns its own loop via ``run_until_complete``, so we
+    # cannot call it; instead we run the same body as a task on the loop PTB
+    # already runs (mirrors the OAuth callback server's task-on-the-loop pattern).
+    # The client is constructed *here* (not in ``__init__``) because
+    # ``botpy.Client`` calls ``asyncio.get_event_loop()`` at construction, so it
+    # must see the running loop. ``async with client`` calls the SDK's private
+    # ``_async_setup_hook`` (binds ``client.loop`` + the ready event to this loop);
+    # ``start`` then logs in and loops until ``close()`` breaks it (``_post_shutdown``).
+    # A QQ login failure must never stop the Telegram bot from starting: ``_qq_run``
+    # swallows and logs the error (by class only — never the app id/secret), leaving
+    # the Telegram channel fully up.
+    async def _qq_run(self, client, secret: str) -> None:
+        try:
+            async with client:
+                await client.start(self.config.qq_app_id, secret)
+        except Exception:
+            logger.error("qq client start failed", exc_info=True)
+
+    def _qq_task_done(self, task: "asyncio.Task") -> None:
+        # Surface a QQ task that ended in an *exception* (not a clean ``close()``)
+        # so it is never silently dropped. ``CancelledError`` / ``Exception`` are
+        # already handled inside ``_qq_run`` (the clean path raises nothing); a
+        # ``BaseException`` (e.g. SystemExit) here is logged by class only.
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("qq task ended with exception", exc_info=True)
+
     # PTB lifecycle hooks (run inside the application's own event loop) ------
     async def _post_init(self, application) -> None:
         await init_db(self.engine)
@@ -480,6 +527,29 @@ class AgentBackend:
         # callback server's lifecycle contract).
         if self.scheduler is not None:
             self.scheduler.start()
+        # Phase 10 (multi-channel): start the QQ client, last, as a task on this
+        # loop. Built *here* so the SDK binds to the running loop; started only
+        # when configured (an app id **and** a client secret in the env). There is
+        # no allow-list — the channel is the owner's personal bot, so any QQ user
+        # who can DM / @ it is served (access is bounded by the app id + a QQ
+        # account). The secret is read from the environment here and only
+        # here (in-memory; never on config, never logged). A startup failure is
+        # contained inside ``_qq_run`` so the Telegram bot keeps running.
+        if self.config.qq_app_id:
+            secret = os.environ.get(_QQ_CLIENT_SECRET_ENV, "").strip()
+            if secret:
+                self._qq_client = build_qq_client(self.service, self.repository, self.config, self.mcp_manager)
+                self._qq_task = asyncio.create_task(self._qq_run(self._qq_client, secret))
+                self._qq_task.add_done_callback(self._qq_task_done)
+            else:
+                # An app id with no client secret cannot log in. This is a
+                # misconfiguration (config-load can't catch it — the secret is
+                # deliberately not on config); degrade the channel to off with a
+                # clear, secret-free warning rather than half-starting it.
+                logger.warning(
+                    "qq configured but %s is not set; starting without the QQ channel",
+                    _QQ_CLIENT_SECRET_ENV,
+                )
         logger.info(
             "agent backend initialised",
             extra={
@@ -490,6 +560,7 @@ class AgentBackend:
                 "mcp_tools": mcp_tool_count,
                 "infra_tools": infra_tool_count,
                 "schedules": len(self.config.schedules),
+                "qq_enabled": self._qq_task is not None,
             },
         )
 
@@ -506,6 +577,25 @@ class AgentBackend:
         # in-flight run finish (bounded) so its venue is cleaned up.
         if self.scheduler is not None:
             await self.scheduler.stop()
+        # Phase 10 (multi-channel): stop the QQ client *after* the approval
+        # broker and scheduler (so any in-flight QQ turn is first unblocked) and
+        # *before* the LLM client / engine close (so no QQ turn is abandoned
+        # mid-call). ``close()`` is idempotent and breaks ``start()``'s loop
+        # cleanly; cancelling the task is a bounded safety net in case the loop
+        # doesn't exit promptly — a hang here must never block the whole
+        # shutdown. Both are best-effort (swallowed) so a QQ teardown failure
+        # can't stop the DB/LLM from closing.
+        if self._qq_client is not None:
+            try:
+                await self._qq_client.close()
+            except Exception:
+                logger.error("qq client close failed", exc_info=True)
+            if self._qq_task is not None:
+                self._qq_task.cancel()
+                try:
+                    await self._qq_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         # Stop the OAuth callback listener before the MCP sessions (idempotent,
         # never raises) — an in-flight callback after this is rejected by the
         # manager as invalid/expired state, not by a dead loop.

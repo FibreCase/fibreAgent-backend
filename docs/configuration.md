@@ -725,6 +725,30 @@ LOG_COLOR=auto
 
 **说明**：日志级别标签是否上色（`INFO` 绿 / `WARNING` 黄 / `ERROR` 红）。`auto` = 仅当 stdout 是终端时才上色，管道/重定向（如 `docker logs`、写文件）保持纯文本；`true` 恒上色；`false` 恒不上色。
 
+### 多渠道——QQ（C2C 纯文本 + 命令）
+
+QQ 渠道**默认关**：一旦设置 `QQ_APP_ID` 即开启（与 MCP / SSH 观测 / 定时任务同类的可选渠道门控）。关闭时 `botpy` 永不 import、不建 websocket，Telegram 照旧。**QQ 的 slash 命令与原生指令面板随渠道一起启用**——没有单独的开关。
+
+可用命令（核心集 + 只读 `/mcp_status`）：`/new` `/stop` `/help` `/status` `/context` `/remember` `/memories` `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status`。与 Telegram 的差异：无 `/start`（QQ 无「开始」概念）、无 `/mcp` / `/mcp auth`（MCP 的 OAuth 登录绑定 Telegram——返回的是内联登录按钮 + 主动完成通知，而 QQ 无内联按钮、主动发送受限，无法可靠送达）。普通回答会**引用**你发的那条消息（`message_reference`，仅首段）。
+
+#### `QQ_APP_ID`
+
+**默认值**：`（空）`
+
+**示例**
+
+```
+QQ_APP_ID=123456789
+```
+
+**说明**：QQ 开放平台的 app id（**非机密**，纯数字字符串）。空 = QQ 渠道**关闭**（无客户端、无 websocket）。这是渠道的**门控**，由 `config.py` 读取。**无 allow-list**（不同于 Telegram 的 `TELEGRAM_ALLOWED_USER_IDS`）：这是主人的**个人 bot**、C2C 是一对一私聊，所以任何能 DM（或 @）到 app 的 `user_openid` 都服务——访问边界是「持有 app id + 一个能加它的 QQ 账号」，与本项目其它个人部署一致。
+
+#### `QQ_CLIENT_SECRET`
+
+**默认值**：`（不设）`（**环境变量机密**；**不被 `config.py` 读取**）
+
+**说明**：app 的 client secret。**只在 `main.py` 建客户端时读一次**（`_post_init`），**从不**存到 `Config`、**从不**进日志、**从不**提交。若设置了 `QQ_APP_ID` 却没设它，渠道以一条 `warning` 跳过（fail-soft——Telegram 照常跑），而非硬启动报错。这个不对称（app id 在 `Config`、secret 在组合根读取）是刻意的：secret 只被用一次来建 websocket，不应挂在到处传递的 config 对象上。
+
 ### 只有 Docker 读的变量（应用不读）
 
 这些只被 `docker-compose.yaml` 使用，应用本身不读，仍放在同一个 `.env` 里。

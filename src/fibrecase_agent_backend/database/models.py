@@ -78,6 +78,53 @@ def schedule_chat_id(name: str) -> int:
 
 
 
+# ---------------------------------------------------------------------------
+# Reserved range for *interactive* QQ conversations (multi-channel, phase 10).
+#
+# The ``conversations`` table is keyed by an ``int`` chat id (``telegram_chat_id``
+# / ``telegram_user_id``) with no channel discriminator column. A QQ C2C (private)
+# chat, however, is identified by a *string* ``user_openid`` — there is no numeric
+# QQ chat id to store. Rather than a schema migration (there is no migration
+# framework; the schema is ``create_all``), a QQ conversation reuses the same
+# reserved-range synthetic-int trick the scheduled runs use, in a *distinct* range
+# so the two never collide:
+#
+#     qq_chat_id = QQ_CHAT_ID_BASE + int(sha256("qq:" + openid)[:8], 16)
+#
+# ``QQ_CHAT_ID_BASE`` sits *below* :data:`SCHEDULE_CHAT_ID_BASE`, so the startup
+# :meth:`ConversationRepository.clear_ephemeral_conversations` sweep (which is
+# bounded to the schedule range) can never delete a live QQ conversation — QQ
+# conversations, like Telegram ones, persist across restarts. The ``"qq:"`` prefix
+# in the hash input keeps the mapping from colliding with a schedule *name* even
+# though both draw a 32-bit suffix. The mapping is deterministic in the openid
+# (the same user maps to the same id every message) and is **not** a secret — it
+# is never a real user identity and may appear in logs at the same level as the
+# existing conversation-id logs.
+#
+# The ``sha256`` input is salted with the literal channel tag ``qq:`` so a QQ
+# openid cannot hash to the same 32-bit suffix as an unrelated schedule name.
+# ---------------------------------------------------------------------------
+QQ_CHAT_ID_BASE = 8_000_000_000_000_000_000
+# The exclusive upper bound of the reserved range (``id`` is strictly less than
+# this). Kept as a constant so the id derivation and any future range-aware sweep
+# share one definition of "the reserved range".
+QQ_CHAT_ID_MAX = QQ_CHAT_ID_BASE + 2**32
+
+
+def qq_chat_id(user_openid: str) -> int:
+    """The deterministic synthetic ``telegram_chat_id`` for a QQ C2C user.
+
+    ``sha256("qq:" + user_openid)``'s first 8 hex chars (32 bits) are added to
+    :data:`QQ_CHAT_ID_BASE`. Same openid → same id every call (so a QQ user always
+    re-enters the same persistent conversation); distinct openids collide only
+    with negligible probability in a 32-bit space (and a collision would merely
+    merge two QQ users' conversations — both already owner-allowlisted — never
+    leak one user to another).
+    """
+    suffix = int(hashlib.sha256(f"qq:{user_openid}".encode("utf-8")).hexdigest()[:8], 16)
+    return QQ_CHAT_ID_BASE + suffix
+
+
 class Base(DeclarativeBase):
     pass
 
