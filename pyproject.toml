@@ -1,6 +1,6 @@
 [project]
 name = "fibrecase-agent-backend"
-version = "1.12.0"
+version = "1.13.1"
 description = "Minimal personal AI agent backend: Telegram + OpenAI-compatible LLM + SQLite with persistent conversations"
 readme = "README.md"
 authors = [
@@ -30,6 +30,7 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.pytest.ini_options]
