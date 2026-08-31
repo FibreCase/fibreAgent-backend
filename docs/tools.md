@@ -81,7 +81,7 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 ```
 解析 → 是否已注册? → 策略(allow/ask/deny) → JSON Schema 校验
-     → 执行前审计(fail-closed) → [若 ask] 一次性 Telegram 人工审批
+     → 执行前审计(fail-closed) → [若 ask] 一次性人工审批（按 scope 路由到该渠道的 broker）
      → asyncio.wait_for(execute, 超时) → 结束审计
 ```
 
@@ -97,9 +97,11 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 
 用 `jsonschema`（`Draft202012Validator`）对 `function.arguments` 校验该工具声明的 `parameters` schema。**非法 / 类型错 / 多余字段直接拒绝、不执行**（`validation_failed`，回给模型一个稳定错误码）。注册期还会用 `check_schema` 校验工具**自己声明的** schema 是否合法（不合法 → 启动失败）。
 
-### 3. 一次性 Telegram 人工审批（仅 `ask`）
+### 3. 一次性人工审批（仅 `ask`）
 
-由 `telegram/approval.py::TelegramApprovalBroker` 实现（唯一的 Telegram 知识来源，通过 `ToolApprovalProvider` 协议注入给渠道无关的 loop）：
+审批按 **scope 前缀路由**到对应渠道的 broker（`tools/approval.py::ToolApprovalProvider` 协议，渠道无关的 tool loop 只依赖这一协议）：Telegram 回合 → `telegram/approval.py::TelegramApprovalBroker`（唯一的 Telegram 知识来源）；QQ 回合（scope 以 `qq:` 开头）→ `qq/approval.py::QQApprovalBroker`（QQ 按钮卡，见下）。两者并存于同一个 `AgentService`，由 `qq/approval.py::QQScopedApprovalRouter` 按 scope 前缀分派。
+
+Telegram broker：
 
 - 在**原会话**里发一条 Approve / Deny 内联按钮消息；消息含固定标题、工具名、工具的安全**用途摘要**（`What it does:` 一行——描述工具**做什么**：内置工具各给一句固定的用途描述，MCP 工具展示其 `description`（用途）；摘要**本身**绝不回显参数），**若这次调用有参数**再另有一段参数视图——默认把**已 schema 校验**的参数以易读 JSON 展示在 `Arguments:` 的 `<pre><code>` 里（无参数且无详情则整段省略；值经 HTML 转义，无法注入标签）；工具若覆写可选的 `approval_detail` 钩子（如 `file_edit`），则改以它返回的**结构化纯文本**展示在 `Action:` 块里（同样转义 + 有界、`<pre><code>` 保留换行）——与过期提示。**代码块语言标注**：`<pre>` 带一个 `class="language-…"` 属性，让 Telegram 按该语言做语法高亮而非猜测其语言——通用 `Arguments:` 块固定标 `json`，`Action:` 块用工具经 `approval_language` 钩子声明的**固定** Pygments 语言名（`file_edit` → `diff`、`file_read` 无 diff 故不标注；`exec` → `bash`）；provider 只保留 `[A-Za-z0-9_-]`、截断到 24 字符并小写，所以该值无法注入第二个 `class`/闭合标签，返回空则不加标注。**参数/详情只出现在这张给主人看的审批卡片上**，卡片本身**不含** scope、chat id、密钥；参数**从不**写入日志、审计表，或面向模型的回退文案。
 - 每个 pending 请求绑定到「**发起者 + 原会话**」：用不可逆的 `hash_scope` 指纹比对发起者（从不持有原始 user id），并要求同一 chat。**其他用户——即使是 allow-list 里的——都收到同样的「已过期/无效」安全答复，且永远不能批准**（不泄露请求是否存在）。
@@ -107,6 +109,11 @@ Agent 能调用的工具通过一个 OpenAI 风格 tool-calling 循环驱动，�
 - **卡片原地收尾**：决定（批准 / 拒绝）或超时后，**同一条**消息（按 `message_id` 定位）被**原地编辑**一次——Approve / Deny 按钮（标为 **✅ Approve** / **❌ Deny**）被移除（空 `InlineKeyboardMarkup([])`，线上序列化为 `{}`，即 Bot API「移除键盘」信号；传 `None` 会被 PTB 丢掉、按钮残留），原来的「This approval is one-time and will expire shortly.」提示行被替换为一个**加粗、带 emoji 的状态词**——`<b>✅ Approved.</b>` / `<b>❌ Denied.</b>` / `<b>⏰ Expired (no decision in time).</b>`（不加 `Status:` 前缀），**`Arguments:` / `Action:` 段也一并移除**（按钮已消失，收尾卡片只保留标题、工具名、用途摘要与状态词），不再另发一条跟进消息。收尾是 best-effort：编辑失败绝不改变已决定的结果、不抛异常、不发消息。
 - **有界等待、无忙轮询**：`request_approval` 在 `asyncio.wait_for` 下 `await` 一个 `asyncio.Future`——不阻塞事件 loop、不轮询。超时（`TOOL_APPROVAL_TIMEOUT_SECONDS`）→ `approval_expired`；进程重启丢弃所有 pending（旧按钮等同未知 id）。
 - 一个被阻塞的会话保持**串行**（同一 chat 的下一条消息在其 `asyncio.Lock` 上排队），另一个会话照常并行推进。
+
+QQ broker（`qq/approval.py::QQApprovalBroker`）——同一 `ToolApprovalProvider` 协议、同一「一次性 / 绑定发起人 / 有界等待 / 重启丢弃 pending」语义，只把「审批 UI」换成 QQ 的**按钮交互**：
+- **主动 C2C 审批卡**：用一条**主动消息**（`post_c2c_message`、`msg_type=2` Markdown、**不**带 `msg_id`/`msg_seq`，故**不**受 5 分钟被动回复窗口约束、也**不**与回合答案分块的 `(msg_id, msg_seq)` 去重冲突）发一张带 `keyboard` 的卡——单行两个 `action.type=1` **回调**按钮（`✅ 批准` / `❌ 拒绝`，`permission` 全员可见、`visited_label` 标注已点），按钮 `data` 只存 `v1:<request_id>:<a|d>`（**不含**参数或密钥）。卡面**只含**固定标题、`**工具：**`、`**用途：**`（`summary`）、`**操作：**`（`detail` 代码块，或参数 JSON 视图）、一次性过期提示——**不含**原始 openid、chat id、密钥。
+- **交互回调**：用户点击 → QQ 推 `INTERACTION_CREATE`（Intent 位 `1<<26`，事件 `type=11`）→ broker 比对点击者 `user_openid` 的 `hash_scope` 指纹与请求发起人（**他人/未知/已过期/重复点击一律安全拒绝**、不泄露请求存在性），并**在 3 s 内** `PUT /interactions/{id}` 回 `code`（0 成功 / 1 失败；不回则客户端转圈）。决定唤醒等待中的 `asyncio.wait_for`（超时 `TOOL_APPROVAL_TIMEOUT_SECONDS` → EXPIRED）；`/stop` 取消回合时 pending 一并失效。
+- **隐私**：与 Telegram 一致——参数/详情**只**出现在给主人看的卡上，**绝不**入日志、审计表或面向模型的文案；日志只记 `hash_scope` 指纹、工具名、决定码与异常类名。
 
 ### 4. 单工具超时
 
@@ -188,7 +195,7 @@ class MyTool(Tool):
 
 `infrastructure/` 包是又一个 **Tool Provider**（与 MCP 同类）：对每个运维配置的 SSH 目标，产出**三个固定、无参、只读**工具——`infra_<target>__host_status` / `__disk_status` / `__service_status`（主机 / 已配置挂载点磁盘 / 已配置 systemd 服务 状态）。目标须为 **Linux + systemd**。
 
-- **与内置工具、MCP 工具同一 registry、同一 gate**：三个工具都声明 `default_permission = allow`（严格只读，与 `get_current_time` / `echo` 一样**无需每次审批**；主人仍可 pin 成 `deny`），因此每次被调用都走完整执行边界（策略 → JSON Schema 校验 → fail-closed 预审计 → 单工具超时 → 审计；因默认 `allow`，一次性 Telegram 审批步被跳过）。模型**无法**指任何 host / path / service / command——工具无参，远程命令是**代码常量**（模板），唯一插值的是启动期已严格校验并 shell 引号转义的 `mounts` / `services`。
+- **与内置工具、MCP 工具同一 registry、同一 gate**：三个工具都声明 `default_permission = allow`（严格只读，与 `get_current_time` / `echo` 一样**无需每次审批**；主人仍可 pin 成 `deny`），因此每次被调用都走完整执行边界（策略 → JSON Schema 校验 → fail-closed 预审计 → 单工具超时 → 审计；因默认 `allow`，一次性审批步被跳过）。模型**无法**指任何 host / path / service / command——工具无参，远程命令是**代码常量**（模板），唯一插值的是启动期已严格校验并 shell 引号转义的 `mounts` / `services`。
 - **连接是短命的、密钥锁定**：`asyncssh` **惰性**导入（仅在被调用的工具真要连接时），每个被调用的工具开一条**主机密钥固定**（`known_hosts=显式文件`，永不 `None`/自动接受）、**仅密钥**（`client_keys=[私钥]`、SSH agent 关闭、密码/键盘交互关闭）的连接，命令跑完即关闭（即便被取消也关闭）。无持久连接、无自动重连。
 - **输出被解析、绝不回显**：stdout 走严格解析器（缺字段 / 重复字段 / 非法数字 / 多余字段 / 记录集不符 → 解析失败）；任何失败——连接/认证/主机密钥失败、非零退出、stderr 有输出、畸形/空/超大的结果——都映射到三个稳定、不回显的码：`infra_unavailable` / `infra_invalid_response` / `infra_result_too_large`。目标的 host、私钥路径、known_hosts 路径、用户名、mount 路径、命令、stdout/stderr **绝不**回给模型、进日志或审计表（告警只带工具名 + 稳定码 + 异常**类**，永不带异常正文）。
 - **启动不触网**：构建工具是纯字符串工作，不校验连接；SSH 只在被调用的工具里发生。`/infra_status` 只读显示**已配置**的目标名 + 其三个工具名 + 总数（read-only），**不**连接、**不**探活、**不**调 LLM，且明确「不显示任何可达性结论」。host / port / 用户名 / key 路径 / known_hosts 路径 / mount / service / command **绝不**出现在其输出里。

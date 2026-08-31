@@ -27,7 +27,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - **显式长期记忆**：`/remember` 显式保存，纯词法检索，跨 `/new` 与重启保留，作为一条明确标注的参考消息注入（不是自动摘要、不是 RAG）。
 - **Markdown 自动渲染**：模型回复的加粗/斜体/代码块/链接转成 Telegram HTML，无法解析时回退纯文本，回复永不丢失；最终回答以 Reply 引用你发的那条消息（长回复只在首段引用一次）。
 - 仅允许你配置的 Telegram User ID 使用，其他人静默拒绝。
-- **多渠道接入——QQ（默认关）**：`QQ_APP_ID` 设置后，同一个渠道无关的 `AgentService` 也接 QQ **C2C（私聊）纯文本**（回复以 **Markdown** 发出、长回复分块）——工具调用、工具安全、上下文预算、长期记忆在 QQ 上原样工作。QQ 上提供与 Telegram 一致的**核心 slash 命令**（`/new` `/stop` `/help` `/status` `/context` `/remember` `/memories` `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status`）、**原生指令面板**（启动时自动 create-or-update，个人发现入口），最终回答用 **`message_reference` 引用你发的那条消息**（长回复只在首段引用一次）。个人 bot、无 allow-list，无群聊/图片/流式、无 `/start` 与 `/mcp auth`（后者的 OAuth 登录绑定 Telegram，见 [当前开发状态](docs/status.md) 的「QQ 渠道的刻意限制」）。
+- **多渠道接入——QQ（默认关）**：`QQ_APP_ID` 设置后，同一个渠道无关的 `AgentService` 也接 QQ **C2C（私聊）纯文本**——工具调用、工具安全、上下文预算、长期记忆在 QQ 上原样工作。回复**按形态分型交付**：最终回答与结构化命令展示用 **Markdown**（`msg_type=2`）、简单回执用**纯文本**（`msg_type=0`），长回复分块。QQ 上提供与 Telegram 一致的**核心 slash 命令**（`/new` `/stop` `/help` `/status` `/context` `/remember` `/memories` `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status`），**命令回复与指令面板均用中文**；启动时 best-effort 建 **原生指令面板**（个人发现入口）与**全局自定义菜单**（`PUT /v2/menu`，两个 `send_message` 快捷项：「对话指令」填入 `/help`、「工具能力」填入 `你会使用哪些工具？`）。最终回答用 **`message_reference` 引用你发的那条消息**（长回复只在首段引用一次）。个人 bot、无 allow-list，无群聊/图片/流式、无 `/start` 与 `/mcp auth`（后者的 OAuth 登录绑定 Telegram，见 [当前开发状态](docs/status.md) 的「QQ 渠道的刻意限制」）。
 
 ## 快速开始
 
@@ -89,6 +89,6 @@ uv run python -m fibrecase_agent_backend
 
 ## 当前开发状态
 
-已在 Telegram 上跑通、全部通过测试的最小个人 Agent backend。核心能力：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio，默认 `ask`）+ **MCP 用户级 OAuth**、**只读基础设施观测（SSH）**、**定时任务（cron）**（启动配置声明、到点自动跑一次、专属全新会话、复用既有安全边界）、**流式回复**（`ENABLE_STREAMING`，默认开——私聊输入框的实时草稿预览随模型生成逐词更新，完整回复仍照常发送；群组/频道自动降级为「正在输入…」+ 分块回复）、**多渠道接入——QQ C2C（`QQ_APP_ID` 设置时启用，默认关：私聊纯文本收发，回复以 Markdown 发出，含与 Telegram 一致的核心 slash 命令 + 原生指令面板，最终回答用 `message_reference` 引用原消息）**、**可选的 `exec` shell 工具**与**可选的 `file` 文件工具集**（两者均**默认关闭**；`file` 里 `file_read` / `file_ls` 只读免审批，其余每次调用恒需人工审批）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。
+已在 Telegram 上跑通、全部通过测试的最小个人 Agent backend。核心能力：工具调用 + 工具安全、远程 MCP 工具（Streamable HTTP + stdio，默认 `ask`）+ **MCP 用户级 OAuth**、**只读基础设施观测（SSH）**、**定时任务（cron）**（启动配置声明、到点自动跑一次、专属全新会话、复用既有安全边界）、**流式回复**（`ENABLE_STREAMING`，默认开——私聊输入框的实时草稿预览随模型生成逐词更新，完整回复仍照常发送；群组/频道自动降级为「正在输入…」+ 分块回复）、**多渠道接入——QQ C2C（`QQ_APP_ID` 设置时启用，默认关：私聊纯文本收发，回复按形态分型——结构化展示用 Markdown、简单回执行纯文本，含与 Telegram 一致的核心 slash 命令（回复与指令面板均中文）+ 原生指令面板 + 全局自定义菜单，最终回答用 `message_reference` 引用原消息，`ask` 工具经 QQ 按钮卡可正常审批）**、**可选的 `exec` shell 工具**与**可选的 `file` 文件工具集**（两者均**默认关闭**；`file` 里 `file_read` / `file_ls` 只读免审批，其余每次调用恒需人工审批）、图片输入/持久化、上下文预算管理、显式长期记忆、Markdown 渲染。
 
 > **默认部署零子进程、零文件写入、零联网扫描**——两个状态变更能力 `exec` / `file` 是 opt-in 的（`ENABLE_EXEC_TOOL` / `ENABLE_FILE_TOOL`），且各自带静态兜底（`exec` 的危险命令 denylist、`file` 的 `FILE_WORKDIR` 路径受限）与逐次审批。**完整的能力清单、安全说明、有意不做 / 限制与下一步，见 [当前开发状态](docs/status.md)；`exec` / `file` 的安全细节见 [工具与工具安全](docs/tools.md)。**

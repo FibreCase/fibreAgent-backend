@@ -2,7 +2,7 @@
 
 在**启动时**连到运维配置的 Model Context Protocol（MCP）服务器——**远程 Streamable HTTP** 端点，或**本地 stdio 进程**（由后端 spawn 一个子进程、走它的 stdin/stdout）——用 `tools/list` 发现其工具，并把每个远程工具包装成一个标准的 `Tool`——`mcp_<server>__<remote>` 命名、默认 `ask`——注册进**同一个** registry。
 
-**MCP 只是又一个 Tool Provider**：它**完全复用 Phase 3 的执行边界**（策略 → JSON Schema 校验 → 需要时的一次性 Telegram 审批 → 单工具超时 → 只记元数据的审计），**没有**第二条执行路径。换句话说，MCP 不改动 Agent 运行时、不改动 service / LLM client / Telegram 层——它只是往 registry 里多塞了一批普通工具。
+**MCP 只是又一个 Tool Provider**：它**完全复用 Phase 3 的执行边界**（策略 → JSON Schema 校验 → 需要时的一次性审批（按 scope 路由到该渠道的 broker）→ 单工具超时 → 只记元数据的审计），**没有**第二条执行路径。换句话说，MCP 不改动 Agent 运行时、不改动 service / LLM client / Telegram 层——它只是往 registry 里多塞了一批普通工具。
 
 ## 命令
 
@@ -71,7 +71,7 @@ stdio: spawn 子进程(command/args/env/cwd)  → stdio 传输   ┤ → ClientS
   - 互斥：http 条目**不得**带 `command`/`args`/`env`/`cwd`；stdio 条目**不得**带 `url` / `bearer_token_env` / `authentication`（spawn 出来的进程没有请求可带头，凭据放在其 `env`）。
   - 报错只点名服务器与字段，**从不**回显 token 值或完整 URL；stdio 的 `env` 校验报错只点名**键**，不回显值。
 - **日志 / 审计 / `/mcp_status` 永不**泄露：端点 URL / host、`Authorization` 头或 token、**stdio 的 command / args / env / cwd**、工具参数、工具结果、异常正文、服务器 instructions、原始 scope / user id、图片 / base64。启动失败只记**服务器名 + 稳定码**（异常只记**类名**）。审计沿用 Phase 3：只存 `scope_hash` + 工具名 + 事件 + 稳定码 +（可选）耗时。
-- **审批仍是回调、不是工具**：MCP 工具的 `ask` 审批走同一个 Telegram 回调 broker——模型无法用文本给自己批准。
+- **审批仍是回调/按钮、不是工具**：MCP 工具的 `ask` 审批走按 **scope 前缀路由**的 provider——Telegram 回合走 Telegram 回调 broker、QQ 回合走 QQ 按钮 broker（见 [工具与工具安全](tools.md)）；模型无法用文本给自己批准。
 - **OAuth 凭据永不**出现在日志 / 审计 / 命令输出 / 异常文案里：access_token、refresh_token、authorization code、client_secret、`Authorization` 头、完整回调 URL（含 query）都不行。回调错误是**固定文案**，不带 provider 错误正文（可能含 token 或端点）。凭据表只存 token 本身与元数据，`/mcp` 只显示状态分类（connected / 需要认证 / 已过期 / 未配置），**不**显示 token、scope 原文或 provider 细节。
 
 ## 配置项

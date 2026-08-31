@@ -122,7 +122,10 @@ are the details that are *easy to violate*.
 - Every by-id memory read/delete is filtered by `scope + id` in SQL; every OAuth
   credential read is filtered by `telegram_user_id` (a foreign lookup is
   indistinguishable from missing — no existence leak).
-- **Approval is a Telegram callback, not a tool.** Never add an `approve`/`confirm`
+- **Approval is a per-channel callback / button, not a tool.** It reaches the tool loop
+  only through the injected `ToolApprovalProvider` (a PTB callback-query handler on a
+  Telegram turn, a QQ button-card `interaction` on a QQ turn — routed by scope prefix),
+  and each channel owns its own approval UI. Never add an `approve`/`confirm`
   tool — the model must never be able to grant itself approval.
 - **Pre-execution audit is fail-closed** (a write failure means the tool does not
   run); terminal audit is best-effort (a write failure is logged, the tool is never

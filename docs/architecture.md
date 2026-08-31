@@ -54,7 +54,7 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 | `telegram/bot.py` | 唯一的 Telegram 知识来源：鉴权、命令、渲染、发送 | 只调 `AgentService`，不碰 OpenAI SDK |
 | `telegram/media.py` | 唯一的 Telegram 媒体下载来源：照片 → `AgentMessage` | 不碰 OpenAI SDK / DB |
 | `telegram/markdown.py` | 模型 Markdown → Telegram HTML（含分块、400 回退） | 纯函数 |
-| `qq/bot.py` + `qq/commands.py` | 唯一的 QQ（`botpy` SDK）知识来源：C2C 纯文本鉴权、`AgentMessage` 归一化、分块发送、回复引用（`message_reference`）、slash 命令分派与 `/stop` in-flight、原生指令面板 | 只调渠道无关的 `AgentService` + `config` / `infrastructure` / `automation` / `mcp`（与 `telegram/` 相同的模块），不碰 OpenAI SDK / DB 类型 / `telegram/` |
+| `qq/bot.py` + `qq/commands.py` + `qq/approval.py` | 唯一的 QQ（`botpy` SDK）知识来源：C2C 纯文本鉴权、`AgentMessage` 归一化、分块发送（按形态选 `msg_type`：结构化 Markdown / 简单回执纯文本）、回复引用（`message_reference`）、slash 命令分派与 `/stop` in-flight、原生指令面板、**全局自定义菜单**（`PUT /v2/menu` 整表替换）、**工具审批按钮卡**（`qq/approval.py`：`QQApprovalBroker` 发主动 C2C 卡 + 解析 `INTERACTION_CREATE`、`QQScopedApprovalRouter` 按 scope 前缀把 `qq:` 请求路由到 QQ broker） | 只调渠道无关的 `AgentService` + `config` / `infrastructure` / `automation` / `mcp`（与 `telegram/` 相同的模块）+ `tools.approval`（审批协议）+ `memory.hash_scope`，不碰 OpenAI SDK / DB 类型 / `telegram/`；`qq/approval.py` 与 `qq/commands.py` 是纯 Python、**无** `botpy`（client 经 `bind_client` 注入） |
 | `agent/messages.py` | 渠道无关内容模型：`AgentMessage` + `TextContent`/`ImageContent` | 不碰 Telegram 类型 |
 | `agent/context.py` | 唯一的上下文选择者（纯 Python，无 I/O）：估算 + `plan_context()` | 无 Telegram/SDK/ORM/文件系统 |
 | `agent/service.py` | 渠道无关核心：锁、持久化、记忆检索、驱动 tool loop | 调 LLM、DB、附件、记忆 |

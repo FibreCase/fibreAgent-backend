@@ -13,7 +13,7 @@ delivery, chunking, error handling, and the privacy invariant (never log the raw
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -27,6 +27,7 @@ from fibrecase_agent_backend.database.models import (
 from fibrecase_agent_backend.qq.bot import (
     QQ_MAX_MESSAGE_CHARS,
     QQ_MSG_TYPE_MARKDOWN,
+    QQ_MSG_TYPE_TEXT,
     QQChannel,
     _c2c_panel_payload,
     _ensure_c2c_panel,
@@ -37,6 +38,15 @@ from fibrecase_agent_backend.qq.commands import (
     build_c2c_panel_items,
     known_command_names,
 )
+from fibrecase_agent_backend.qq.approval import (
+    QQApprovalBroker,
+    QQScopedApprovalRouter,
+    _approval_keyboard,
+    _card_text,
+    decision_from,
+    request_id_from,
+)
+from fibrecase_agent_backend.tools.approval import ApprovalDecision, ApprovalRequest
 from fibrecase_agent_backend.qq import build_qq_client
 
 
@@ -475,6 +485,13 @@ def _reply_text(msg):
     return r.get("content")
 
 
+def _reply_type(msg):
+    """The ``msg_type`` of a fake message's first reply (0 plain / 2 markdown)."""
+    if not msg.replies:
+        return None
+    return msg.replies[0]["msg_type"]
+
+
 class _FakeHttp:
     """A stand-in for the ``botpy`` client's ``BotHttp`` (the panel's REST path).
 
@@ -515,7 +532,9 @@ async def test_command_new_resets_and_does_not_run_agent_turn():
     assert service.reset_calls == [(cid, cid)]
     assert service.calls == []
     assert repo.created == []
-    assert "New conversation started" in _reply_text(msg)
+    assert "已开始新会话" in _reply_text(msg)
+    # A simple receipt is delivered as plain text (msg_type=0), not Markdown.
+    assert _reply_type(msg) == 0
 
 
 async def test_command_help_lists_all_commands():
@@ -527,10 +546,12 @@ async def test_command_help_lists_all_commands():
 
     assert service.calls == [], "/help must not run an agent turn"
     text = _reply_text(msg)
-    assert "Available commands" in text
-    for name, _ in _QQ_COMMANDS:
+    assert "可用命令" in text
+    for name, _desc in _QQ_COMMANDS:
         assert f"/{name}" in text
     assert len(_QQ_COMMANDS) == 12, "the QQ command set is the 12 core + mcp_status"
+    # A structured display is delivered as Markdown (msg_type=2).
+    assert _reply_type(msg) == QQ_MSG_TYPE_MARKDOWN
 
 
 async def test_unknown_slash_falls_through_to_agent_turn():
@@ -557,7 +578,9 @@ async def test_command_remember_uses_scope_and_leaks_nothing(caplog):
         await channel.on_c2c_message_create(msg)
 
     assert service.remember_calls == [(f"qq:{openid}", "my secret note")]
-    assert "Memory saved" in _reply_text(msg)
+    assert "记忆已保存" in _reply_text(msg)
+    # A simple receipt is delivered as plain text (msg_type=0).
+    assert _reply_type(msg) == QQ_MSG_TYPE_TEXT
     # The command *name* is logged; the *content* and the raw openid are not.
     joined = [v for rec in caplog.records for v in _all_str_fields(rec)]
     assert any("remember" in v for v in joined)
@@ -581,6 +604,8 @@ async def test_command_memories_lists_with_timestamp_and_scope():
     assert service.list_memories_calls == [f"qq:{openid}"]
     text = _reply_text(msg)
     assert "#3" in text and "remember me" in text and "2026-01-01" in text
+    # The memory *list* is a structured display → Markdown (msg_type=2).
+    assert _reply_type(msg) == QQ_MSG_TYPE_MARKDOWN
 
 
 async def test_command_forget_single():
@@ -592,7 +617,9 @@ async def test_command_forget_single():
     await channel.on_c2c_message_create(msg)
 
     assert service.forget_calls == [(f"qq:{openid}", 3)]
-    assert "Memory deleted" in _reply_text(msg)
+    assert "记忆已删除" in _reply_text(msg)
+    # A simple receipt is delivered as plain text (msg_type=0).
+    assert _reply_type(msg) == QQ_MSG_TYPE_TEXT
 
 
 async def test_command_forget_all_requires_confirm_token():
@@ -616,7 +643,7 @@ async def test_command_forget_all_confirm_deletes():
     await channel.on_c2c_message_create(msg)
 
     assert service.forget_all_calls == [f"qq:{openid}"]
-    assert "All memories cleared" in _reply_text(msg)
+    assert "已清除全部记忆" in _reply_text(msg)
 
 
 async def test_command_status_known_conversation():
@@ -629,7 +656,9 @@ async def test_command_status_known_conversation():
 
     assert service.conversation_status_calls == [5]
     text = _reply_text(msg)
-    assert "gpt-x" in text and "5" in text and "Messages" in text
+    assert "gpt-x" in text and "5" in text and "消息数" in text
+    # A structured display is delivered as Markdown (msg_type=2).
+    assert _reply_type(msg) == QQ_MSG_TYPE_MARKDOWN
 
 
 async def test_command_context_none_yet():
@@ -640,7 +669,7 @@ async def test_command_context_none_yet():
     await channel.on_c2c_message_create(msg)
 
     assert service.context_status_calls == []
-    assert "No conversation yet" in _reply_text(msg)
+    assert "还没有会话" in _reply_text(msg)
 
 
 async def test_command_tool_audit_clamps_limit():
@@ -663,8 +692,10 @@ async def test_command_mcp_status_enabled():
     await channel.on_c2c_message_create(msg)
 
     text = _reply_text(msg)
-    assert "gcal" in text and "available" in text and "3 tools" in text
-    assert "Total MCP tools available" in text and "3" in text
+    assert "gcal" in text and "可用" in text and "3 个工具" in text
+    assert "可用 MCP 工具总数" in text and "3" in text
+    # The server list is a structured display → Markdown (msg_type=2).
+    assert _reply_type(msg) == QQ_MSG_TYPE_MARKDOWN
 
 
 async def test_command_mcp_status_disabled_when_no_manager():
@@ -673,7 +704,8 @@ async def test_command_mcp_status_disabled_when_no_manager():
     msg = _FakeMessage("/mcp_status", openid="openid-alice")
     await channel.on_c2c_message_create(msg)
 
-    assert _reply_text(msg) == "**MCP:** disabled"
+    assert _reply_text(msg) == "MCP：未启用"
+    assert _reply_type(msg) == QQ_MSG_TYPE_TEXT  # a disabled notice is plain text
 
 
 async def test_command_infra_status_renders_tool_names_and_no_host():
@@ -690,6 +722,8 @@ async def test_command_infra_status_renders_tool_names_and_no_host():
     assert "infra_prod__service_status" in text
     # Only the target *name* and local tool names — never a host/path/command.
     assert "prod" in text
+    # The target list is a structured display → Markdown (msg_type=2).
+    assert _reply_type(msg) == QQ_MSG_TYPE_MARKDOWN
 
 
 async def test_command_infra_status_disabled():
@@ -698,7 +732,8 @@ async def test_command_infra_status_disabled():
     msg = _FakeMessage("/infra_status", openid="openid-alice")
     await channel.on_c2c_message_create(msg)
 
-    assert _reply_text(msg) == "**Infrastructure:** disabled"
+    assert _reply_text(msg) == "基础设施观测：未启用"
+    assert _reply_type(msg) == QQ_MSG_TYPE_TEXT  # a disabled notice is plain text
 
 
 async def test_command_schedule_status_renders_next_fire_and_leaks_no_prompt():
@@ -712,9 +747,11 @@ async def test_command_schedule_status_renders_next_fire_and_leaks_no_prompt():
     await channel.on_c2c_message_create(msg)
 
     text = _reply_text(msg)
-    assert "daily" in text and "*/5 * * * *" in text and "next:" in text
+    assert "daily" in text and "*/5 * * * *" in text and "下次触发" in text
     # The reply shows name + cron + next-fire only — never the prompt/chat/user id.
     assert "secret-prompt" not in text
+    # The schedule list is a structured display → Markdown (msg_type=2).
+    assert _reply_type(msg) == QQ_MSG_TYPE_MARKDOWN
 
 
 async def test_command_schedule_status_disabled():
@@ -723,7 +760,8 @@ async def test_command_schedule_status_disabled():
     msg = _FakeMessage("/schedule_status", openid="openid-alice")
     await channel.on_c2c_message_create(msg)
 
-    assert _reply_text(msg) == "**Schedules:** disabled (none configured)"
+    assert _reply_text(msg) == "定时任务：未启用（未配置）"
+    assert _reply_type(msg) == QQ_MSG_TYPE_TEXT  # a disabled notice is plain text
 
 
 # ---------------------------------------------------------------------------
@@ -737,7 +775,9 @@ async def test_stop_with_nothing_running_replies_notice():
     await channel.on_c2c_message_create(msg)
 
     assert service.calls == []
-    assert "Nothing to stop" in _reply_text(msg)
+    assert "没有正在进行的回复" in _reply_text(msg)
+    # A simple receipt is delivered as plain text (msg_type=0).
+    assert _reply_type(msg) == QQ_MSG_TYPE_TEXT
 
 
 async def test_stop_cancels_in_flight_turn():
@@ -835,10 +875,13 @@ def test_build_c2c_panel_items_drops_long_names_and_caps():
     )
     # /schedule_status (16 chars incl. the slash) is dropped by the 14-char cap.
     assert "/schedule_status" not in names
-    # Every command whose "/name" fits the cap is present, in order.
-    for name, _ in _QQ_COMMANDS:
+    # Every command whose "/name" fits the cap is present, in order, and each
+    # panel description is the command's (Chinese) description — the same value
+    # the ``/help`` reply shows, so the two surfaces never drift.
+    for name, desc in _QQ_COMMANDS:
         if len(f"/{name}") <= 14:
-            assert f"/{name}" in names
+            item = next(i for i in items if i["name"] == f"/{name}")
+            assert item["desc"] == desc
     assert len(items) <= 20
 
 
@@ -853,7 +896,7 @@ def test_c2c_panel_payload_shape_and_privacy():
 
 
 def test_known_command_names_matches_command_table():
-    assert known_command_names() == {name for name, _ in _QQ_COMMANDS}
+    assert known_command_names() == {name for name, _desc in _QQ_COMMANDS}
 
 
 async def test_ensure_panel_creates_when_absent():
@@ -908,4 +951,396 @@ async def test_on_ready_wires_panel():
 
     await client.on_ready()
 
-    assert [c[0] for c in http.calls] == ["GET", "POST"]
+    # Panel (create-or-update) then the global menu (a plain replace).
+    assert [c[0] for c in http.calls] == ["GET", "POST", "PUT"]
+
+
+# ---------------------------------------------------------------------------
+# global custom menu (v2_menu) — the C2C "⋮" menu with two send_message items
+# ---------------------------------------------------------------------------
+def test_global_menu_payload_shape_and_privacy():
+    from fibrecase_agent_backend.qq.bot import _global_menu_payload
+
+    p = _global_menu_payload()
+    items = p["menu"]["items"]
+    assert len(items) == 2
+    # The two fixed send_message items: a "/help" shortcut (dispatches the
+    # command list) and a plain question sent as a normal agent turn.
+    assert items[0] == {"type": "send_message", "name": "对话指令", "send_message": "/help"}
+    assert items[1] == {"type": "send_message", "name": "工具能力", "send_message": "你会使用哪些工具？"}
+    # The menu is fixed and content-free: no openid, no command argument, no body
+    # beyond the two literals we fully control.
+    blob = str(p)
+    assert "openid" not in blob
+
+
+async def test_ensure_global_menu_puts_fixed_payload():
+    from fibrecase_agent_backend.qq.bot import _ensure_global_menu, _global_menu_payload
+
+    http = _FakeHttp()
+    await _ensure_global_menu(http)
+
+    assert len(http.calls) == 1
+    method, path, kwargs = http.calls[0]
+    assert method == "PUT"
+    assert path == "/v2/menu"
+    # The body is the fixed two-item payload — PUT /v2/menu replaces the whole menu.
+    assert kwargs["json"] == _global_menu_payload()
+
+
+async def test_ensure_global_menu_swallows_errors():
+    from fibrecase_agent_backend.qq.bot import _ensure_global_menu
+
+    http = _FakeHttp(raise_on=RuntimeError("boom"))
+    await _ensure_global_menu(http)  # must not raise
+    assert [c[0] for c in http.calls] == ["PUT"]
+
+
+# ---------------------------------------------------------------------------
+# tool approval (QQ button-interaction transport — the QQApprovalBroker)
+# ---------------------------------------------------------------------------
+class _FakeApi:
+    """A stand-in for the ``botpy`` client's ``api`` (the approval send + ack).
+
+    ``post_c2c_message`` records its kwargs (openid / msg_type / markdown /
+    keyboard) and raises if ``raise_send`` is set (to prove the fail-closed
+    path). ``on_interaction_result`` records ``(interaction_id, code)``.
+    """
+
+    def __init__(self, raise_send=None):
+        self.sent = []
+        self.acks = []
+        self.raise_send = raise_send
+
+    async def post_c2c_message(self, **kwargs):
+        if self.raise_send is not None:
+            raise self.raise_send
+        self.sent.append(dict(kwargs))
+        return {"id": "ROBOT1.0_fake"}
+
+    async def on_interaction_result(self, interaction_id, code):
+        self.acks.append((interaction_id, code))
+
+
+class _FakeClient:
+    """A minimal stand-in for the ``botpy`` Client (just holds ``.api``)."""
+
+    def __init__(self, api):
+        self.api = api
+
+
+def _make_request(scope="qq:openid-alice", tool_name="exec", summary="run a shell command",
+                  arguments=None, detail="", language=""):
+    return ApprovalRequest(
+        request_id="req123",
+        conversation_id=5,
+        scope=scope,
+        tool_name=tool_name,
+        summary=summary,
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+        arguments=dict(arguments or {}),
+        detail=detail,
+        language=language,
+    )
+
+
+def _fake_interaction(interaction_id="int-1", openid="openid-alice", button_data="v1:req123:a", itype=11):
+    resolved = type("R", (), {"button_id": "allow", "button_data": button_data,
+                              "message_id": "ROBOT1.0_fake", "user_id": None, "feature_id": None})()
+    data = type("D", (), {"type": itype, "resolved": resolved})()
+    return type("I", (), {"id": interaction_id, "user_openid": openid, "data": data,
+                          "type": itype, "scene": "c2c"})()
+
+
+async def test_qq_approval_approve_resolves_and_acks_success(caplog):
+    api = _FakeApi()
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(api))
+    openid = "openid-alice"
+
+    with caplog.at_level("INFO", logger="qq.approval"):
+        decision_task = asyncio.create_task(broker.request_approval(_make_request(scope=f"qq:{openid}")))
+        await asyncio.sleep(0)  # let request_approval register the pending + send the card
+        assert len(api.sent) == 1, "the approval card must be sent to the turn's openid"
+        assert api.sent[0]["openid"] == openid
+        assert api.sent[0]["msg_type"] == 2
+
+        await broker.handle_interaction(_fake_interaction(interaction_id="int-1", openid=openid,
+                                                           button_data="v1:req123:a"))
+        decision = await asyncio.wait_for(decision_task, timeout=2)
+
+    assert decision is ApprovalDecision.APPROVED
+    # The card carries an Approve + Deny callback-button row with the request id
+    # embedded in the opaque button data (never an openid or the tool name).
+    kb = api.sent[0]["keyboard"]["content"]["rows"][0]["buttons"]
+    labels = {b["render_data"]["label"]: b["action"] for b in kb}
+    assert labels["✅ 批准"]["type"] == 1 and labels["✅ 批准"]["data"] == "v1:req123:a"
+    assert labels["❌ 拒绝"]["type"] == 1 and labels["❌ 拒绝"]["data"] == "v1:req123:d"
+    # The click was acked as success (code 0) so the client stops spinning.
+    assert api.acks == [("int-1", 0)]
+    # Privacy: the resolved log line carries a scope *hash*, the tool name, and
+    # the decision — never the raw openid.
+    joined = [v for rec in caplog.records for v in _all_str_fields(rec)]
+    assert not any(openid in v for v in joined), "the raw openid must never be logged"
+    assert any("exec" in v for v in joined), "the tool name is a safe identifier and is logged"
+
+
+async def test_qq_approval_deny_resolves():
+    api = _FakeApi()
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(api))
+
+    decision_task = asyncio.create_task(broker.request_approval(_make_request()))
+    await asyncio.sleep(0)
+
+    await broker.handle_interaction(_fake_interaction(openid="openid-alice", button_data="v1:req123:d"))
+    decision = await asyncio.wait_for(decision_task, timeout=2)
+
+    assert decision is ApprovalDecision.DENIED
+    assert api.acks == [("int-1", 0)]
+
+
+async def test_qq_approval_foreign_openid_is_rejected_and_voids():
+    # A click from a *different* openid than the one running the turn must not
+    # approve — it voids the pending request (→ EXPIRED) and acks failure (code 1).
+    api = _FakeApi()
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(api))
+
+    decision_task = asyncio.create_task(broker.request_approval(_make_request(scope="qq:openid-alice")))
+    await asyncio.sleep(0)
+
+    await broker.handle_interaction(_fake_interaction(openid="openid-EVIL", button_data="v1:req123:a"))
+    decision = await asyncio.wait_for(decision_task, timeout=2)
+
+    assert decision is ApprovalDecision.EXPIRED
+    assert api.acks == [("int-1", 1)]
+
+
+async def test_qq_approval_unknown_request_acks_failure():
+    api = _FakeApi()
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(api))
+
+    # No pending request with this id (stale button / already consumed).
+    await broker.handle_interaction(_fake_interaction(openid="openid-alice", button_data="v1:ghost:a"))
+
+    assert api.acks == [("int-1", 1)]
+
+
+async def test_qq_approval_non_button_interaction_is_ignored():
+    api = _FakeApi()
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(api))
+
+    # A non-button interaction type (e.g. message feedback, type 13) is not ours:
+    # no ack, no resolution.
+    await broker.handle_interaction(_fake_interaction(openid="openid-alice", itype=13))
+
+    assert api.acks == [], "a non-button interaction must not be acked"
+    assert api.sent == []
+
+
+async def test_qq_approval_without_client_fails_closed():
+    broker = QQApprovalBroker()  # no client bound
+
+    decision = await broker.request_approval(_make_request())
+
+    assert decision is ApprovalDecision.DENIED
+
+
+async def test_qq_approval_send_failure_fails_closed():
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(_FakeApi(raise_send=RuntimeError("send down"))))
+
+    decision = await broker.request_approval(_make_request())  # must not raise
+
+    assert decision is ApprovalDecision.DENIED
+
+
+async def test_qq_approval_expires_when_no_decision():
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(_FakeApi()))
+
+    # expires_at in the past → the bounded wait times out immediately → EXPIRED.
+    request = _make_request()
+    request = ApprovalRequest(
+        request_id=request.request_id, conversation_id=request.conversation_id,
+        scope=request.scope, tool_name=request.tool_name, summary=request.summary,
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        arguments=request.arguments,
+    )
+    decision = await asyncio.wait_for(broker.request_approval(request), timeout=2)
+
+    assert decision is ApprovalDecision.EXPIRED
+
+
+async def test_qq_approval_shutdown_resolves_pending_expired():
+    api = _FakeApi()
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(api))
+
+    decision_task = asyncio.create_task(broker.request_approval(_make_request()))
+    await asyncio.sleep(0)  # card sent, future pending
+    assert not decision_task.done()
+
+    await broker.shutdown()
+    decision = await asyncio.wait_for(decision_task, timeout=2)
+
+    assert decision is ApprovalDecision.EXPIRED
+
+
+async def test_qq_approval_one_time_repeat_click_fails():
+    api = _FakeApi()
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(api))
+
+    decision_task = asyncio.create_task(broker.request_approval(_make_request()))
+    await asyncio.sleep(0)
+
+    # First (valid) click consumes the request and acks success.
+    await broker.handle_interaction(_fake_interaction(openid="openid-alice", button_data="v1:req123:a"))
+    decision = await asyncio.wait_for(decision_task, timeout=2)
+    assert decision is ApprovalDecision.APPROVED
+    # A repeat click on the same (now consumed) id acks failure.
+    await broker.handle_interaction(_fake_interaction(openid="openid-alice", button_data="v1:req123:a"))
+    assert api.acks == [("int-1", 0), ("int-1", 1)]
+
+
+async def test_qq_approval_button_data_ack_code_swallowed():
+    # A failed ack (client.api raising) must not propagate out of the handler.
+    class _BrokenApi(_FakeApi):
+        async def on_interaction_result(self, interaction_id, code):
+            raise RuntimeError("ack down")
+
+    broker = QQApprovalBroker()
+    broker.bind_client(_FakeClient(_BrokenApi()))
+
+    decision_task = asyncio.create_task(broker.request_approval(_make_request()))
+    await asyncio.sleep(0)
+    await broker.handle_interaction(_fake_interaction(openid="openid-alice", button_data="v1:req123:a"))
+    decision = await asyncio.wait_for(decision_task, timeout=2)  # must not raise
+    assert decision is ApprovalDecision.APPROVED
+
+
+# --- the approval card (secret-free Markdown) ------------------------------
+def test_qq_approval_card_shows_tool_and_summary_not_openid():
+    text = _card_text(_make_request(scope="qq:openid-alice", tool_name="exec",
+                                    summary="run a shell command"))
+    assert "exec" in text and "run a shell command" in text
+    assert "openid-alice" not in text, "the card must never carry the raw openid"
+    assert "需要批准" in text or "工具" in text
+
+
+def test_qq_approval_card_detail_replaces_arguments_json():
+    # A tool that supplies a friendly detail (e.g. exec's bash block) renders it
+    # under an Action: label with the language tag — not the generic JSON block.
+    text = _card_text(_make_request(detail="$ ls -la", language="bash", arguments={"command": "ls -la"}))
+    assert "```bash" in text and "ls -la" in text
+    assert "**操作：**" in text
+    assert "**参数：**" not in text, "the detail block replaces the generic Arguments block"
+
+
+def test_qq_approval_card_arguments_json_when_no_detail():
+    text = _card_text(_make_request(arguments={"command": "ls -la"}))
+    assert "**参数：**" in text and "```json" in text and "ls -la" in text
+
+
+def test_qq_approval_keyboard_binds_request_id_only():
+    kb = _approval_keyboard("reqXYZ")
+    buttons = kb["content"]["rows"][0]["buttons"]
+    datas = {b["action"]["data"] for b in buttons}
+    assert datas == {"v1:reqXYZ:a", "v1:reqXYZ:d"}
+    # The button data carries the version + request id + decision only.
+    assert not any("openid" in d for d in datas)
+
+
+def test_qq_approval_button_data_parsing():
+    assert request_id_from("v1:req123:a") == "req123"
+    assert decision_from("v1:req123:a") is ApprovalDecision.APPROVED
+    assert decision_from("v1:req123:d") is ApprovalDecision.DENIED
+    assert decision_from("v2:req123:a") is None, "a wrong version is not a valid decision"
+    assert decision_from("garbage") is None
+
+
+# --- the scope-routing provider (main.py's single approval_provider) --------
+class _RecordingBroker:
+    """A fake approval provider that records calls and returns a canned decision."""
+
+    def __init__(self, tag, decision):
+        self.tag = tag
+        self.decision = decision
+        self.calls = []
+
+    async def request_approval(self, request):
+        self.calls.append(request)
+        return self.decision
+
+    async def shutdown(self):
+        pass
+
+
+async def test_routing_provider_dispatches_by_scope_prefix():
+    tele = _RecordingBroker("telegram", ApprovalDecision.DENIED)
+    qq = _RecordingBroker("qq", ApprovalDecision.APPROVED)
+    router = QQScopedApprovalRouter(tele, qq)
+
+    assert await router.request_approval(_make_request(scope="qq:openid-alice")) is ApprovalDecision.APPROVED
+    assert await router.request_approval(_make_request(scope="telegram:42")) is ApprovalDecision.DENIED
+    # Each broker got exactly its own requests.
+    assert len(qq.calls) == 1 and qq.calls[0].scope.startswith("qq:")
+    assert len(tele.calls) == 1 and tele.calls[0].scope.startswith("telegram:")
+
+
+async def test_routing_provider_shutdown_drains_both():
+    tele = _RecordingBroker("telegram", ApprovalDecision.DENIED)
+    qq = _RecordingBroker("qq", ApprovalDecision.APPROVED)
+
+    class _ShutdownRecorder(_RecordingBroker):
+        def __init__(self, tag):
+            super().__init__(tag, ApprovalDecision.DENIED)
+            self.shutdown_calls = 0
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    t = _ShutdownRecorder("t")
+    q = _ShutdownRecorder("q")
+    router = QQScopedApprovalRouter(t, q)
+    await router.shutdown()
+    assert t.shutdown_calls == 1 and q.shutdown_calls == 1
+
+
+# --- build_qq_client wires the interaction handler + intent ----------------
+async def test_build_qq_client_wires_interaction_handler():
+    import botpy
+
+    broker = QQApprovalBroker()
+    client = build_qq_client(
+        _FakeService(), _FakeRepo(), _FakeConfig(), None, approval_broker=broker
+    )
+    # The interaction intent bit (1<<26) must now be set alongside public_messages.
+    assert client.intents == botpy.Intents(public_messages=True, interaction=True).value
+    # The client was bound to the broker (so it can send cards).
+    assert broker._client is client
+
+    # A button click routed through on_interaction_create reaches the broker
+    # (here an unknown id → ack failure, no exception).
+    broker.bind_client(client)  # re-bind to the real client's api
+    class _CaptureApi:
+        async def on_interaction_result(self, interaction_id, code):
+            self.ack = (interaction_id, code)
+    capture = _CaptureApi()
+    client.api = capture
+    await client.on_interaction_create(_fake_interaction(openid="openid-alice", button_data="v1:ghost:a"))
+    assert capture.ack == ("int-1", 1)
+
+
+async def test_build_qq_client_no_approval_leaves_interaction_intent_off():
+    import botpy
+
+    client = build_qq_client(_FakeService(), _FakeRepo(), _FakeConfig(), None)
+    # Without an approval broker, the interaction intent is off (no button events
+    # are requested) and on_interaction_create is a harmless no-op.
+    assert client.intents == botpy.Intents(public_messages=True).value
+    await client.on_interaction_create(_fake_interaction())  # must not raise

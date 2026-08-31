@@ -2,16 +2,30 @@
 
 This module holds the *logic* of the QQ bot's slash-commands: it reuses the same
 channel-agnostic :class:`~..agent.service.AgentService` methods the Telegram
-adapter uses and produces the same plain-text replies. It is deliberately
+adapter uses, but renders the replies **in Chinese** (the QQ channel's
+user-facing language; the Telegram adapter renders the same commands in English).
+It is deliberately
 **independent** of :mod:`..telegram` (a channel must not import another channel)
 and of ``botpy`` (this package's only botpy imports live in
 :mod:`.bot`), so it can be unit-tested with lightweight fakes and no live client.
 
+**Formatting is split by shape, not by command — and the split is carried to
+delivery:** a *simple* one-line receipt (``/new``, the ``/stop`` "nothing running"
+reply, ``/remember``, the ``/forget`` outcomes, and the disabled / "none yet"
+notices) is **plain text** — no markdown markers, delivered by the channel as a
+``msg_type=0`` message. A *structured* display (``/help``, ``/status``,
+``/context``, ``/memories``, ``/tool_audit``, and the enabled ``/mcp_status`` /
+``/infra_status`` / ``/schedule_status``) keeps **Markdown** for its headers /
+fields / lists, delivered as a ``msg_type=2`` message. Each handler reports the
+shape of *its* reply via :class:`CommandReply`, so the same command can be plain
+in one branch and Markdown in another (e.g. ``/memories`` is a plain "none yet"
+notice when empty, a Markdown list when it has memories).
+
 The transport half — parsing the leading ``/token`` off an incoming C2C message,
 deciding *which* command ran, delivering the returned string over the QQ
 websocket, and (for ``/stop``) the QQ-local in-flight registry — lives in
-:mod:`.bot`. Everything here returns the reply string (or ``None`` for "send
-nothing") and never sends anything itself.
+:mod:`.bot`. Everything here returns a :class:`CommandReply` (or ``None`` for
+"send nothing") and never sends anything itself.
 
 Privacy mirrors the Telegram layer: none of these commands exposes a key, token,
 endpoint, host, mount path, service name, command, ``prompt``/``chat_id``/
@@ -24,10 +38,11 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 from .. import __version__
-from ..agent.service import AgentError, AgentService, _user_safe_for
+from ..agent.service import AgentError, AgentService
 from ..automation.cron import CronError, parse_cron
 from ..config import Config
 from ..database.repository import ConversationRepository
@@ -35,25 +50,45 @@ from ..infrastructure import local_tool_name
 
 logger = logging.getLogger("qq")
 
+
+class CommandReply(NamedTuple):
+    """A command's reply: its delivery ``text`` and whether it is ``markdown``.
+
+    ``markdown`` picks the delivery *type* in :mod:`.bot`: ``True`` sends a
+    ``msg_type=2`` Markdown message (a *structured* display — ``/help``,
+    ``/status``, ``/context``, the ``/memories`` / ``/tool_audit`` lists, and the
+    enabled ``/mcp_status`` / ``/infra_status`` / ``/schedule_status``); ``False``
+    sends a ``msg_type=0`` plain-text message (a *simple* one-line receipt —
+    ``/new``, the ``/stop`` "nothing running" reply, ``/remember``, the
+    ``/forget`` outcomes, and the disabled / "none yet" notices). The decision is
+    made per branch in each handler, not inferred from the text.
+    """
+
+    text: str
+    markdown: bool = False
+
 # The QQ command set: the Telegram core set + read-only ``/mcp_status``, minus
 # ``/start`` (no QQ concept) and ``/mcp`` / ``/mcp auth`` (the OAuth login is
 # Telegram-bound — it returns an inline login *button* and a proactive
-# completion notification, both of which QQ cannot reliably deliver). Single
-# source of truth for both ``cmd_help`` and the native command panel.
-# ``(command, short_description)``.
+# completion notification, both of which QQ cannot reliably deliver). Each
+# entry is ``(command, description)`` where the description is **Chinese** — the
+# QQ channel's user-facing language. It is the single source of truth for *both*
+# user-facing surfaces that describe a command: the ``/help`` reply (a QQ command
+# *reply*) and the native command *panel* (the ``/v2/panels`` 指令面板) — so the
+# command set, its order, and its wording stay in lockstep across the two.
 _QQ_COMMANDS: list[tuple[str, str]] = [
-    ("new", "Start a new conversation"),
-    ("stop", "Stop the current reply"),
-    ("help", "Show this help"),
-    ("status", "Show run status"),
-    ("context", "Show context budget"),
-    ("remember", "Save a long-term memory"),
-    ("memories", "List your memories"),
-    ("forget", "Forget a memory or all"),
-    ("tool_audit", "Show tool audit log"),
-    ("mcp_status", "Show remote MCP tool status"),
-    ("infra_status", "Show configured infra targets"),
-    ("schedule_status", "Show configured schedules"),
+    ("new", "开始新的会话"),
+    ("stop", "停止当前回复"),
+    ("help", "显示帮助"),
+    ("status", "显示运行状态"),
+    ("context", "显示上下文预算"),
+    ("remember", "保存一条长期记忆"),
+    ("memories", "查看你的记忆"),
+    ("forget", "删除一条记忆或全部"),
+    ("tool_audit", "查看工具审计日志"),
+    ("mcp_status", "查看远程 MCP 工具状态"),
+    ("infra_status", "查看已配置的基础设施目标"),
+    ("schedule_status", "查看已配置的定时任务"),
 ]
 
 # The native command panel caps each item's ``name`` at 14 characters, and the
@@ -71,10 +106,13 @@ def build_c2c_panel_items(commands: list[tuple[str, str]] = _QQ_COMMANDS) -> lis
 
     Pure (no I/O, no botpy): each command becomes a ``command``-type panel item
     ``{"type": "command", "name": "/<cmd>", "desc": <description>}`` whose click
-    fills the ``/<cmd>`` into the input box. Items are filtered to those whose
-    ``name`` fits the 14-char panel cap (``/schedule_status`` drops out here)
-    and the panel to at most 20 items (the API maximum), in the command table's
-    order. Returns ``[]`` if nothing qualifies.
+    fills the ``/<cmd>`` into the input box. The ``desc`` is the command's
+    **Chinese** description (the native command *panel* is rendered in the channel's
+    user-facing language, exactly like the ``/help`` reply) — the same value the
+    ``/help`` list shows, so the two surfaces never drift. Items are filtered to
+    those whose ``name`` fits the 14-char panel cap (``/schedule_status`` drops out
+    here) and the panel to at most 20 items (the API maximum), in the command
+    table's order. Returns ``[]`` if nothing qualifies.
     """
     items: list[dict] = []
     for name, desc in commands:
@@ -95,13 +133,13 @@ def _utc_stamp(dt) -> str:
         return str(dt)
 
 
-async def cmd_new(service: AgentService, conversation_id: int) -> str:
+async def cmd_new(service: AgentService, conversation_id: int) -> CommandReply:
     """/new — start a fresh conversation for this chat (drops all its history)."""
     await service.reset(conversation_id, conversation_id)
-    return "**New conversation started** (history cleared)."
+    return CommandReply("已开始新会话（历史已清空）。")
 
 
-async def cmd_stop(in_flight: dict[int, "object"], conversation_id: int) -> str | None:
+async def cmd_stop(in_flight: dict[int, "object"], conversation_id: int) -> CommandReply | None:
     """/stop — interrupt this chat's in-flight reply.
 
     Pops the in-flight task registered for ``conversation_id`` (by
@@ -113,7 +151,7 @@ async def cmd_stop(in_flight: dict[int, "object"], conversation_id: int) -> str 
     """
     task = in_flight.pop(conversation_id, None)
     if task is None or task.done():
-        return "**Nothing to stop.**"
+        return CommandReply("没有正在进行的回复。")
     task.cancel()
     # Do not await the cancelled task here: it is unwinding in its own task and
     # posts its own notice. Awaiting it could deadlock on the very
@@ -121,102 +159,107 @@ async def cmd_stop(in_flight: dict[int, "object"], conversation_id: int) -> str 
     return None
 
 
-async def cmd_help() -> str:
-    """List the available commands (generated from ``_QQ_COMMANDS``)."""
-    lines = ["**Available commands:**", ""]
+async def cmd_help() -> CommandReply:
+    """List the available commands (generated from ``_QQ_COMMANDS``).
+
+    The ``/help`` reply is a QQ command *reply*, so it is rendered in **Chinese**
+    (the channel's user-facing language) — the same descriptions the native command
+    *panel* (``/v2/panels``) shows.
+    """
+    lines = ["**可用命令：**", ""]
     for cmd, desc in _QQ_COMMANDS:
         lines.append(f"/{cmd} — {desc}")
-    lines += ["", "Any other text message is sent to the agent."]
-    return "\n".join(lines)
+    lines += ["", "其他文字消息都会发送给 Agent。"]
+    return CommandReply("\n".join(lines), markdown=True)
 
 
 async def cmd_status(service: AgentService, repo: ConversationRepository, config: Config,
-                     conversation_id: int) -> str:
+                     conversation_id: int) -> CommandReply:
     """/status — run status: version, model, and (if any) the current
     conversation and its message count."""
     conversation = await repo.get_conversation(conversation_id)
     if conversation is None:
         lines = [
-            "**Agent Backend:**",
-            "**Status:** OK",
+            "**Agent 后端：**",
+            "**状态：** 正常",
             "",
-            f"**Version:** {__version__}",
-            f"**Model:** {config.openai_model}",
-            "**Conversation:** (none yet — send a message)",
-            "**Database:** OK",
+            f"**版本：** {__version__}",
+            f"**模型：** {config.openai_model}",
+            "**会话：** （暂无——发一条消息即可）",
+            "**数据库：** 正常",
         ]
     else:
         status = await service.conversation_status(conversation.id)
         lines = [
-            "**Agent Backend:**",
-            "**Status:** OK",
+            "**Agent 后端：**",
+            "**状态：** 正常",
             "",
-            f"**Version:** {__version__}",
-            f"**Model:** {config.openai_model}",
-            f"**Conversation:** {conversation.id}",
-            f"**Messages:** {status['messages']}",
-            "**Database:** OK",
+            f"**版本：** {__version__}",
+            f"**模型：** {config.openai_model}",
+            f"**会话：** {conversation.id}",
+            f"**消息数：** {status['messages']}",
+            "**数据库：** 正常",
         ]
     # None of the above exposes keys, tokens, or file paths.
-    return "\n".join(lines)
+    return CommandReply("\n".join(lines), markdown=True)
 
 
 async def cmd_context(service: AgentService, repo: ConversationRepository,
-                      conversation_id: int) -> str:
+                      conversation_id: int) -> CommandReply:
     """/context — a read-only preview of how much stored history (and its images)
     would fit both the message cap and the estimated-token budget. It never
     reads an attachment blob (planning is metadata-only)."""
     conversation = await repo.get_conversation(conversation_id)
     if conversation is None:
-        return "**No conversation yet** — send a message first."
+        return CommandReply("还没有会话——请先发一条消息。")
 
     s = await service.context_status(conversation.id)
     free_tokens = s["budget"] - s["estimated_cost"]
     free_messages = s["cap"] - (s["history_messages"] + 1)
     images_downgraded = s["images_in_store"] - s["images_kept"]
     lines = [
-        "**Context:**",
-        f"**Conversation:** {s['conversation_id']}",
+        "**上下文：**",
+        f"**会话：** {s['conversation_id']}",
         "",
-        f"**Message cap:** {s['cap']}",
-        f"**Stored:** {s['stored_messages']} messages",
-        f"**Kept this turn:** {s['history_messages']} (+1 current)",
-        f"**Room left:** ~{free_messages} messages",
+        f"**消息上限：** {s['cap']}",
+        f"**已存：** {s['stored_messages']} 条",
+        f"**本回合保留：** {s['history_messages']} 条（+1 当前）",
+        f"**剩余空间：** 约 {free_messages} 条",
         "",
-        f"**Estimated budget:** {s['budget']} units",
-        f"**Used:** ~{s['estimated_cost']} units (system {s['system_cost']})",
-        f"**Free:** ~{free_tokens} units",
+        f"**估算预算：** {s['budget']} 单位",
+        f"**已用：** 约 {s['estimated_cost']} 单位（系统 {s['system_cost']}）",
+        f"**剩余：** 约 {free_tokens} 单位",
         "",
-        f"**History images kept:** {s['images_kept']} / {s['images_in_store']}"
-        + (f" ({images_downgraded} downgraded to text)" if images_downgraded > 0 else ""),
+        f"**保留的历史图片：** {s['images_kept']} / {s['images_in_store']}"
+        + (f"（{images_downgraded} 张已降级为纯文本）" if images_downgraded > 0 else ""),
         "",
-        "(Conservative estimate, not exact tokens.)",
+        "（保守估算，非精确 token 数。）",
     ]
     # None of the above exposes message text, keys, tokens, digests, or paths.
-    return "\n".join(lines)
+    return CommandReply("\n".join(lines), markdown=True)
 
 
-async def cmd_remember(service: AgentService, memory_scope: str, args: str) -> str:
+async def cmd_remember(service: AgentService, memory_scope: str, args: str) -> CommandReply:
     """/remember <content> — save one explicit long-term memory."""
     record = await service.remember_memory(memory_scope, args)
-    return f"**Memory saved.**\n**ID:** {record.id}\n\n{record.content}"
+    return CommandReply(f"记忆已保存。\n编号：{record.id}\n\n{record.content}")
 
 
-async def cmd_memories(service: AgentService, memory_scope: str) -> str:
+async def cmd_memories(service: AgentService, memory_scope: str) -> CommandReply:
     """/memories — list the caller's own memories."""
     records = await service.list_memories(memory_scope)
     if not records:
-        return "**No memories saved yet.** Use /remember <text> to save one."
+        return CommandReply("还没有保存任何记忆。用 /remember <文字> 保存一条。")
 
-    lines = [f"**Your memories:** ({len(records)} total)", ""]
+    lines = [f"**你的记忆：**（共 {len(records)} 条）", ""]
     for r in records:
-        lines.append(f"**#{r.id}** (saved {_utc_stamp(r.created_at)})")
+        lines.append(f"**#{r.id}**（保存于 {_utc_stamp(r.created_at)}）")
         lines.append(r.content)
         lines.append("")
-    return "\n".join(lines).rstrip()
+    return CommandReply("\n".join(lines).rstrip(), markdown=True)
 
 
-async def cmd_forget(service: AgentService, memory_scope: str, args: str) -> str:
+async def cmd_forget(service: AgentService, memory_scope: str, args: str) -> CommandReply:
     """/forget <id> — delete one memory; /forget all CONFIRM — delete all.
 
     ``/forget all`` without the exact ``CONFIRM`` token only shows the
@@ -225,26 +268,26 @@ async def cmd_forget(service: AgentService, memory_scope: str, args: str) -> str
     """
     tokens = args.split()
     if not tokens:
-        raise AgentError("Usage: /forget <id> or /forget all CONFIRM", "memory_invalid")
+        raise AgentError("用法：/forget <id> 或 /forget all CONFIRM", "memory_invalid")
 
     if tokens[0].lower() == "all":
         if len(tokens) >= 2 and tokens[1] == "CONFIRM":
             removed = await service.forget_all_memories(memory_scope)
-            return f"**All memories cleared.** ({removed} deleted)"
-        return _user_safe_for("memory_clear_confirmation")
+            return CommandReply(f"已清除全部记忆。（删除 {removed} 条）")
+        return CommandReply("要清除全部记忆，请发送：/forget all CONFIRM")
 
     try:
         memory_id = int(tokens[0])
     except ValueError:
-        raise AgentError("Usage: /forget <id> or /forget all CONFIRM", "memory_invalid")
+        raise AgentError("用法：/forget <id> 或 /forget all CONFIRM", "memory_invalid")
     await service.forget_memory(memory_scope, memory_id)
-    return f"**Memory deleted.** (ID: {memory_id})"
+    return CommandReply(f"记忆已删除。（编号：{memory_id}）")
 
 
 _TOOL_AUDIT_MAX_LIMIT = 50
 
 
-async def cmd_tool_audit(service: AgentService, memory_scope: str, args: str) -> str:
+async def cmd_tool_audit(service: AgentService, memory_scope: str, args: str) -> CommandReply:
     """/tool_audit [limit] — show the caller's own recent tool-audit events.
 
     Read-only and scope-isolated: it reads only the *current* principal's audit
@@ -259,13 +302,13 @@ async def cmd_tool_audit(service: AgentService, memory_scope: str, args: str) ->
         try:
             limit = max(1, min(_TOOL_AUDIT_MAX_LIMIT, int(arg)))
         except ValueError:
-            return "Usage: /tool_audit [limit]  (limit is 1-50)"
+            return CommandReply("用法：/tool_audit [limit]  （limit 为 1-50）")
 
     records = await service.list_tool_audit_events(memory_scope, limit)
     if not records:
-        return "**No tool activity yet.** Tool calls will appear here as they run."
+        return CommandReply("还没有工具活动。工具调用会在这里显示。")
 
-    lines = [f"**Tool audit:** (last {len(records)} events, most recent first)", ""]
+    lines = [f"**工具审计：**（最近 {len(records)} 条，最新在前）", ""]
     for r in records:
         line = f"**#{r.id}** {_utc_stamp(r.created_at)} — {r.tool_name} / {r.event_type}"
         if r.code:
@@ -273,13 +316,13 @@ async def cmd_tool_audit(service: AgentService, memory_scope: str, args: str) ->
         if r.latency_ms is not None:
             line += f" / {r.latency_ms}ms"
         lines.append(line)
-    lines += ["", "(Codes are stable, human-readable status tags — arguments and results are not shown.)"]
+    lines += ["", "（码为稳定的可读状态标签——不显示参数与结果。）"]
     # None of the above exposes tool args, results, exception text, raw scope,
     # the user id, or any secret.
-    return "\n".join(lines)
+    return CommandReply("\n".join(lines), markdown=True)
 
 
-async def cmd_mcp_status(config: Config, mcp_manager) -> str:
+async def cmd_mcp_status(config: Config, mcp_manager) -> CommandReply:
     """/mcp_status — show which configured remote MCP servers are up and how many
     tools each exposes.
 
@@ -292,19 +335,19 @@ async def cmd_mcp_status(config: Config, mcp_manager) -> str:
     """
     # No manager (no servers configured, or tools disabled) → MCP is disabled.
     if mcp_manager is None or not getattr(config, "enable_tools", True) or len(mcp_manager) == 0:
-        return "**MCP:** disabled"
+        return CommandReply("MCP：未启用")
 
-    lines = ["**Remote MCP servers:**", ""]
+    lines = ["**远程 MCP 服务器：**", ""]
     for entry in mcp_manager.status():
-        state = "available" if entry["available"] else "unavailable"
-        lines.append(f"**{entry['name']}** — {state} ({entry['tool_count']} tools)")
-    lines += ["", f"**Total MCP tools available:** {mcp_manager.total_tools}"]
+        state = "可用" if entry["available"] else "不可用"
+        lines.append(f"**{entry['name']}** — {state}（{entry['tool_count']} 个工具）")
+    lines += ["", f"**可用 MCP 工具总数：** {mcp_manager.total_tools}"]
     # None of the above exposes a URL, host, header, token, description, schema,
     # server instructions, or any failure detail.
-    return "\n".join(lines)
+    return CommandReply("\n".join(lines), markdown=True)
 
 
-async def cmd_infra_status(config: Config) -> str:
+async def cmd_infra_status(config: Config) -> CommandReply:
     """/infra_status — show which read-only infrastructure targets are configured.
 
     Read-only and non-mutating: it renders only the **configuration** — each
@@ -316,29 +359,28 @@ async def cmd_infra_status(config: Config) -> str:
     conclusion about whether a target is reachable.
     """
     if not getattr(config, "enable_tools", True) or not config.infra_ssh_targets:
-        return "**Infrastructure:** disabled"
+        return CommandReply("基础设施观测：未启用")
 
-    lines = ["**Infrastructure observation targets (read-only):**", ""]
+    lines = ["**基础设施观测目标（只读）：**", ""]
     for target in config.infra_ssh_targets:
         tool_names = ", ".join(
             f"`{local_tool_name(target.name, obs)}`"
             for obs in ("host_status", "disk_status", "service_status")
         )
-        lines.append(f"**{target.name}** — configured (3 tools, read-only): {tool_names}")
+        lines.append(f"**{target.name}** — 已配置（3 个工具，只读）：{tool_names}")
     lines += [
         "",
-        f"**Total configured tools:** {len(config.infra_ssh_targets) * 3}",
+        f"**已配置工具总数：** {len(config.infra_ssh_targets) * 3}",
         "",
-        "(Configured only — this shows nothing about reachability; a status is "
-        "read only when the corresponding tool is actually called.)",
+        "（仅显示已配置项——不反映可达性；只有真正调用对应工具时才读取状态。）",
     ]
     # None of the above exposes a host, port, username, key path, known_hosts
     # path, mount path, service name, or command — only the target name and the
     # (operator-named) local tool names.
-    return "\n".join(lines)
+    return CommandReply("\n".join(lines), markdown=True)
 
 
-async def cmd_schedule_status(config: Config) -> str:
+async def cmd_schedule_status(config: Config) -> CommandReply:
     """/schedule_status — show the configured cron schedules and their next fire time.
 
     Read-only and non-mutating: it renders the startup-configured schedule list
@@ -350,11 +392,11 @@ async def cmd_schedule_status(config: Config) -> str:
     "never (untriggerable)".
     """
     if not config.schedules:
-        return "**Schedules:** disabled (none configured)"
+        return CommandReply("定时任务：未启用（未配置）")
 
     tz = ZoneInfo(config.schedule_timezone) if config.schedule_timezone else datetime.now().astimezone().tzinfo
     now = datetime.now(tz)
-    lines = ["**Scheduled tasks:**", ""]
+    lines = ["**定时任务：**", ""]
     for spec in config.schedules:
         try:
             nxt = parse_cron(spec.cron).next_fire(now, tz)
@@ -362,13 +404,13 @@ async def cmd_schedule_status(config: Config) -> str:
             # Cannot happen — the cron was validated at startup — but stay safe.
             nxt = None
         if nxt is None:
-            fire = "never (untriggerable)"
+            fire = "永不（无法触发）"
         else:
             fire = nxt.strftime("%Y-%m-%d %H:%M %Z")
-        lines.append(f"**{spec.name}** — `{spec.cron}` → next: {fire}")
-    lines += ["", f"(Times in {config.schedule_timezone or 'local tz'}. Read-only — this does not trigger anything.)"]
+        lines.append(f"**{spec.name}** — `{spec.cron}` → 下次触发：{fire}")
+    lines += ["", f"（时间为 {config.schedule_timezone or '本地时区'}。只读——此命令不触发任何运行。）"]
     # Name + cron + next-fire only; never prompt / chat_id / user_id.
-    return "\n".join(lines)
+    return CommandReply("\n".join(lines), markdown=True)
 
 
 # The generic notice for an *unexpected* (non-AgentError) command failure. It is
@@ -415,20 +457,23 @@ async def dispatch(
     conversation_id: int,
     memory_scope: str,
     in_flight: dict[int, "object"],
-) -> str | None:
-    """Run the named QQ command and return its reply string.
+) -> CommandReply | None:
+    """Run the named QQ command and return its reply.
 
-    Returns the reply string (Markdown) to deliver, or ``None`` for "send
-    nothing" (a successful ``/stop`` that cancelled a live turn — the cancelled
-    turn posts its own notice). **Unknown commands return ``None`` too**, so the
-    caller in :mod:`.bot` can fall through to a normal agent turn — an unknown
-    ``/foo`` is never swallowed (matching Telegram, where unmatched ``/…`` text
-    reaches the message handler).
+    Returns a :class:`CommandReply` (whose ``markdown`` flag tells :mod:`.bot`
+    whether to deliver the text as a ``msg_type=2`` Markdown message or a
+    ``msg_type=0`` plain-text message), or ``None`` for "send nothing" (a
+    successful ``/stop`` that cancelled a live turn — the cancelled turn posts its
+    own notice). **Unknown commands return ``None`` too**, so the caller in
+    :mod:`.bot` can fall through to a normal agent turn — an unknown ``/foo`` is
+    never swallowed (matching Telegram, where unmatched ``/…`` text reaches the
+    message handler).
 
     Errors are contained here, mirroring the Telegram handlers: an
     :class:`AgentError` (usage / memory / audit problems) becomes its
-    user-safe message; any other exception is logged by class and surfaced as a
-    fixed generic notice. The dispatcher itself never raises.
+    user-safe message (as plain text — a short receipt, never a display); any
+    other exception is logged by class and surfaced as a fixed generic notice.
+    The dispatcher itself never raises.
     """
     handler = _DISPATCH.get(command)
     if handler is None:
@@ -460,9 +505,9 @@ async def dispatch(
         # command == "schedule_status"
         return await handler(config)
     except AgentError as exc:
-        return exc.user_safe
+        return CommandReply(exc.user_safe)
     except Exception:
         # Log by class only (exc_info carries the type, not the body); never the
         # args, the scope, or any secret.
         logger.exception("qq command failed", extra={"conversation_id": conversation_id})
-        return _GENERIC_COMMAND_ERROR
+        return CommandReply(_GENERIC_COMMAND_ERROR)

@@ -20,11 +20,18 @@ On top of plain send/receive this channel also offers:
   Telegram's quote-once).
 * **A native command panel** — a best-effort, idempotent create-or-update of
   the QQ 指令面板 (``POST /v2/panels``) fired from ``on_ready``.
+* **Tool approval** — ``ask``-permission tools are approvable on QQ. A turn that
+  reaches one presents an approval card (a Markdown message with Approve / Deny
+  **callback buttons**) to the user running the turn; the click raises an
+  ``INTERACTION_CREATE`` event, handled here by :func:`build_qq_client`'s
+  ``on_interaction_create`` (which acks within the 3-second window and delegates
+  the decision to the :class:`~.approval.QQApprovalBroker`).
 
 Scope of this slice is deliberately minimal: **plain-text C2C** (no images, no
 streaming draft). The channel is a thin transport over the existing
 ``AgentService`` → tool loop → LLM core, so tool calling, the tool-security
-gate, context budgeting, and long-term memory all work unchanged for QQ.
+gate, context budgeting, and long-term memory all work unchanged for QQ — now
+including one-time ``ask`` approval.
 
 There is **no allow-list** (unlike the Telegram adapter's
 ``allowed_user_ids``): this is the owner's *personal* bot and a C2C chat is a
@@ -198,7 +205,10 @@ class QQChannel:
                 )
                 if reply:
                     try:
-                        await self._send_long(message, reply)  # command acks do not quote
+                        # Command acks do not quote; the reply's own ``markdown``
+                        # flag picks the delivery type (plain ``msg_type=0`` for a
+                        # simple receipt, Markdown ``msg_type=2`` for a display).
+                        await self._send_long(message, reply.text, markdown=reply.markdown)
                     except Exception:
                         logger.error(
                             "qq failed to send command reply",
@@ -228,12 +238,15 @@ class QQChannel:
         self._in_flight[conversation_id] = asyncio.current_task()
         try:
             try:
-                # No ``delivery_chat_id`` and no ``on_text_delta``: QQ has no draft
-                # preview, and (by design) approval is a *Telegram* callback. So an
-                # ``ask`` tool on a QQ turn resolves to this synthetic chat id, whose
-                # approval-card send fails, and the broker fail-closes to DENIED —
-                # QQ turns run ``allow`` tools freely but cannot be approved for
-                # ``ask`` tools. That is a documented limitation, not a bug.
+                # No ``delivery_chat_id`` (that carrier is a *real Telegram* chat
+                # id, used by scheduled runs to route a card to the owner's bound
+                # chat) and no ``on_text_delta`` (QQ has no draft preview).
+                # Approval, however, **does** work on QQ: when the shared service
+                # reaches an ``ask`` tool, it routes to the QQ broker by this turn's
+                # ``qq:<openid>`` scope, which sends a button card to this same
+                # openid and resolves from the ``INTERACTION_CREATE`` the click
+                # raises (wired in :func:`build_qq_client`). ``allow`` tools run
+                # freely; ``ask`` tools are approvable; ``deny`` is rejected.
                 agent_message = AgentMessage(contents=[TextContent(text)], source="qq")
                 reply = await self._service.process_message(cid, agent_message, memory_scope=memory_scope)
             except AgentError as exc:
@@ -274,16 +287,24 @@ class QQChannel:
         finally:
             self._in_flight.pop(conversation_id, None)
 
-    async def _send_long(self, message, text: str, *, quote_id: int | None = None) -> None:
-        """Deliver the model's ``text`` to the user, chunked, as Markdown C2C replies.
+    async def _send_long(self, message, text: str, *, quote_id: int | None = None,
+                         markdown: bool = True) -> None:
+        """Deliver ``text`` to the user, chunked, as a C2C reply.
 
-        Each chunk is sent as a ``msg_type=2`` Markdown message so the QQ client renders
-        it — the text rides the nested ``markdown`` field (``markdown.content``), **not**
-        the top-level ``content``. The model's text goes in **verbatim**: there is **no**
-        Markdown→anything conversion or escaping pass (unlike the Telegram adapter's
-        ``telegram/markdown.py`` HTML conversion). QQ's renderer handles the Markdown the
-        model emits; whatever it does not recognise simply shows as-is, and nothing is
-        rewritten or dropped on the way out.
+        ``markdown`` picks the delivery *type* (shared by the agent's final
+        answer and by slash-command replies): ``True`` sends each chunk as a
+        ``msg_type=2`` Markdown message so the QQ client renders it — the text
+        rides the nested ``markdown`` field (``markdown.content``), **not** the
+        top-level ``content``; ``False`` sends each chunk as a ``msg_type=0``
+        plain-text message, the text in the top-level ``content`` field (a
+        simple one-line command receipt carries no Markdown markers).
+
+        The agent's final answer is always ``markdown=True``: its text goes in
+        **verbatim** — there is **no** Markdown→anything conversion or escaping
+        pass (unlike the Telegram adapter's ``telegram/markdown.py`` HTML
+        conversion). QQ's renderer handles the Markdown the model emits; whatever
+        it does not recognise simply shows as-is, and nothing is rewritten or
+        dropped on the way out.
 
         Each chunk is a separate reply to the *same* incoming message
         (``msg_id = message.id``) with an incrementing ``msg_seq`` (1, 2, 3, …). The
@@ -300,7 +321,13 @@ class QQChannel:
         for i, chunk in enumerate(_split_for_qq(text), start=1):
             if not chunk:
                 continue
-            kwargs: dict = {"msg_type": QQ_MSG_TYPE_MARKDOWN, "markdown": {"content": chunk}, "msg_seq": i}
+            kwargs: dict = {"msg_seq": i}
+            if markdown:
+                kwargs["msg_type"] = QQ_MSG_TYPE_MARKDOWN
+                kwargs["markdown"] = {"content": chunk}
+            else:
+                kwargs["msg_type"] = QQ_MSG_TYPE_TEXT
+                kwargs["content"] = chunk
             if i == 1 and quote_id is not None:
                 kwargs["message_reference"] = {
                     "message_id": str(quote_id),
@@ -408,7 +435,67 @@ async def _ensure_c2c_panel(http, payload: dict) -> None:
         logger.exception("qq command panel sync failed")
 
 
-def build_qq_client(service, repository, config, mcp_manager):
+# ---------------------------------------------------------------------------
+# Global custom menu (v2_menu) — the C2C "⋮" menu that appears next to the input
+# box for every C2C user. Unlike the C2C *command panel* (``/v2/panels``), this is
+# a **global, owner-configured** resource (no per-user remark/marker): a single
+# ``PUT /v2/menu`` **replaces** the whole menu and is therefore naturally
+# idempotent across restarts (no create-or-update dance, no remark to match).
+#
+# We add two ``send_message`` items — the only item type that fits a personal
+# bot (``link`` needs a https URL and ``switch`` needs a search endpoint we don't
+# have):
+#   * "对话指令" → "/help": clicking it fills ``/help`` into the input box and,
+#     once sent, dispatches the ``/help`` command (the quick-command list).
+#   * "工具能力" → "你会使用哪些工具？": sent as a normal agent turn; the model
+#     answers from the tools it was given (a plain conversational prompt, not a
+#     command, so it runs the full tool loop and the reply is a quoted Markdown
+#     answer).
+# Both are fixed, secret-free, and content we fully control — the menu carries no
+# openid, no command argument, and no message body beyond these two literals.
+# ---------------------------------------------------------------------------
+_GLOBAL_MENU_ITEMS: tuple[dict, ...] = (
+    {"type": "send_message", "name": "对话指令", "send_message": "/help"},
+    {"type": "send_message", "name": "工具能力", "send_message": "你会使用哪些工具？"},
+)
+
+
+def _global_menu_payload() -> dict:
+    """Build the full body for ``PUT /v2/menu`` (replace the global C2C menu).
+
+    Pure (no I/O, no botpy): a menu whose items are the two fixed
+    ``send_message`` entries in :data:`_GLOBAL_MENU_ITEMS`. ``PUT /v2/menu``
+    replaces the entire menu with this body, so sending the same payload on
+    every startup is idempotent by construction.
+    """
+    return {"menu": {"items": list(_GLOBAL_MENU_ITEMS)}}
+
+
+async def _ensure_global_menu(http) -> None:
+    """Best-effort replace the global C2C custom menu (``PUT /v2/menu``).
+
+    ``http`` is the ``botpy`` client's public ``BotHttp`` (the same
+    ``await http.request(route, **kwargs)`` primitive the panel path uses).
+    Sends the fixed two-item menu and logs only a success line (the response is
+    a bare ``{"version": N}`` revision counter — not logged).
+
+    **Never raises.** A menu hiccup (network, a 4xx) is logged by class only and
+    swallowed — it must never break startup or message handling, exactly like the
+    command panel. No secret, openid, or message body is logged.
+    """
+    # Lazy import: keep botpy out of the module top level (same rule as the panel
+    # path and :func:`build_qq_client`).
+    from botpy.http import Route
+
+    try:
+        await http.request(Route("PUT", "/v2/menu"), json=_global_menu_payload())
+        logger.info("qq global menu updated")
+    except Exception:
+        # Log by class only — never let a menu failure escape.
+        logger.exception("qq global menu sync failed")
+
+
+def build_qq_client(service, repository, config, mcp_manager, approval_broker=None):
     """Construct the ``botpy`` client for the QQ channel.
 
     This is the *only* function in the codebase that imports ``botpy``. It is
@@ -423,12 +510,22 @@ def build_qq_client(service, repository, config, mcp_manager):
     ``/schedule_status`` / ``/mcp_status``); they are not secrets and are safe to
     hold.
 
+    ``approval_broker`` (a :class:`~.approval.QQApprovalProvider`) is the
+    QQ-side approval transport, injected by the composition root only when
+    tools are enabled. It is bound to this client (so it can send the approval
+    card) and its :meth:`~.approval.QQApprovalBroker.handle_interaction` is
+    wired to the client's ``on_interaction_create`` handler — the entry point
+    for message-button clicks.
+
     Returns a ``botpy.Client`` subclass instance whose ``on_c2c_message_create``
-    is wired to a fresh :class:`QQChannel` and whose ``on_ready`` best-effort
+    is wired to a fresh :class:`QQChannel`, whose ``on_ready`` best-effort
     creates-or-updates the native command panel (fired after login, when the
-    token is valid). ``Intents(public_messages=True)`` (bit 1<<25) is the flag
-    that enables the C2C ``c2c_message_create`` event. There is no allow-list to
-    thread through — see :class:`QQChannel`.
+    token is valid), and (when ``approval_broker`` is given) whose
+    ``on_interaction_create`` routes button clicks to the broker. ``Intents``
+    enables ``public_messages`` (bit 1<<25, the C2C ``c2c_message_create`` event)
+    and, when approval is on, ``interaction`` (bit 1<<26, the button-click
+    ``INTERACTION_CREATE`` event). There is no allow-list to thread through —
+    see :class:`QQChannel`.
     """
     # Lazy import: ``botpy`` (and its ``aiohttp`` dependency) is loaded only when
     # the QQ channel is actually turned on, so a Telegram-only deployment never
@@ -445,18 +542,29 @@ def build_qq_client(service, repository, config, mcp_manager):
 
         async def on_ready(self):
             # ``on_ready`` is dispatched by botpy (by name, no args) once the
-            # websocket login completes, so the token is valid here. Best-effort:
-            # a panel failure is swallowed inside ``_ensure_c2c_panel``.
+            # websocket login completes, so the token is valid here. Both are
+            # best-effort: each swallows its own failure (a panel/menu hiccup
+            # must never break startup or message handling).
             await _ensure_c2c_panel(self.http, panel_payload)
+            await _ensure_global_menu(self.http)
 
-    # ``ext_handlers=False``: botpy's default adds a rotating *file* handler that
-    # writes ``botpy.log`` into the current working directory. We don't want a
-    # stray log file dropped into the repo root (local dev) or ``/app`` (Docker);
-    # instead let botpy's lifecycle logs propagate to our already-configured root
-    # logger (``bot_log=True`` keeps propagation on). ``log_level=None`` leaves
-    # our configured level untouched.
-    return _QQClient(
-        intents=botpy.Intents(public_messages=True),
+        async def on_interaction_create(self, interaction):
+            # A message-button click (or another interaction). The broker
+            # acks it (within the 3-second window) and resolves the pending
+            # approval, or ignores it if it is not a button click. Only wired
+            # when approval is on (see below).
+            if approval_broker is not None:
+                await approval_broker.handle_interaction(interaction)
+
+    intents = botpy.Intents(public_messages=True, interaction=approval_broker is not None)
+    client = _QQClient(
+        intents=intents,
         bot_log=True,
         ext_handlers=False,
     )
+    # Bind the client to the broker so it can send approval cards via
+    # ``client.api.post_c2c_message``. Done after construction (the client owns
+    # its own ``api``) and only when approval is on.
+    if approval_broker is not None:
+        approval_broker.bind_client(client)
+    return client

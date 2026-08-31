@@ -201,7 +201,7 @@ MAX_TOOL_ITERATIONS=20
 TOOL_APPROVAL_TIMEOUT_SECONDS=60
 ```
 
-**说明**：对 `ask` 策略工具，等待 Telegram 审批（`Approve`/`Deny`）的秒数，超时则按「审批已过期」处理。必须为正数。
+**说明**：对 `ask` 策略工具，等待人工审批（`Approve`/`Deny`）的秒数，超时则按「审批已过期」处理。必须为正数。
 
 #### `TOOL_TIMEOUT_SECONDS`
 

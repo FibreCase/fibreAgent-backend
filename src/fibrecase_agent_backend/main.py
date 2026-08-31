@@ -44,6 +44,7 @@ from .mcp.auth import (
     build_oauth_callback_server,
 )
 from .qq import build_qq_client
+from .qq.approval import QQApprovalBroker, QQScopedApprovalRouter
 from .telegram.approval import TelegramApprovalBroker
 from .telegram.bot import build_application, compose_startup_hooks, deliver_markdown, register_command_menu
 from .tools import FileBackedToolPolicy, build_policy, reconcile_permissions_file
@@ -133,6 +134,19 @@ class AgentBackend:
         auditor = RepositoryToolAuditor(self.repository) if registry else None
         broker = TelegramApprovalBroker(self.repository) if registry else None
         self.approval_broker = broker
+        # Phase 10 (multi-channel): the QQ-side approval transport. Built whenever
+        # tools are on (it is cheap and in-memory, and binds to the QQ client
+        # later in ``_post_init`` only if the QQ channel is actually configured).
+        # It is *not* wired into the shared service directly — the service takes
+        # the scope-routing provider below, which forwards ``qq:…``-scoped turns
+        # to this broker and everything else to the Telegram broker.
+        self._qq_approval_broker = QQApprovalBroker() if registry else None
+        # The single channel-agnostic ``approval_provider`` the shared service
+        # holds: routes each ``ask`` to the broker matching the turn's scope
+        # prefix (``qq:`` → QQ button card, else → Telegram inline callback).
+        approval_provider = (
+            QQScopedApprovalRouter(broker, self._qq_approval_broker) if registry else None
+        )
         # Phase 4.x: user-level OAuth for MCP. The manager is built **only**
         # when a callback base URL is configured *and* at least one provider's
         # client credentials are present *and* at least one server declares
@@ -197,7 +211,7 @@ class AgentBackend:
             max_retrieved_memories=config.max_retrieved_memories,
             max_memory_estimated_tokens=config.max_memory_estimated_tokens,
             policy=policy,
-            approval_provider=broker,
+            approval_provider=approval_provider,
             auditor=auditor,
             tool_timeout_seconds=config.tool_timeout_seconds,
             tool_approval_timeout_seconds=config.tool_approval_timeout_seconds,
@@ -538,7 +552,13 @@ class AgentBackend:
         if self.config.qq_app_id:
             secret = os.environ.get(_QQ_CLIENT_SECRET_ENV, "").strip()
             if secret:
-                self._qq_client = build_qq_client(self.service, self.repository, self.config, self.mcp_manager)
+                self._qq_client = build_qq_client(
+                    self.service,
+                    self.repository,
+                    self.config,
+                    self.mcp_manager,
+                    approval_broker=self._qq_approval_broker,
+                )
                 self._qq_task = asyncio.create_task(self._qq_run(self._qq_client, secret))
                 self._qq_task.add_done_callback(self._qq_task_done)
             else:
@@ -567,9 +587,15 @@ class AgentBackend:
     async def _post_shutdown(self, application) -> None:
         logger.info("shutting down agent backend")
         # Cancel any outstanding approvals first so a turn blocked on a human
-        # decision resolves (expired) instead of hanging the shutdown.
+        # decision resolves (expired) instead of hanging the shutdown. Both the
+        # Telegram broker (inline callbacks) and the QQ broker (button cards) are
+        # drained here, before the scheduler stops and before the QQ client
+        # closes — so an in-flight QQ turn awaiting an approval is unblocked
+        # first, not abandoned with its websocket dropped.
         if self.approval_broker is not None:
             await self.approval_broker.shutdown()
+        if self._qq_approval_broker is not None:
+            await self._qq_approval_broker.shutdown()
         # Phase 9 (Automation): stop the scheduler *after* the approval broker
         # (so a scheduled turn awaiting an approval is first unblocked) and
         # *before* the LLM client / engine are closed (so no scheduled turn is
