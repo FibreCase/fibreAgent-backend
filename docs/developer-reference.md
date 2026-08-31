@@ -41,7 +41,7 @@ implemented, mocked-tested, and released:
 - An **opt-in `exec` shell tool** (default off, always `ask`, with a static catastrophic-command backstop) — implemented and tested on top of that
 - An **opt-in `file` toolset** (default off; `file_read`/`file_ls` read-only `allow`, the other seven tools always `ask`; confined to `FILE_WORKDIR` against `../` and symlink escape, precise replace + narrow non-overwriting file/directory operations) — implemented and tested on top of that
 - **Streaming replies** (Bot API 10.0 `sendMessageDraft`; `ENABLE_STREAMING`, default on) — a live draft-preview in a private chat's compose box that animates as the model generates, with the full reply still delivered as a normal message; group/channel chats and a disabled knob degrade to the classic "typing…" + chunked reply. The Bot API 10.3 Stop button is a later phase (stop stays on `/stop`). Implemented and mocked-tested on top of that.
-- **Phase 10 (Multi-Channel: QQ C2C plain text + commands)** — the first non-Telegram channel. A plain-text **C2C (private-chat) send/receive** adapter over the official `botpy` SDK, off by default (on when `QQ_APP_ID` is set). It normalises an incoming QQ C2C message into `AgentMessage(source="qq")`, calls the same channel-agnostic `AgentService.process_message`, and delivers the reply over the QQ websocket — so tool calling, the tool-security gate, context budgeting, and long-term memory all work unchanged. On top of plain send/receive it offers the **same slash-command surface** as the Telegram bot (core set + read-only `/mcp_status`), **reply-quoting** of the user's message (`message_reference`, first chunk only), a **native command panel** (best-effort, idempotent create-or-update), a **global C2C custom menu** (`PUT /v2/menu`, best-effort, idempotent by replace), and **tool approval via QQ button cards** — a `qq/approval.py` broker (botpy-free) that, for a QQ-scoped `ask` request, sends an *active* C2C Markdown message with a `keyboard` of callback buttons, resolves the `INTERACTION_CREATE` the click produces (acked within 3 s), and is selected per-request by a scope-prefix `QQScopedApprovalRouter` co-resident with the Telegram broker in the one `AgentService`. Command *replies* render in **Chinese** (the Telegram adapter renders the same commands in English); delivery type follows the reply's shape — **simple** receipts as plain text (`msg_type=0`), **structured** displays as Markdown (`msg_type=2`). Conversations are keyed by a deterministic synthetic id in a reserved range disjoint from (and below) the schedule range. `qq/bot.py` is the only module that imports `botpy`; `qq/commands.py` and `qq/approval.py` are pure / botpy-free. **Limitations:** C2C plain text only (no group/guild, no images, no streaming draft), no `/start` (no QQ concept) and no `/mcp` / `/mcp auth` (OAuth is Telegram-bound). `deny` tools are still rejected on a QQ turn (`ask` is approvable via the button card). Implemented and mocked-tested on top of that.
+- **Phase 10 (Multi-Channel: QQ C2C plain text + commands)** — the first non-Telegram channel. A plain-text **C2C (private-chat) send/receive** adapter over the official `botpy` SDK, off by default (on when `QQ_APP_ID` is set). It normalises an incoming QQ C2C message into `AgentMessage(source="qq")`, calls the same channel-agnostic `AgentService.process_message`, and delivers the reply over the QQ websocket — so tool calling, the tool-security gate, context budgeting, and long-term memory all work unchanged. On top of plain send/receive it offers the **same slash-command surface** as the Telegram bot (core set + read-only `/mcp_status` + `/user_status`), **reply-quoting** of the user's message (`message_reference`, first chunk only), a **native command panel** (best-effort, idempotent create-or-update), a **global C2C custom menu** (`PUT /v2/menu`, best-effort, idempotent by replace), and **tool approval via QQ button cards** — a `qq/approval.py` broker (botpy-free) that, for a QQ-scoped `ask` request, sends an *active* C2C Markdown message with a `keyboard` of callback buttons, resolves the `INTERACTION_CREATE` the click produces (acked within 3 s), and is selected per-request by a scope-prefix `QQScopedApprovalRouter` co-resident with the Telegram broker in the one `AgentService`. Command *replies* render in **Chinese** (the Telegram adapter renders the same commands in English); delivery type follows the reply's shape — **simple** receipts as plain text (`msg_type=0`), **structured** displays as Markdown (`msg_type=2`). Conversations are keyed by a deterministic synthetic id in a reserved range disjoint from (and below) the schedule range. `qq/bot.py` is the only module that imports `botpy`; `qq/commands.py` and `qq/approval.py` are pure / botpy-free. **Limitations:** C2C plain text only (no group/guild, no images, no streaming draft), no `/start` (no QQ concept) and no `/mcp` / `/mcp auth` (OAuth is Telegram-bound). `deny` tools are still rejected on a QQ turn (`ask` is approvable via the button card). Implemented and mocked-tested on top of that.
 
 ### Phase 1
 
@@ -562,6 +562,10 @@ systemd**.
   **never** shows host / port / username / key path / known-hosts path / mount path /
   service / command — target *name* + the three tool *names* only.
   `("infra_status", "Show configured infra targets")` is in `_COMMANDS`.
+  **`/user_status`** is an allow-listed read-only command (behind `_is_authorized`,
+  like `/status`) that returns **the caller's own** `user_id` + `chat_id` so they can
+  fill a schedule's `receiver.telegram`; unauthorised senders are ignored and the
+  values are user-facing in-chat but **never** logged.
 - **Config** (strict, fail-fast at startup, `config.py`): the target list is a JSON
   **array** (empty = off), read from the **default file
   `config/infra_ssh_targets.json`** when present, an explicit
@@ -884,7 +888,8 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   bot, **reply-quoting** of the user's message, and a **native command panel**. The
   command *logic* lives in `qq/commands.py` (pure, botpy-free, Telegram-free — a
   channel never imports another channel): `_QQ_COMMANDS` is the single source of
-  truth (12 commands: the core set + read-only `/mcp_status`, **minus** `/start` (no QQ
+  truth (13 commands: the core set + read-only `/mcp_status` + `/user_status`,
+  **minus** `/start` (no QQ
   concept) and `/mcp`/`/mcp auth` (OAuth is Telegram-bound)); `build_c2c_panel_items`
   maps it to the panel's `command` items, **filtering to the 14-char name cap** (which
   drops `/schedule_status` — it is still *dispatched* by hand) and the 20-item cap;
@@ -1012,7 +1017,17 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   the QQ adapter logs only the synthetic conversation id, the QQ *message id*, a text
   length, and (for a command) the command *name* — **never** the raw `user_openid` (a
   user identity), a command *argument* (which can carry memory content), or the message
-  / reply body.
+  / reply body. **`/user_status`** is the one command that *deliberately* returns
+  the caller's own `user_openid` **to that caller in-chat** (so they can fill a
+  schedule's `receiver.qq`); it recovers the openid from the `qq:` scope prefix and
+  is user-facing — the openid appears in the reply but is **never** logged (the
+  privacy rule above still holds). **`deliver_qq_markdown(client, openid, text)`** is
+  a module-level, botpy-free async helper (safe for the composition root to import):
+  a **proactive**, chunked Markdown C2C send to an openid — an *active* message (no
+  `msg_id` / `msg_seq`) outside the 5-min passive-reply window, one `msg_type=2`
+  Markdown message per `_split_for_qq` chunk. The composition root's schedule
+  delivery (`main.py::_deliver_schedule_notification`) uses it to push a scheduled
+  run's result to a `receiver.qq`, alongside Telegram's `deliver_markdown`.
 
 - **`qq/approval.py`** — the phase-10 **QQ tool-approval broker + scope router**
   (pure Python, **botpy-free** — it imports only `..memory.hash_scope` and
@@ -1593,7 +1608,20 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   `registry.add(*self.infra_tools)` atomically (any `ValueError` → a startup
   `ConfigError` naming the colliding tool) and records the count in the init log. The
   MCP permissions-file reconcile still passes **only** the MCP tools — infra tools
-  are local and are **never** seeded into `MCP_PERMISSIONS_FILE`.
+  are local and are **never** seeded into `MCP_PERMISSIONS_FILE`. **The schedule
+  runner is channel-aware (phase 9 + 10):** `_run_schedule(spec)` derives the
+  dedicated-venue row principal from the spec's `identity` —
+  `spec.telegram.user_id` for a telegram-identity run, `qq_chat_id(spec.qq.user_openid)`
+  for a qq-identity run — and calls `process_message` with `spec.memory_scope()`
+  (`telegram:<user_id>` or `qq:<openid>`) and `spec.approval_delivery_chat_id()`
+  (`receiver.telegram.chat_id` for telegram identity, `None` for qq — the QQ approval
+  broker routes by the `qq:` scope prefix, not a chat id). Delivery is delegated to
+  `_deliver_schedule_notification(spec, text)`, which best-efforts the formatted
+  notice (task name + result, or the fixed safe `AgentError` phrase) to **every**
+  present `receiver` channel — telegram via `deliver_markdown`, qq via
+  `deliver_qq_markdown` — where a failure (or a `qq` receiver while the QQ channel is
+  not running, `self._qq_client is None`) is logged by **schedule name only**, never
+  blocks the other channel, and never raises; the `finally` still deletes the venue.
 - **`automation/`** — phase 9 (Automation). Two pure modules, **no** Telegram /
   OpenAI SDK / ORM / AgentService imports: **`cron.py`** is a zero-dependency,
   **strict 5-field** cron grammar (`parse_cron` → frozen `CronSpec`): per-field
@@ -1619,9 +1647,10 @@ The one-paragraph-per-module internals. `CLAUDE.md` keeps the module *map* and t
   `start`/`stop` are **idempotent, never raise**, and `stop` cancels the loop then
   gives in-flight runs a **bounded** chance to finish (a genuinely stuck one is
   cancelled) so shutdown never hangs; sleep is capped at 30 s so `stop` latency
-  stays bounded. The Telegram-specific runner (dedicated fresh conversation →
-  `process_message` → formatted notification → `finally` cleanup) lives in the
-  composition root (`main.py::_run_schedule`), not here.
+  stays bounded. The channel-aware runner (dedicated fresh conversation →
+  `process_message` under the spec's `identity` → multi-channel notification →
+  `finally` cleanup) lives in the composition root (`main.py::_run_schedule`), not
+  here — the scheduler itself only knows a schedule's `name` + `cron`.
 
 ---
 
@@ -2162,13 +2191,24 @@ these startup-time settings.
   five fields: `name` (`[a-z][a-z0-9_-]{0,31}`, **unique** across the list — it also
   derives the dedicated-conversation synthetic id), `cron` (a **strict 5-field**
   expression — see the `automation/` per-module reference; bad cron → `ConfigError`),
-  `chat_id` (**positive** `int`, never `bool`/float/string/`None` — the bound chat the
-  notification + any approval card are delivered to), `user_id` (**positive** `int` —
-  the owner identity the run executes as, so long-term memory retrieval still
-  applies), and `prompt` (the fixed per-run text; non-empty after strip, **≤ 2000**
-  chars). Max **16** schedules, duplicate names refused. A violation is a startup
-  `ConfigError` naming the **schedule (or index) and field**, **never** the `prompt`
-  body or any other field value (mirrors the infra-targets rule).
+  `prompt` (the fixed per-run text; non-empty after strip, **≤ 2000** chars),
+  `identity` (`"telegram"` / `"qq"` — the channel the single run **executes under**:
+  it fixes the memory scope injected and where an in-run `ask` approval card is
+  routed), and `receiver` (a **non-empty** object listing **every** channel that
+  receives the delivered result, keys ⊆ `{"telegram","qq"}`):
+  - **`receiver.telegram`** (optional): `{ "chat_id": <positive int>, "user_id":
+    <positive int> }` — `chat_id` is the delivery chat (and the approval
+    `delivery_chat_id` when `identity=="telegram"`), `user_id` is the owner
+    principal (memory scope + the dedicated row's user column).
+  - **`receiver.qq`** (optional): `{ "user_openid": <non-empty str> }` — the
+    delivery target, and the owner principal when `identity=="qq"`.
+  The `identity`'s receiver **must be present** (`identity=="telegram"` ⇒ `telegram`
+  present; `identity=="qq"` ⇒ `qq` present), which enforces "≥ 1 receiver" for free.
+  All `chat_id` / `user_id` are **positive** `int` (never `bool`/float/string/`None`);
+  `user_openid` is a **non-empty** `str`. Max **16** schedules, duplicate names
+  refused. A violation is a startup `ConfigError` naming the **schedule (or index)
+  and field/key**, **never** the `prompt` body, a `user_openid`, or any other field
+  value (mirrors the infra-targets rule).
 - **`SCHEDULES_FILE`** (default empty): a path (relative to the working directory,
   e.g. `config/schedules.json`) to a standalone file holding the **same** JSON
   **array**. Source selection (the same file-over-inline idea as `MCP_SERVERS_FILE`,
@@ -2190,11 +2230,14 @@ these startup-time settings.
 The schedule list is validated in `load_config` (strict, fail-fast). Schedules come
 **only** from these startup-time settings — the model, chat input, memory, and tool
 arguments can **never** create, modify, delete, or trigger a schedule; changing one
-requires a restart. `chat_id` / `user_id` / `prompt` / the run's reply are **never**
-written to the logs, the audit table, or `/schedule_status` (the `cron` **is** shown
-there, alongside the name and next-fire time — the one allowed schedule attribute in
-a command); the notification itself carries the task name + result (content delivered
-to the owner, allowed).
+requires a restart. `chat_id` / `user_id` / `user_openid` / `prompt` / the run's reply
+are **never** written to the logs, the audit table, or `/schedule_status` (the `cron`
+**is** shown there, alongside the name and next-fire time — the one allowed schedule
+attribute in a command); the notification itself carries the task name + result
+(content delivered to the owner, allowed). The one deliberate exception is the
+**`/user_status`** command on each channel: it returns the caller's own identity
+(Telegram `user_id` + `chat_id`, QQ `user_openid`) **to that caller in-chat** so they
+can fill a schedule's `receiver` — user-facing, and still **never logged**.
 
 ### QQ channel knobs (phase 10 — multi-channel, C2C plain text + commands)
 
@@ -2224,7 +2267,7 @@ are always available once `QQ_APP_ID` is set.
   the secret is used exactly once, to start the websocket, and should not ride on the
   config object that is freely passed around.
 
-**The command set and the panel are config-free.** The 12 slash-commands, their reply
+**The command set and the panel are config-free.** The 13 slash-commands, their reply
 text, and the native command panel are all derived from the hard-coded
 `qq/commands.py::_QQ_COMMANDS` table (single source of truth for both `/help` and the
 panel) — there is no env var to add, reorder, or disable a QQ command. `config` and
@@ -2765,12 +2808,19 @@ A map of which behaviours each phase covers:
   safe-skipped, **no catch-up** on (re)start, idempotent `start`/`stop` leaving no
   dangling task, bounded drain of an in-flight run), `tests/test_schedule_runner.py`
   (the composition-root `_run_schedule`: dedicated **reserved-range** synthetic venue
-  via `reset_conversation(name-derived id, user_id)`, `process_message` **exactly
-  once** with `memory_scope` + `delivery_chat_id`, a single formatted notification to
-  `spec.chat_id` carrying name + result **not** the prompt, empty reply → no
-  notification, long result chunked, `AgentError` → fixed safe notice, a generic
+  via `reset_conversation(name-derived id, row_user_id)` where the row principal is
+  `spec.telegram.user_id` for a telegram-identity run or `qq_chat_id(spec.qq.user_openid)`
+  for a qq-identity run, `process_message` **exactly
+  once** with `spec.memory_scope()` + `spec.approval_delivery_chat_id()`, a formatted
+  notification carrying name + result **not** the prompt delivered to **every**
+  present `receiver` channel (telegram via `deliver_markdown`, qq via
+  `deliver_qq_markdown`), empty reply → no notification, long result chunked,
+  `AgentError` → fixed safe notice to all configured receivers, a generic
   exception → no notification, **`finally` always deletes the venue**, a failed
-  send is swallowed, and prompt/reply never reach Telegram text or logs),
+  send on one channel is swallowed (logged by name only, never the openid) without
+  blocking the other, a `qq` receiver while `self._qq_client is None` → a safe
+  "channel not running" warning and skip, and prompt/reply/openid never reach the
+  channel text or logs),
   `tests/test_main_scheduling_wiring.py` (empty `SCHEDULES` → **no scheduler
   object** so no task is ever started and the startup sweep is a no-op; non-empty →
   the scheduler is wired to the bound `_run_schedule` runner + `SCHEDULE_TIMEZONE`),
@@ -2846,7 +2896,7 @@ mocked** — no real QQ/LLM/network/subprocess.
 
 **Slash-commands, reply-quoting, and the panel** (same file): (11) **Dispatch** —
 `/new` → `service.reset(cid, cid)` + ack and **no** agent turn / no conversation
-row; `/help` lists all 12 commands; an **unknown** `/…` falls through to the agent
+row; `/help` lists all 13 commands; an **unknown** `/…` falls through to the agent
 as a normal `source="qq"` turn (never swallowed); the command *name* is logged but a
 `/remember` **argument** (and the raw openid) is **not** (same test asserts the
 memory scope `qq:<openid>` was used). (12) **Each command** reuses the
@@ -2859,12 +2909,14 @@ none-yet branch), `/context` (none-yet branch; metadata-only), `/remember` /
 `total_tools`; disabled when manager is `None`), `/infra_status` (`local_tool_name`
 per observation; **never** a host/port/path/command — only target name + tool
 names; disabled when no targets), `/schedule_status` (name + cron + next-fire only,
-**never** prompt/chat_id/user_id; disabled when none). Each command's reply is a
+**never** prompt/chat_id/user_id; disabled when none), `/user_status` (returns the
+caller's own `user_openid` recovered from the `qq:` scope prefix, Markdown, user-facing
+in-chat but the openid is **never** in `caplog`). Each command's reply is a
 `CommandReply`, and the test asserts the **delivery type follows the shape**: a
 **simple** receipt (`/new`, `/remember`, the `/forget` outcomes, the disabled /
 "none-yet" notices) is plain (`msg_type=0`), a **structured** display (`/help`,
 `/status`, `/context`, the `/memories` list, `/mcp_status` / `/infra_status` /
-`/schedule_status` enabled) is Markdown (`msg_type=2`). (13) **`/stop`** — the turn
+`/schedule_status` / `/user_status` enabled) is Markdown (`msg_type=2`). (13) **`/stop`** — the turn
 registers its `asyncio.Task` in the QQ-local `_in_flight`; a `/stop` from a *separate*
 message cancels it (asserted via `pytest.raises(CancelledError)` on the turn task),
 the `/stop` sends nothing, the cancelled turn posts a plain-text "已停止" notice
@@ -3177,9 +3229,11 @@ drains both. **All mocked** — no real QQ/LLM/network/subprocess.
   no `/mcp` / `/mcp auth` — the MCP **OAuth login is Telegram-bound** (it returns an
   inline login *button* and a proactive completion notification; QQ has no inline
   button and its proactive send is rate-limited — 2/channel/day inside a 5-minute
-  passive window — so the login flow is not reliably deliverable). The 12 commands that
+  passive window — so the login flow is not reliably deliverable). The 13 commands that
   *are* available: `/new` `/stop` `/help` `/status` `/context` `/remember` `/memories`
-  `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status`.
+  `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status`
+  `/user_status` (returns the caller's own `user_openid` in-chat; user-facing, never
+  logged).
 - **Reply-quoting covers the answer, not the panel.** A normal answer's first chunk
   carries a `message_reference` quoting the user's message; command acks and error
   notices do not (there is nothing to quote for them). `/stop`'s "已停止" notice quotes
@@ -3188,6 +3242,20 @@ drains both. **All mocked** — no real QQ/LLM/network/subprocess.
   panel caps each item's `name` at 14 characters; `/schedule_status` is 16 (incl. the
   slash), so it is dropped from the panel by the length filter while remaining
   typeable by hand (and listed in `/help`).
+- **A schedule's `receiver` is a *delivery* list; `identity` is the *run* identity.**
+  A fire runs the agent **once**, under the channel named by `identity` (which fixes
+  the memory scope and the approval-card channel), and then delivers the one result
+  to **every** channel present in `receiver`. `identity`'s receiver must be present,
+  so a run always has a well-formed home identity. The two are independent: an
+  `identity="telegram"` schedule with both receivers runs as the Telegram user but
+  still pushes the result to the QQ `user_openid` too.
+- **A scheduled QQ delivery needs the QQ channel actually running.** If a schedule has
+  a `receiver.qq` but the QQ channel is off (no `QQ_APP_ID`, or a login failure), the
+  QQ leg is skipped with a safe warning by schedule name (the `user_openid` is never
+  logged) and the Telegram leg (if any) is unaffected — it is a runtime degradation,
+  **not** a `ConfigError` (consistent with how the QQ channel itself degrades). The
+  QQ send is a **proactive** C2C message (no `msg_id`/`msg_seq`), outside the 5-min
+  passive window.
 
 ---
 

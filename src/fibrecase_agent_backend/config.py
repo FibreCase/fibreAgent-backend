@@ -119,13 +119,45 @@ class InfraSshTarget:
 
 
 @dataclass(frozen=True)
+class ScheduleTelegramReceiver:
+    """The Telegram half of a schedule's ``receiver`` (optional).
+
+    * ``chat_id`` — the **delivery** Telegram chat id (a positive int): where the
+      schedule's result / failure notice is sent.
+    * ``user_id`` — the **owner** Telegram user id (a positive int). It is the
+      memory scope principal (``telegram:<user_id>``) when the schedule's
+      ``identity`` is ``"telegram"``, and the ``telegram_user_id`` stored on the
+      dedicated conversation row. (A ``"qq"``-identity schedule may still carry
+      this to also deliver to Telegram; then the row stores the QQ synthetic id,
+      so ``user_id`` is only *read* for the scope/principal when the identity is
+      ``"telegram"``.)
+    """
+
+    chat_id: int
+    user_id: int
+
+
+@dataclass(frozen=True)
+class ScheduleQQReceiver:
+    """The QQ half of a schedule's ``receiver`` (optional).
+
+    * ``user_openid`` — the C2C per-app identity (a non-empty string) of the QQ
+      user the result / failure notice is sent to. When the schedule's
+      ``identity`` is ``"qq"`` this is also the memory scope principal
+      (``qq:<user_openid>``) and the owner of the dedicated conversation.
+    """
+
+    user_openid: str
+
+
+@dataclass(frozen=True)
 class ScheduleSpec:
     """One validated, operator-configured cron schedule (phase 9 — Automation).
 
     A schedule fires the Agent on a time basis, in a *dedicated fresh
     conversation*, running ``prompt`` through the normal
-    ``AgentService.process_message()`` and then delivering a formatted
-    notification (task name + result) to ``chat_id``.
+    ``AgentService.process_message()`` **once**, and then delivering a formatted
+    notification (task name + result) to **every** channel named in ``receiver``.
 
     Every field is **startup operator config**: the model, chat input, memory,
     and tool arguments can never create / modify / trigger a schedule.
@@ -137,22 +169,57 @@ class ScheduleSpec:
       :func:`.automation.cron.parse_cron` (a bad cron is a startup
       ``ConfigError`, never a silent "never fires"). The expression is stored as
       a string and re-parsed by the scheduler; it is never logged.
-    * ``chat_id`` — the **delivery** Telegram chat id (a positive int): where the
-      notification and any approval cards are sent (usually the owner's private
-      chat with the bot; a group id delivers there instead).
-    * ``user_id`` — the **owner** Telegram user id (a positive int): the memory
-      scope (``telegram:<user_id>``), the approval-callback principal binding,
-      and the ``telegram_user_id`` stored on the dedicated conversation row.
     * ``prompt`` — the fixed, non-empty prompt (≤ 2000 chars) the schedule runs.
       It is never logged, shown in ``/schedule_status``, or written anywhere but
       the dedicated conversation (which is deleted after each run).
+    * ``identity`` — the channel the run **executes** under: ``"telegram"`` or
+      ``"qq"``. It decides (a) the memory scope — ``telegram:<user_id>`` vs
+      ``qq:<user_openid>`` — and therefore which saved long-term memories are
+      injected; and (b) the approval routing — a ``"telegram"`` run carries a
+      ``delivery_chat_id`` (the Telegram card's target), a ``"qq"`` run carries
+      none (the QQ approval broker routes by the ``qq:`` scope prefix). ``identity``
+      must name a **present** receiver, which is also what guarantees at least
+      one receiver is present for every schedule.
+    * ``telegram`` / ``qq`` — the optional :class:`ScheduleTelegramReceiver` /
+      :class:`ScheduleQQReceiver` the result is **delivered** to. At least one is
+      present (the identity's, at minimum; the other may be added so the result
+      reaches both channels). A present receiver whose channel is not actually
+      running (a ``qq`` receiver on a Telegram-only deployment) is *skipped with a
+      warning* at delivery time — never a startup error.
+
+    ``memory_scope()`` and ``approval_delivery_chat_id()`` expose the identity's
+    derived values so the composition-root runner stays free of channel logic.
     """
 
     name: str
     cron: str
-    chat_id: int
-    user_id: int
     prompt: str
+    identity: str
+    telegram: ScheduleTelegramReceiver | None = None
+    qq: ScheduleQQReceiver | None = None
+
+    def memory_scope(self) -> str:
+        """The memory-scope principal this run executes under.
+
+        ``"telegram"`` → ``telegram:<receiver.telegram.user_id>``; ``"qq"`` →
+        ``qq:<receiver.qq.user_openid>``. Both are valid for the identity (its
+        receiver must be present), so this never raises for a parsed schedule.
+        """
+        if self.identity == "telegram":
+            return f"telegram:{self.telegram.user_id}"  # type: ignore[union-attr]
+        return f"qq:{self.qq.user_openid}"  # type: ignore[union-attr]
+
+    def approval_delivery_chat_id(self) -> int | None:
+        """The real Telegram chat id an in-run approval card targets, or ``None``.
+
+        A ``"telegram"`` run returns its receiver's ``chat_id`` (the synthetic
+        schedule venue has no real chat, so the card goes there). A ``"qq"`` run
+        returns ``None`` — the QQ approval broker routes by the ``qq:`` scope
+        prefix, not a chat id.
+        """
+        if self.identity == "telegram":
+            return self.telegram.chat_id  # type: ignore[union-attr]
+        return None
 
 
 @dataclass(frozen=True)
@@ -1255,7 +1322,14 @@ _SCHEDULE_MAX_COUNT = 16
 # The only fields a schedule entry may carry. Any other key is a startup error —
 # a typo is a config error, never silently dropped (so an operator cannot
 # accidentally ship a schedule that behaves differently from what they wrote).
-_SCHEDULE_FIELDS = frozenset({"name", "cron", "chat_id", "user_id", "prompt"})
+_SCHEDULE_FIELDS = frozenset({"name", "cron", "prompt", "identity", "receiver"})
+# The channel a schedule's ``identity`` may name, and the keys a ``receiver``
+# object may carry. Both are a fixed two-channel vocabulary; an unknown value or
+# key is a startup error (not a silent drop).
+_SCHEDULE_IDENTITY_VALUES = frozenset({"telegram", "qq"})
+_SCHEDULE_RECEIVER_CHANNELS = frozenset({"telegram", "qq"})
+_SCHEDULE_TELEGRAM_RECEIVER_FIELDS = frozenset({"chat_id", "user_id"})
+_SCHEDULE_QQ_RECEIVER_FIELDS = frozenset({"user_openid"})
 
 
 def _load_schedules_text() -> str:
@@ -1303,6 +1377,42 @@ def _load_schedules_text() -> str:
     return os.environ.get("SCHEDULES", "")
 
 
+def _parse_schedule_telegram_receiver(where: str, raw: object) -> ScheduleTelegramReceiver:
+    """Validate a ``receiver.telegram`` object into a :class:`ScheduleTelegramReceiver`.
+
+    Both ``chat_id`` and ``user_id`` must be present positive ints (bools
+    rejected). Error text names the schedule + field, never a value.
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} 'receiver.telegram' must be a JSON object")
+    unknown = set(raw) - _SCHEDULE_TELEGRAM_RECEIVER_FIELDS
+    if unknown:
+        raise ConfigError(f"{where} 'receiver.telegram' has unknown field(s): {', '.join(sorted(unknown))}")
+    for id_field in ("chat_id", "user_id"):
+        value = raw.get(id_field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConfigError(f"{where} 'receiver.telegram.{id_field}' must be a positive integer")
+    return ScheduleTelegramReceiver(chat_id=raw["chat_id"], user_id=raw["user_id"])
+
+
+def _parse_schedule_qq_receiver(where: str, raw: object) -> ScheduleQQReceiver:
+    """Validate a ``receiver.qq`` object into a :class:`ScheduleQQReceiver`.
+
+    ``user_openid`` must be a non-empty string. Error text names the field, never
+    the openid value (an openid is a per-app identity, not to be echoed in a
+    startup error).
+    """
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} 'receiver.qq' must be a JSON object")
+    unknown = set(raw) - _SCHEDULE_QQ_RECEIVER_FIELDS
+    if unknown:
+        raise ConfigError(f"{where} 'receiver.qq' has unknown field(s): {', '.join(sorted(unknown))}")
+    openid = raw.get("user_openid")
+    if not isinstance(openid, str) or not openid.strip():
+        raise ConfigError(f"{where} 'receiver.qq.user_openid' must be a non-empty string")
+    return ScheduleQQReceiver(user_openid=openid)
+
+
 def _parse_schedules(raw: str) -> tuple[ScheduleSpec, ...]:
     """Parse + strictly validate the raw schedules JSON *text* into a tuple of
     :class:`ScheduleSpec`. The text is a JSON *array* (resolved from the default
@@ -1317,12 +1427,19 @@ def _parse_schedules(raw: str) -> tuple[ScheduleSpec, ...]:
     * more than :data:`_SCHEDULE_MAX_COUNT` schedules,
     * a missing / non-string ``cron`` or a cron that :func:`.automation.cron.parse_cron`
       rejects (a bad cron is a startup failure, never a silent "never fires"),
-    * a ``chat_id`` / ``user_id`` that is not a positive int (bools rejected),
+    * a missing ``identity`` or one not in :data:`_SCHEDULE_IDENTITY_VALUES`,
+    * a missing / non-object / empty ``receiver``, an unknown ``receiver`` key,
+      or — within a present receiver — a bad / missing ``chat_id`` / ``user_id``
+      (a positive int, bools rejected) or a bad / missing ``user_openid``
+      (a non-empty string),
+    * an ``identity`` whose ``receiver`` is **not** present (e.g. ``identity:
+      "qq"`` with no ``receiver.qq``), which is what enforces "at least one
+      receiver present",
     * a missing / empty ``prompt`` or a ``prompt`` over
       :data:`_SCHEDULE_MAX_PROMPT_CHARS` chars.
 
     Error messages name the *schedule* (once its name is known) or its *index*,
-    and the *field* — **never** the ``prompt`` body (or any other field value),
+    and the *field* — **never** the ``prompt`` body or a ``user_openid`` value,
     mirroring the "don't echo the value" rule for the other providers.
     """
     # Imported here (not at module top) so the pure cron parser stays importable
@@ -1372,10 +1489,33 @@ def _parse_schedules(raw: str) -> tuple[ScheduleSpec, ...]:
         except CronError as exc:
             raise ConfigError(f"{where} 'cron' is invalid: {exc}") from exc
 
-        for id_field in ("chat_id", "user_id"):
-            value = entry.get(id_field)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ConfigError(f"{where} '{id_field}' must be a positive integer")
+        identity = entry.get("identity")
+        if not isinstance(identity, str) or identity not in _SCHEDULE_IDENTITY_VALUES:
+            raise ConfigError(
+                f"{where} 'identity' must be one of: {', '.join(sorted(_SCHEDULE_IDENTITY_VALUES))}"
+            )
+
+        receiver = entry.get("receiver")
+        if not isinstance(receiver, dict) or not receiver:
+            raise ConfigError(
+                f"{where} is missing a valid 'receiver' (a non-empty object with at "
+                f'least one of: {", ".join(sorted(_SCHEDULE_RECEIVER_CHANNELS))})'
+            )
+        unknown_recv = set(receiver) - _SCHEDULE_RECEIVER_CHANNELS
+        if unknown_recv:
+            raise ConfigError(f"{where} 'receiver' has unknown channel(s): {', '.join(sorted(unknown_recv))}")
+
+        telegram_recv = (
+            _parse_schedule_telegram_receiver(where, receiver["telegram"]) if "telegram" in receiver else None
+        )
+        qq_recv = _parse_schedule_qq_receiver(where, receiver["qq"]) if "qq" in receiver else None
+
+        # The identity must name a present receiver. This is what guarantees at
+        # least one receiver is present (the identity's, at minimum).
+        if identity == "telegram" and telegram_recv is None:
+            raise ConfigError(f"{where} identity is 'telegram' but 'receiver.telegram' is missing")
+        if identity == "qq" and qq_recv is None:
+            raise ConfigError(f"{where} identity is 'qq' but 'receiver.qq' is missing")
 
         prompt = entry.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -1389,9 +1529,10 @@ def _parse_schedules(raw: str) -> tuple[ScheduleSpec, ...]:
             ScheduleSpec(
                 name=name,
                 cron=cron,
-                chat_id=entry["chat_id"],
-                user_id=entry["user_id"],
                 prompt=prompt,
+                identity=identity,
+                telegram=telegram_recv,
+                qq=qq_recv,
             )
         )
     return tuple(schedules)

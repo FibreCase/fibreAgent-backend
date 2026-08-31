@@ -5,6 +5,6 @@ composition root's entry point) and the :class:`QQChannel` handler object
 (constructed directly by the tests, without a live ``botpy`` client).
 """
 
-from .bot import QQChannel, build_qq_client
+from .bot import QQChannel, build_qq_client, deliver_qq_markdown
 
-__all__ = ["QQChannel", "build_qq_client"]
+__all__ = ["QQChannel", "build_qq_client", "deliver_qq_markdown"]

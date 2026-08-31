@@ -41,8 +41,22 @@ def _load(monkeypatch, **extra):
     return load_config()
 
 
-def _sched(name="daily", cron="0 7 * * *", chat_id=1, user_id=1, prompt="do the check"):
-    return {"name": name, "cron": cron, "chat_id": chat_id, "user_id": user_id, "prompt": prompt}
+def _sched(name="daily", cron="0 7 * * *", prompt="do the check",
+           identity="telegram", telegram=(1, 1), qq=None):
+    """A default schedule with an overridable ``receiver``.
+
+    ``telegram`` is ``None`` or a ``(chat_id, user_id)`` pair → ``receiver.telegram``;
+    ``qq`` is ``None`` or a ``user_openid`` string → ``receiver.qq``. The default is
+    a ``"telegram"``-identity, telegram-receiver-only schedule. Tests that used the
+    old flat ``chat_id`` / ``user_id`` knobs retarget onto ``telegram=(chat_id,
+    user_id)``; a ``"qq"`` identity sets ``telegram=None, qq=<openid>``.
+    """
+    receiver: dict = {}
+    if telegram is not None:
+        receiver["telegram"] = {"chat_id": telegram[0], "user_id": telegram[1]}
+    if qq is not None:
+        receiver["qq"] = {"user_openid": qq}
+    return {"name": name, "cron": cron, "prompt": prompt, "identity": identity, "receiver": receiver}
 
 
 def _mkfiles_write(path, text):
@@ -75,9 +89,38 @@ def test_schedules_parses_one(monkeypatch):
     s = cfg.schedules[0]
     assert s.name == "daily"
     assert s.cron == "0 7 * * *"
-    assert s.chat_id == 1
-    assert s.user_id == 1
+    assert s.identity == "telegram"
+    assert s.telegram.chat_id == 1
+    assert s.telegram.user_id == 1
+    assert s.qq is None
+    assert s.memory_scope() == "telegram:1"
+    assert s.approval_delivery_chat_id() == 1
     assert s.prompt == "do the check"
+
+
+def test_schedules_parses_qq_identity(monkeypatch):
+    cfg = _load(monkeypatch, SCHEDULES=json.dumps([_sched(identity="qq", telegram=None, qq="AxB")]))
+    s = cfg.schedules[0]
+    assert s.identity == "qq"
+    assert s.qq.user_openid == "AxB"
+    assert s.telegram is None
+    assert s.memory_scope() == "qq:AxB"
+    assert s.approval_delivery_chat_id() is None
+
+
+def test_schedules_parses_both_receivers(monkeypatch):
+    # identity=qq but BOTH receivers present → delivered to both channels, the
+    # run executes under the qq identity.
+    cfg = _load(
+        monkeypatch,
+        SCHEDULES=json.dumps([_sched(identity="qq", telegram=(42, 7), qq="AxB")]),
+    )
+    s = cfg.schedules[0]
+    assert s.identity == "qq"
+    assert s.telegram.chat_id == 42
+    assert s.qq.user_openid == "AxB"
+    assert s.memory_scope() == "qq:AxB"
+    assert s.approval_delivery_chat_id() is None
 
 
 def test_schedules_parses_multiple(monkeypatch):
@@ -171,23 +214,119 @@ def test_schedules_rejects_bad_cron(monkeypatch, cron):
 
 
 # ===========================================================================
-# chat_id / user_id validation (positive int, bools rejected)
+# identity + receiver validation
 # ===========================================================================
-@pytest.mark.parametrize("chat_id", [0, -1, "1", 1.0, True, None, "abc"])
-def test_schedules_rejects_bad_chat_id(monkeypatch, chat_id):
+def _bad_identity(identity):
+    return {"name": "x", "cron": "0 7 * * *", "prompt": "p", "identity": identity,
+            "receiver": {"telegram": {"chat_id": 1, "user_id": 1}}}
+
+
+@pytest.mark.parametrize("identity", [None, "", "TG", "tg", 1, ["telegram"], "slack"])
+def test_schedules_rejects_bad_identity(monkeypatch, identity):
     with pytest.raises(ConfigError):
-        _load(monkeypatch, SCHEDULES=json.dumps([_sched(chat_id=chat_id)]))
+        _load(monkeypatch, SCHEDULES=json.dumps([_bad_identity(identity)]))
+
+
+def test_schedules_rejects_missing_identity(monkeypatch):
+    d = _sched()
+    del d["identity"]
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+@pytest.mark.parametrize("receiver", [None, "x", "telegram", ["telegram"], {}])
+def test_schedules_rejects_bad_receiver(monkeypatch, receiver):
+    d = _sched()
+    d["receiver"] = receiver
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+def test_schedules_rejects_unknown_receiver_channel(monkeypatch):
+    d = _sched()
+    d["receiver"]["slack"] = {"foo": 1}
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+def test_schedules_rejects_identity_without_its_receiver(monkeypatch):
+    # identity=qq but only a telegram receiver present.
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([_sched(identity="qq", telegram=(1, 1), qq=None)]))
+    # identity=telegram but only a qq receiver present.
+    d = _sched(identity="telegram", telegram=None, qq="AxB")
+    d["receiver"] = {"qq": {"user_openid": "AxB"}}
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+# --- receiver.telegram.chat_id / user_id (positive int, bools rejected) ------
+@pytest.mark.parametrize("chat_id", [0, -1, "1", 1.0, True, None, "abc"])
+def test_schedules_rejects_bad_telegram_chat_id(monkeypatch, chat_id):
+    d = _sched()
+    d["receiver"]["telegram"]["chat_id"] = chat_id
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
 
 
 @pytest.mark.parametrize("user_id", [0, -1, "1", 1.0, True, None])
-def test_schedules_rejects_bad_user_id(monkeypatch, user_id):
-    with pytest.raises(ConfigError):
-        _load(monkeypatch, SCHEDULES=json.dumps([_sched(user_id=user_id)]))
-
-
-def test_schedules_missing_chat_id_rejected(monkeypatch):
+def test_schedules_rejects_bad_telegram_user_id(monkeypatch, user_id):
     d = _sched()
-    del d["chat_id"]
+    d["receiver"]["telegram"]["user_id"] = user_id
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+def test_schedules_rejects_telegram_receiver_missing_chat_id(monkeypatch):
+    d = _sched()
+    del d["receiver"]["telegram"]["chat_id"]
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+def test_schedules_rejects_telegram_receiver_missing_user_id(monkeypatch):
+    d = _sched()
+    del d["receiver"]["telegram"]["user_id"]
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+def test_schedules_rejects_unknown_telegram_receiver_field(monkeypatch):
+    d = _sched()
+    d["receiver"]["telegram"]["bogus"] = 1
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+def test_schedules_rejects_non_object_telegram_receiver(monkeypatch):
+    d = _sched()
+    d["receiver"]["telegram"] = "not-an-object"
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+# --- receiver.qq.user_openid (non-empty string) -----------------------------
+def _qq_sched(user_openid):
+    return {"name": "x", "cron": "0 7 * * *", "prompt": "p", "identity": "qq",
+            "receiver": {"qq": {"user_openid": user_openid}}}
+
+
+@pytest.mark.parametrize("user_openid", [None, "", "   ", 123, ["a"], {"a": 1}])
+def test_schedules_rejects_bad_qq_user_openid(monkeypatch, user_openid):
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([_qq_sched(user_openid)]))
+
+
+def test_schedules_rejects_qq_receiver_missing_user_openid(monkeypatch):
+    d = _qq_sched("AxB")
+    del d["receiver"]["qq"]["user_openid"]
+    with pytest.raises(ConfigError):
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
+
+
+def test_schedules_rejects_unknown_qq_receiver_field(monkeypatch):
+    d = _qq_sched("AxB")
+    d["receiver"]["qq"]["chat_id"] = 5
     with pytest.raises(ConfigError):
         _load(monkeypatch, SCHEDULES=json.dumps([d]))
 
@@ -246,12 +385,24 @@ def test_schedules_bad_cron_error_names_schedule_not_prompt(monkeypatch):
 
 def test_schedules_bad_chat_id_error_names_field_not_value(monkeypatch):
     secret = "SECRET-PROMPT-ABC"
+    d = _sched(name="nightly", telegram=(-5, 1), prompt=secret)
     with pytest.raises(ConfigError) as exc:
-        _load(monkeypatch, SCHEDULES=json.dumps([_sched(name="nightly", chat_id=-5, prompt=secret)]))
+        _load(monkeypatch, SCHEDULES=json.dumps([d]))
     msg = str(exc.value)
     assert "chat_id" in msg
+    assert "receiver.telegram" in msg
     assert "-5" not in msg  # the (bad) value is not echoed
     assert secret not in msg
+
+
+def test_schedules_bad_user_openid_error_names_field_not_value(monkeypatch):
+    # A non-string openid is rejected; the error names the field but never echoes
+    # the (bad) value — mirroring the "don't echo the value" rule for other providers.
+    with pytest.raises(ConfigError) as exc:
+        _load(monkeypatch, SCHEDULES=json.dumps([_qq_sched(12345)]))
+    msg = str(exc.value)
+    assert "user_openid" in msg
+    assert "12345" not in msg  # the (bad) value is not echoed
 
 
 def test_schedules_overlong_prompt_error_names_length_not_body(monkeypatch):

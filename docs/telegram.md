@@ -52,6 +52,8 @@ Bot 支持以下命令（输入 `/` 会弹出 Telegram 原生命令菜单，或�
 | `/mcp auth <server>` | 为**你的账号**发起第三方 OAuth 登录（如 `/mcp auth gcal`）：返回一个**内联 URL 登录按钮**（点一下即跳转，无需复制 URL）+ 一条有效期提示。凭据绑定到你的 Telegram user（不是会话），自动刷新；`/new` 与重启不影响。需要 `OAUTH_CALLBACK_BASE_URL` 与相应 provider 凭据已配置，否则给出安全提示。 |
 | `/mcp_status` | 只读查看已配置的远程 MCP 服务器状态：每台的名称、`available`/`unavailable`、发现到的工具数，以及可用工具总数。**不**发起连接/刷新，也不调用 LLM 或 MCP；未配置（或 `ENABLE_TOOLS=false`）时显示「MCP: disabled」；**绝不**显示 URL/host/token/头/工具描述或服务器 instructions。 |
 | `/infra_status` | 只读查看已配置的 SSH 观测目标：每个目标的名称 + 其三个只读工具名 + 总数。**不**连接、**不**探活、**不**调 LLM，也明确不显示任何可达性结论；无目标（或 `ENABLE_TOOLS=false`）时显示「Infrastructure: disabled」；**绝不**显示 host/端口/用户名/key 路径/known_hosts 路径/mount/service/命令。 |
+| `/schedule_status` | 只读查看**已配置**定时任务的**名字 + cron + 下次触发时间**（在 `SCHEDULE_TIMEZONE`/本地时区下算）；**只**显示这三项，**绝不**显示 prompt/chat_id/user_id；不触发运行、不调 LLM；未配置时显示 disabled。 |
+| `/user_status` | 显示**你本人**的身份：`user_id` + `chat_id`（填定时任务的 `receiver.telegram` 用）；只回显给本人、**绝不**进日志/审计。 |
 | `/help` | 列出本帮助 |
 
 其它任何文字消息都会作为对话发给 Agent。

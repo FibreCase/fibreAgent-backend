@@ -44,17 +44,17 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - **Agent Service 渠道无关**：未来接 Web UI / Discord / HTTP API 都复用同一个 `AgentService`。QQ（C2C）就是第一个非 Telegram 渠道：`qq/bot.py` 把一条 C2C 文本归一化成 `AgentMessage(source="qq")`，调用同一个 `process_message()`，再经 QQ websocket 回发——工具循环、工具安全门、上下文预算、长期记忆对它全部原样工作。QQ 的 slash 命令（`qq/commands.py`，纯 Python、无 `botpy`、不 import `telegram/`）复用**同一批**渠道无关的 `AgentService` 方法（`reset` / `conversation_status` / `context_status` / 记忆方法 / `list_tool_audit_events`）与启动期 `Config` / `McpManager`，只换掉「交付」这一层——与 Telegram 的命令共用核心、各自实现传输，正是不改核心的例子。
 - **只有 `llm/client.py` 知道 OpenAI 协议**；只有 `database/` 知道 ORM/SQL。
 - `attachments/` 与 `memory/` 两个包**不含**任何 Telegram / OpenAI SDK / ORM 依赖（纯 Python + 文件系统）；`mcp/` 同样不含 Telegram / OpenAI SDK / ORM（只依赖 MCP SDK + 其 HTTP client / stdio 子进程）。`qq/` 是唯一 import `botpy` 的包（`build_qq_client` 内懒加载，仅在 QQ 渠道开启时才导入），与 `telegram/` 是唯一 import PTB 的包对称——一个渠道适配器不得 import 另一个渠道。
-- `automation/` **不含**任何 Telegram / OpenAI SDK / ORM / AgentService 依赖：cron 解析（纯 Python，stdlib `zoneinfo`）与后台调度循环只认一个注入的 `runner` 协程；Telegram 专用的 runner（专属会话 → `process_message` → 通知 → 清理）在组合根 `main.py` 里提供。
+- `automation/` **不含**任何 Telegram / OpenAI SDK / ORM / AgentService 依赖：cron 解析（纯 Python，stdlib `zoneinfo`）与后台调度循环只认一个注入的 `runner` 协程，且只读每个 `ScheduleSpec` 的 `name` / `cron`；**渠道感知的 runner**（专属会话 → 按 `identity` 决定记忆作用域与审批渠道路由的 `process_message` → 向 `receiver` 里**每个**渠道投递 → 清理）在组合根 `main.py` 里提供（Telegram 用 `deliver_markdown`、QQ 用 `deliver_qq_markdown`）。
 - 模块之间低耦合：Telegram / Agent / Tool / LLM / Database 各自单一职责。
 
 ## 模块地图
 
 | 模块 | 单一职责 | 依赖边界 |
 | --- | --- | --- |
-| `telegram/bot.py` | 唯一的 Telegram 知识来源：鉴权、命令、渲染、发送 | 只调 `AgentService`，不碰 OpenAI SDK |
+| `telegram/bot.py` | 唯一的 Telegram 知识来源：鉴权、命令（含 `/user_status` 回显调用者本人 `user_id`+`chat_id`）、渲染、发送 | 只调 `AgentService`，不碰 OpenAI SDK |
 | `telegram/media.py` | 唯一的 Telegram 媒体下载来源：照片 → `AgentMessage` | 不碰 OpenAI SDK / DB |
 | `telegram/markdown.py` | 模型 Markdown → Telegram HTML（含分块、400 回退） | 纯函数 |
-| `qq/bot.py` + `qq/commands.py` + `qq/approval.py` | 唯一的 QQ（`botpy` SDK）知识来源：C2C 纯文本鉴权、`AgentMessage` 归一化、分块发送（按形态选 `msg_type`：结构化 Markdown / 简单回执纯文本）、回复引用（`message_reference`）、slash 命令分派与 `/stop` in-flight、原生指令面板、**全局自定义菜单**（`PUT /v2/menu` 整表替换）、**工具审批按钮卡**（`qq/approval.py`：`QQApprovalBroker` 发主动 C2C 卡 + 解析 `INTERACTION_CREATE`、`QQScopedApprovalRouter` 按 scope 前缀把 `qq:` 请求路由到 QQ broker） | 只调渠道无关的 `AgentService` + `config` / `infrastructure` / `automation` / `mcp`（与 `telegram/` 相同的模块）+ `tools.approval`（审批协议）+ `memory.hash_scope`，不碰 OpenAI SDK / DB 类型 / `telegram/`；`qq/approval.py` 与 `qq/commands.py` 是纯 Python、**无** `botpy`（client 经 `bind_client` 注入） |
+| `qq/bot.py` + `qq/commands.py` + `qq/approval.py` | 唯一的 QQ（`botpy` SDK）知识来源：C2C 纯文本鉴权、`AgentMessage` 归一化、分块发送（按形态选 `msg_type`：结构化 Markdown / 简单回执纯文本）、**主动 C2C 投递原语** `deliver_qq_markdown`（无 `msg_id`/`msg_seq` 的 Markdown 主动消息，供组合根把定时运行结果推给 `receiver.qq`）、回复引用（`message_reference`）、slash 命令分派（含 `/user_status` 回显调用者本人 `user_openid`）与 `/stop` in-flight、原生指令面板、**全局自定义菜单**（`PUT /v2/menu` 整表替换）、**工具审批按钮卡**（`qq/approval.py`：`QQApprovalBroker` 发主动 C2C 卡 + 解析 `INTERACTION_CREATE`、`QQScopedApprovalRouter` 按 scope 前缀把 `qq:` 请求路由到 QQ broker） | 只调渠道无关的 `AgentService` + `config` / `infrastructure` / `automation` / `mcp`（与 `telegram/` 相同的模块）+ `tools.approval`（审批协议）+ `memory.hash_scope`，不碰 OpenAI SDK / DB 类型 / `telegram/`；`qq/approval.py` 与 `qq/commands.py` 是纯 Python、**无** `botpy`（client 经 `bind_client` 注入） |
 | `agent/messages.py` | 渠道无关内容模型：`AgentMessage` + `TextContent`/`ImageContent` | 不碰 Telegram 类型 |
 | `agent/context.py` | 唯一的上下文选择者（纯 Python，无 I/O）：估算 + `plan_context()` | 无 Telegram/SDK/ORM/文件系统 |
 | `agent/service.py` | 渠道无关核心：锁、持久化、记忆检索、驱动 tool loop | 调 LLM、DB、附件、记忆 |

@@ -480,10 +480,10 @@ MAX_INFRA_TOOL_RESULT_CHARS=8000
 **示例**
 
 ```
-SCHEDULES=[{"name":"morning-brief","cron":"0 7 * * *","chat_id":123456789,"user_id":987654321,"prompt":"Summarise today's priorities."}]
+SCHEDULES=[{"name":"morning-brief","cron":"0 7 * * *","prompt":"Summarise today's priorities.","identity":"telegram","receiver":{"telegram":{"chat_id":123456789,"user_id":987654321}}}]
 ```
 
-**说明**：定时任务列表，JSON **数组**。空 = 无自动化、不建调度循环、不跑任何定时任务（与空 `MCP_SERVERS` 同构）。每个对象**有且只有**五个字段：`name`（`[a-z][a-z0-9_-]{0,31}`、整表唯一）+ `cron`（**严格 5 字段**，见 [定时任务](scheduling.md)）+ `chat_id`（正整数，通知/审批卡投递到的绑定聊天）+ `user_id`（正整数，运行身份，故长期记忆检索仍生效）+ `prompt`（每次运行的固定文本，非空、≤ 2000 字符）。**启动期强校验**，任何违规都是 `ConfigError`（最多 16 个任务）——**只点名 `name` 与字段，绝不回显 `prompt` 内容或任何密钥**。多任务建议改用 `SCHEDULES_FILE`。
+**说明**：定时任务列表，JSON **数组**。空 = 无自动化、不建调度循环、不跑任何定时任务（与空 `MCP_SERVERS` 同构）。每个对象**有且只有**五个字段：`name`（`[a-z][a-z0-9_-]{0,31}`、整表唯一）+ `cron`（**严格 5 字段**，见 [定时任务](scheduling.md)）+ `prompt`（每次运行的固定文本，非空、≤ 2000 字符）+ `identity`（`"telegram"` / `"qq"`，这次运行**以哪个身份执行**——决定记忆作用域与审批卡投递渠道）+ `receiver`（**至少一个**渠道的投递目标对象：`"telegram":{"chat_id","user_id"}` 和/或 `"qq":{"user_openid"}`；`identity` 对应的那个 receiver 必须存在）。一次运行，结果投递到 `receiver` 里每个存在的渠道。**启动期强校验**，任何违规都是 `ConfigError`（最多 16 个任务）——**只点名 `name` 与字段，绝不回显 `prompt`、`user_openid` 或任何密钥**。QQ 的 `user_openid` 用 `/user_status` 命令查到自己。多任务建议改用 `SCHEDULES_FILE`。
 
 #### `SCHEDULES_FILE`
 
@@ -729,7 +729,7 @@ LOG_COLOR=auto
 
 QQ 渠道**默认关**：一旦设置 `QQ_APP_ID` 即开启（与 MCP / SSH 观测 / 定时任务同类的可选渠道门控）。关闭时 `botpy` 永不 import、不建 websocket，Telegram 照旧。**QQ 的 slash 命令与原生指令面板随渠道一起启用**——没有单独的开关。
 
-可用命令（核心集 + 只读 `/mcp_status`）：`/new` `/stop` `/help` `/status` `/context` `/remember` `/memories` `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status`。与 Telegram 的差异：无 `/start`（QQ 无「开始」概念）、无 `/mcp` / `/mcp auth`（MCP 的 OAuth 登录绑定 Telegram——返回的是内联登录按钮 + 主动完成通知，而 QQ 无内联按钮、主动发送受限，无法可靠送达）。普通回答会**引用**你发的那条消息（`message_reference`，仅首段）。
+可用命令（核心集 + 只读 `/mcp_status` + `/user_status`）：`/new` `/stop` `/help` `/status` `/context` `/remember` `/memories` `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status` `/user_status`。`/user_status` 返回**调用者本人**的 `user_openid`（配置 QQ 定时任务 `receiver.qq` 用），只回显给本人、**绝不**进日志/审计。与 Telegram 的差异：无 `/start`（QQ 无「开始」概念）、无 `/mcp` / `/mcp auth`（MCP 的 OAuth 登录绑定 Telegram——返回的是内联登录按钮 + 主动完成通知，而 QQ 无内联按钮、主动发送受限，无法可靠送达）。普通回答会**引用**你发的那条消息（`message_reference`，仅首段）。
 
 #### `QQ_APP_ID`
 

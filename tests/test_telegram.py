@@ -36,6 +36,7 @@ from fibrecase_agent_backend.telegram.bot import (
     cmd_start,
     cmd_status,
     cmd_stop,
+    cmd_user_status,
     compose_startup_hooks,
     handle_message,
     split_into_chunks,
@@ -337,6 +338,25 @@ async def test_cmd_status_reports_conversation():
     assert "<b>Status:</b> OK" in sent and "test-model" in sent
     # /status reports the backend version.
     assert f"<b>Version:</b> {__version__}" in sent
+
+
+async def test_cmd_user_status_reports_own_identity():
+    # /user_status shows the caller's own user_id + chat_id (the values to fill
+    # into a schedule's receiver.telegram). Rendered through _send_long (Markdown
+    # → HTML), so assert on the raw numbers which survive the conversion.
+    update, chat, context, app, bot = _make(user_id=7, chat_id=42, text="/user_status", allowed=(7,))
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_user_status(update, context)
+    sent = send.await_args.kwargs["text"]
+    assert "7" in sent and "42" in sent
+    assert "user_id" in sent and "chat_id" in sent
+
+
+async def test_cmd_user_status_unauthorized_noop():
+    update, chat, context, app, bot = _make(user_id=999, chat_id=42, text="/user_status", allowed=(1,))
+    with patch.object(Chat, "send_message", new_callable=AsyncMock) as send:
+        await cmd_user_status(update, context)
+    send.assert_not_awaited()
 
 
 async def test_cmd_new_resets_and_confirms():
@@ -808,9 +828,15 @@ class _ScheduleConfig:
 
 
 def _sched(name, cron, *, chat_id=42, user_id=7, prompt="SECRET-PROMPT-BODY"):
-    from fibrecase_agent_backend.config import ScheduleSpec
+    from fibrecase_agent_backend.config import ScheduleSpec, ScheduleTelegramReceiver
 
-    return ScheduleSpec(name=name, cron=cron, chat_id=chat_id, user_id=user_id, prompt=prompt)
+    # /schedule_status only reads name + cron (+ next fire); the receiver values
+    # are a valid telegram-identity construction so the spec builds. The command
+    # never shows the receiver's chat_id/user_id (or the qq openid).
+    return ScheduleSpec(
+        name=name, cron=cron, prompt=prompt,
+        identity="telegram", telegram=ScheduleTelegramReceiver(chat_id=chat_id, user_id=user_id),
+    )
 
 
 def _sent_text(send):

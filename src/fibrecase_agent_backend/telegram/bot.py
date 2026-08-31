@@ -93,6 +93,7 @@ _COMMANDS: list[tuple[str, str]] = [
     ("mcp", "Show MCP servers / start OAuth login"),
     ("infra_status", "Show configured infra targets"),
     ("schedule_status", "Show configured schedules"),
+    ("user_status", "Show your user_id and chat_id"),
     ("help", "Show this help"),
 ]
 
@@ -485,6 +486,30 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "**Database:** OK",
         ]
     # None of the above exposes keys, tokens, or file paths.
+    await _send_long(chat, "\n".join(lines))
+
+
+async def cmd_user_status(update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/user_status — show the caller's own Telegram identity.
+
+    Returns the caller's ``user_id`` (the principal the bot is bound to for
+    approval) and the current ``chat_id`` (where this message was sent) — the two
+    numbers the owner needs to fill in a schedule's ``receiver.telegram``
+    (``user_id`` + ``chat_id``). Both are the *caller's own* values, shown back to
+    the caller in their own chat; behind the allow-list, like every other command.
+    """
+    if not _is_authorized(update, context):
+        return
+    user = update.effective_user
+    chat = update.effective_chat
+    lines = [
+        "**Agent Backend — user status:**",
+        "",
+        f"**user_id:** `{user.id if user is not None else None}`",
+        f"**chat_id:** `{chat.id if chat is not None else None}`",
+        "",
+        "(These are the values to fill in a schedule's `receiver.telegram`.)",
+    ]
     await _send_long(chat, "\n".join(lines))
 
 
@@ -1220,6 +1245,9 @@ def build_application(
     # Phase 9: read-only view of the configured cron schedules + next fire time
     # (config metadata only — no LLM, no trigger, no prompt/chat_id/user_id).
     application.add_handler(CommandHandler("schedule_status", cmd_schedule_status))
+    # The caller's own Telegram identity (user_id + chat_id), shown back to the
+    # caller behind the allow-list (used to fill in a schedule's receiver).
+    application.add_handler(CommandHandler("user_status", cmd_user_status))
     # Phase 4.x: MCP status + user-level OAuth login. ``/mcp auth <server>`` is
     # the single ``/mcp`` command with an ``auth`` argument (Telegram treats it
     # as one command), so it is dispatched inside ``cmd_mcp`` — there is no

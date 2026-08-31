@@ -21,13 +21,13 @@ Telegram Adapter   →   Agent Service   →   Tool Loop   →   LLM Client   �
 - **工具调用 + 工具安全**：每次调用都过一道统一边界——`allow`/`ask`/`deny` 策略 → JSON Schema 校验 → 需要时的一次性人工审批 → 单工具超时 → 只记元数据的 append-only 审计（`/tool_audit` 查看，绝不显示参数/结果）。
 - **远程 MCP 工具**（Streamable HTTP + stdio 本地进程）：启动时把发现的工具注册进同一个 registry（`mcp_<server>__<remote>`、默认 `ask`），**完全复用**上面的安全边界——MCP 只是又一个工具 provider；支持 **per-user OAuth**（`/mcp auth`，凭据绑定到你的账号、自动刷新，`/new` 与重启不影响登录态）。`/mcp_status` 只读查看状态。
 - **只读基础设施观测（SSH）**：对运维配置的目标各产出三个**固定、无参、只读**工具（主机 / 磁盘 / systemd 服务状态，默认 `allow` 无需审批），同样复用上面的安全边界——模型无法指定 host/path/service。`/infra_status` 只读查看（不连接、不探活）。
-- **定时任务（cron）**：在启动配置里声明一个 cron 任务后，后端到点**自动**跑一次 Agent（专属、全新的会话，运行后删除、不留痕），完成后向绑定聊天发一条格式化通知；**完全复用** `process_message` 的既有安全边界（审批卡经 `delivery_chat_id` 路由到你的聊天），**只来自启动配置**（改需重启、不暴露新端口）。`/schedule_status` 只读查看（不触发运行、不显示 prompt）。
+- **定时任务（cron）**：在启动配置里声明一个 cron 任务后，后端到点**自动**跑一次 Agent（专属、全新的会话，运行后删除、不留痕）。每个任务用 `identity` 指定**以哪个渠道身份执行**（决定记忆作用域与审批卡路由）、用 `receiver` 列出**要收结果的渠道**（Telegram 和/或 QQ，至少 `identity` 对应的那个必须存在）——一次运行、结果**每个渠道**都发一条格式化通知；**完全复用** `process_message` 的既有安全边界（`telegram` 身份的审批卡经 `delivery_chat_id` 路由到你的聊天、`qq` 身份经 QQ 按钮卡 broker），**只来自启动配置**（改需重启、不暴露新端口）。`/schedule_status` 只读查看（不触发运行、不显示 prompt）；`/user_status` 帮你查到 `user_id`/`chat_id`（或 QQ 的 `user_openid`）来填 `receiver`。
 - **图片输入 + 持久化**：照片（可带说明）base64 交给模型，并以内容寻址 blob 落盘（SHA-256 去重、原子写），重启后仍在窗口内时重新入窗。
 - **上下文预算管理**：消息数窗口之上再有一道模型无关的估算 token 预算，必要时把历史图片降级为纯文本，绝不让超长请求打爆端点。
 - **显式长期记忆**：`/remember` 显式保存，纯词法检索，跨 `/new` 与重启保留，作为一条明确标注的参考消息注入（不是自动摘要、不是 RAG）。
 - **Markdown 自动渲染**：模型回复的加粗/斜体/代码块/链接转成 Telegram HTML，无法解析时回退纯文本，回复永不丢失；最终回答以 Reply 引用你发的那条消息（长回复只在首段引用一次）。
 - 仅允许你配置的 Telegram User ID 使用，其他人静默拒绝。
-- **多渠道接入——QQ（默认关）**：`QQ_APP_ID` 设置后，同一个渠道无关的 `AgentService` 也接 QQ **C2C（私聊）纯文本**——工具调用、工具安全、上下文预算、长期记忆在 QQ 上原样工作。回复**按形态分型交付**：最终回答与结构化命令展示用 **Markdown**（`msg_type=2`）、简单回执用**纯文本**（`msg_type=0`），长回复分块。QQ 上提供与 Telegram 一致的**核心 slash 命令**（`/new` `/stop` `/help` `/status` `/context` `/remember` `/memories` `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status`），**命令回复与指令面板均用中文**；启动时 best-effort 建 **原生指令面板**（个人发现入口）与**全局自定义菜单**（`PUT /v2/menu`，两个 `send_message` 快捷项：「对话指令」填入 `/help`、「工具能力」填入 `你会使用哪些工具？`）。最终回答用 **`message_reference` 引用你发的那条消息**（长回复只在首段引用一次）。个人 bot、无 allow-list，无群聊/图片/流式、无 `/start` 与 `/mcp auth`（后者的 OAuth 登录绑定 Telegram，见 [当前开发状态](docs/status.md) 的「QQ 渠道的刻意限制」）。
+- **多渠道接入——QQ（默认关）**：`QQ_APP_ID` 设置后，同一个渠道无关的 `AgentService` 也接 QQ **C2C（私聊）纯文本**——工具调用、工具安全、上下文预算、长期记忆在 QQ 上原样工作。回复**按形态分型交付**：最终回答与结构化命令展示用 **Markdown**（`msg_type=2`）、简单回执用**纯文本**（`msg_type=0`），长回复分块。QQ 上提供与 Telegram 一致的**核心 slash 命令**（`/new` `/stop` `/help` `/status` `/context` `/remember` `/memories` `/forget` `/tool_audit` `/mcp_status` `/infra_status` `/schedule_status` `/user_status`），**命令回复与指令面板均用中文**（`/user_status` 回显你本人的 `user_openid` 来填 QQ 定时任务的 `receiver.qq`）；启动时 best-effort 建 **原生指令面板**（个人发现入口）与**全局自定义菜单**（`PUT /v2/menu`，两个 `send_message` 快捷项：「对话指令」填入 `/help`、「工具能力」填入 `你会使用哪些工具？`）。最终回答用 **`message_reference` 引用你发的那条消息**（长回复只在首段引用一次）。个人 bot、无 allow-list，无群聊/图片/流式、无 `/start` 与 `/mcp auth`（后者的 OAuth 登录绑定 Telegram，见 [当前开发状态](docs/status.md) 的「QQ 渠道的刻意限制」）。
 
 ## 快速开始
 
@@ -64,6 +64,7 @@ uv run python -m fibrecase_agent_backend
 | `/mcp_status` | 只读查看已配置远程 MCP 服务器状态（available/unavailable、工具数、总数）；不发起连接、不显示 URL/token |
 | `/infra_status` | 只读查看已配置的 SSH 观测目标及其三个工具（read-only）；不连接、不探活 |
 | `/schedule_status` | 只读查看已配置定时任务的名字 + cron + 下次触发时间；不显示 prompt/chat_id、不触发运行 |
+| `/user_status` | 显示**你本人**的身份（`user_id` + `chat_id`）——填定时任务 `receiver.telegram` 用；只回显给本人、不进日志 |
 | `/help` | 列出帮助 |
 
 其它任何文字消息都会作为对话发给 Agent。完整说明见 [Telegram 接入与命令](docs/telegram.md)。

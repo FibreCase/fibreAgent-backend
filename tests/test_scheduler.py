@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from fibrecase_agent_backend.automation.scheduler import Scheduler
-from fibrecase_agent_backend.config import ScheduleSpec
+from fibrecase_agent_backend.config import ScheduleSpec, ScheduleTelegramReceiver
 
 TZ = ZoneInfo("UTC")
 
@@ -37,7 +37,15 @@ def _t(s: str) -> datetime:
 
 
 def _spec(name: str, cron: str) -> ScheduleSpec:
-    return ScheduleSpec(name=name, cron=cron, chat_id=1, user_id=1, prompt=f"prompt-{name}")
+    # The scheduler loop only reads spec.name + spec.cron; the receiver fields are
+    # a valid telegram-identity construction so the dataclass is well-formed.
+    return ScheduleSpec(
+        name=name,
+        cron=cron,
+        prompt=f"prompt-{name}",
+        identity="telegram",
+        telegram=ScheduleTelegramReceiver(chat_id=1, user_id=1),
+    )
 
 
 class _Recorder:

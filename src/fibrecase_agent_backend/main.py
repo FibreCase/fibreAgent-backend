@@ -28,7 +28,7 @@ from .attachments import AttachmentStore
 from .automation import Scheduler
 from .config import Config, ConfigError, McpServer, load_config
 from .database.audit import RepositoryToolAuditor
-from .database.models import schedule_chat_id
+from .database.models import qq_chat_id, schedule_chat_id
 from .database.oauth import OAuthStorageImpl
 from .database.repository import ConversationRepository
 from .database.session import create_engine, create_session_factory, init_db
@@ -43,7 +43,7 @@ from .mcp.auth import (
     OAuthProvider,
     build_oauth_callback_server,
 )
-from .qq import build_qq_client
+from .qq import build_qq_client, deliver_qq_markdown
 from .qq.approval import QQApprovalBroker, QQScopedApprovalRouter
 from .telegram.approval import TelegramApprovalBroker
 from .telegram.bot import build_application, compose_startup_hooks, deliver_markdown, register_command_menu
@@ -348,22 +348,30 @@ class AgentBackend:
         except TelegramError:
             logger.warning("oauth notifier send failed", extra={"server": mcp_server})
 
-    # Phase 9 (Automation): the Telegram-specific runner the scheduler fires for
-    # each due schedule. Runs as a task on the PTB event loop (created by the
-    # scheduler), so it can drive ``self.service`` and ``self.application.bot``
-    # directly.
+    # Phase 9 (Automation): the runner the scheduler fires for each due schedule.
+    # Runs as a task on the PTB event loop (created by the scheduler), so it can
+    # drive ``self.service``, ``self.application.bot`` (Telegram) and
+    # ``self._qq_client`` (QQ) directly.
     #
-    # Execution model (the phase-9 core decision):
+    # Execution model:
     #   1. prepare a **dedicated, fresh** venue: a synthetic ``telegram_chat_id``
     #      in the reserved range (``schedule_chat_id(spec.name)``) reuses the
     #      ``conversations`` table — no new table. ``reset_conversation`` yields an
-    #      empty history and self-heals a crashed run's leftover row;
+    #      empty history and self-heals a crashed run's leftover row. The row's
+    #      ``telegram_user_id`` is the identity's principal (the Telegram
+    #      ``user_id`` for a ``telegram`` identity; the ``qq_chat_id`` of the
+    #      openid for a ``qq`` identity — mirroring the interactive QQ path, which
+    #      stores the synthetic id in both columns).
     #   2. run the fixed prompt through the *same* channel-agnostic
-    #      ``AgentService.process_message()`` the interactive path uses — with the
-    #      owner's ``memory_scope`` and ``delivery_chat_id=spec.chat_id`` (so any
-    #      approval card goes to the real chat, not the synthetic venue);
-    #   3. deliver a **formatted notification** (task name + result) to
-    #      ``spec.chat_id``; a failure sends a fixed, safe short notice;
+    #      ``AgentService.process_message()`` the interactive path uses — with
+    #      ``spec.memory_scope()`` (so long-term memory retrieval + the right
+    #      principal) and ``spec.approval_delivery_chat_id()`` (a ``telegram`` run
+    #      sends an in-run approval card to its receiver's chat; a ``qq`` run
+    #      passes ``None`` — the QQ broker routes by the ``qq:`` scope prefix).
+    #      The agent runs **once** per fire.
+    #   3. deliver a **formatted notification** (task name + result) to **every**
+    #      channel named in ``spec.receiver`` via :meth:`_deliver_schedule_notification`;
+    #      a failure sends a fixed, safe short notice to the same channels.
     #   4. always (``finally``) delete the dedicated venue, leaving no trace.
     #
     # A scheduled run never enters ``bot_data[_IN_FLIGHT]`` (that slot is the
@@ -372,39 +380,31 @@ class AgentBackend:
     # per-task single-flight.
     async def _run_schedule(self, spec) -> None:
         synthetic_chat_id = schedule_chat_id(spec.name)
-        conversation = await self.repository.reset_conversation(synthetic_chat_id, spec.user_id)
+        # The dedicated row's principal is the identity's owner: the Telegram
+        # user_id, or the QQ openid's synthetic chat id (a qq: conversation row
+        # stores the synthetic id in the telegram_user_id column, like the
+        # interactive path does).
+        row_user_id = (
+            spec.telegram.user_id if spec.identity == "telegram" else qq_chat_id(spec.qq.user_openid)
+        )
+        conversation = await self.repository.reset_conversation(synthetic_chat_id, row_user_id)
         try:
             reply = await self.service.process_message(
                 conversation.id,
                 spec.prompt,
-                memory_scope=f"telegram:{spec.user_id}",
-                delivery_chat_id=spec.chat_id,
+                memory_scope=spec.memory_scope(),
+                delivery_chat_id=spec.approval_delivery_chat_id(),
             )
             if reply:
                 text = f"⏰ **定时任务：{spec.name}**\n\n{reply}"
-                try:
-                    await deliver_markdown(self.application.bot, spec.chat_id, text)
-                except TelegramError:
-                    # Best-effort delivery (mirrors _oauth_notifier): a failed
-                    # notification is logged (by name) and swallowed, never
-                    # raised — the venue cleanup below must still run.
-                    logger.warning(
-                        "scheduled run notification failed",
-                        extra={"schedule": spec.name},
-                    )
+                await self._deliver_schedule_notification(spec, text)
             # An empty reply carries nothing to report: no notification.
         except AgentError as exc:
             # A fixed, safe failure notice: the task name + a category-mapped
             # Chinese phrase. Never the prompt, exception text, or a stack —
             # the owner should know the 7am check failed rather than it vanishing.
             notice = f"⏰ **定时任务：{spec.name}**\n\n{exc.user_safe}"
-            try:
-                await deliver_markdown(self.application.bot, spec.chat_id, notice)
-            except TelegramError:
-                logger.warning(
-                    "scheduled run failure notice failed",
-                    extra={"schedule": spec.name},
-                )
+            await self._deliver_schedule_notification(spec, notice)
         except Exception:
             # Fault isolation is already guaranteed by the scheduler, but the
             # runner must not leak venue cleanup: log by name + class only.
@@ -423,6 +423,44 @@ class AgentBackend:
                     "scheduled run venue cleanup failed",
                     extra={"schedule": spec.name, "conversation_id": conversation.id},
                 )
+
+    async def _deliver_schedule_notification(self, spec, text: str) -> None:
+        """Best-effort delivery of a schedule's notification to every configured
+        receiver.
+
+        Delivers to each channel present in ``spec.receiver``; a failure on one
+        channel (a Telegram send error, a QQ send error, or a QQ receiver on a
+        Telegram-only deployment where ``self._qq_client`` is ``None``) is logged
+        *by schedule name only* and never blocks the other channel or raises —
+        the venue cleanup in :meth:`_run_schedule`'s ``finally`` must still run.
+        The QQ ``user_openid`` is a delivery target and never appears in a log
+        line.
+        """
+        if spec.telegram is not None:
+            try:
+                await deliver_markdown(self.application.bot, spec.telegram.chat_id, text)
+            except TelegramError:
+                logger.warning(
+                    "scheduled run notification failed (telegram)",
+                    extra={"schedule": spec.name},
+                )
+        if spec.qq is not None:
+            if self._qq_client is None:
+                # Configured a QQ receiver but the channel is not running (no
+                # client): skip with a clear warning, mirroring the QQ
+                # channel's own degradation behaviour.
+                logger.warning(
+                    "scheduled run QQ delivery skipped (channel not running)",
+                    extra={"schedule": spec.name},
+                )
+            else:
+                try:
+                    await deliver_qq_markdown(self._qq_client, spec.qq.user_openid, text)
+                except Exception:
+                    logger.warning(
+                        "scheduled run notification failed (qq)",
+                        extra={"schedule": spec.name},
+                    )
 
     # Phase 10 (multi-channel): QQ. The ``botpy`` client is built and started
     # here, on the running PTB loop, and driven as a task — the SDK's own

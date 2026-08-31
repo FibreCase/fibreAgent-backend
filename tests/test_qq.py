@@ -549,9 +549,30 @@ async def test_command_help_lists_all_commands():
     assert "可用命令" in text
     for name, _desc in _QQ_COMMANDS:
         assert f"/{name}" in text
-    assert len(_QQ_COMMANDS) == 12, "the QQ command set is the 12 core + mcp_status"
+    assert len(_QQ_COMMANDS) == 13, "the QQ command set is the 13 core + mcp_status + user_status"
     # A structured display is delivered as Markdown (msg_type=2).
     assert _reply_type(msg) == QQ_MSG_TYPE_MARKDOWN
+
+
+async def test_command_user_status_returns_own_openid_and_is_not_logged(caplog):
+    # /user_status returns the *caller's own* user_openid (derived from the
+    # memory_scope) in the reply — and, being user-facing, the openid is **not**
+    # logged. It also must not run an agent turn.
+    openid = "openid-alice"
+    service = _FakeService()
+    channel = _channel(service, _FakeRepo(conv_id=5))
+
+    with caplog.at_level("INFO", logger="qq"):
+        msg = _FakeMessage("/user_status", openid=openid)
+        await channel.on_c2c_message_create(msg)
+
+    assert service.calls == [], "/user_status must not run an agent turn"
+    text = _reply_text(msg)
+    assert openid in text  # the caller's own openid is shown to the caller
+    assert _reply_type(msg) == QQ_MSG_TYPE_MARKDOWN
+    # The openid is user-facing (in the reply) but must never reach the logs.
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert openid not in logged
 
 
 async def test_unknown_slash_falls_through_to_agent_turn():

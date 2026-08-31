@@ -41,9 +41,11 @@ import pytest
 from telegram.error import TelegramError
 
 from fibrecase_agent_backend.agent.service import AgentError, _user_safe_for
+from fibrecase_agent_backend.config import ScheduleQQReceiver, ScheduleTelegramReceiver
 from fibrecase_agent_backend.database.models import (
     SCHEDULE_CHAT_ID_BASE,
     SCHEDULE_CHAT_ID_MAX,
+    qq_chat_id,
     schedule_chat_id,
 )
 from fibrecase_agent_backend.main import AgentBackend
@@ -86,23 +88,49 @@ class _RecordingBot:
         self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
 
 
+class _FakeQQClient:
+    """A stand-in for the ``botpy`` client's ``.api`` — records ``post_c2c_message``.
+
+    ``deliver_qq_markdown`` calls ``client.api.post_c2c_message(openid=...,
+    msg_type=..., markdown={"content": ...})``; this records each call so a test
+    can assert the openid target and the (chunked) content.
+    """
+
+    def __init__(self, error: BaseException | None = None):
+        self.sent: list[dict[str, Any]] = []
+        self.error = error
+
+        api = self
+
+        class _Api:
+            async def post_c2c_message(self, **kwargs):
+                if api.error is not None:
+                    raise api.error
+                api.sent.append(kwargs)
+
+        self.api = _Api()
+
+
 class _App:
     def __init__(self, bot: _RecordingBot) -> None:
         self.bot = bot
 
 
-def _make_backend(repo, service: _FakeService, bot: _RecordingBot):
+def _make_backend(repo, service: _FakeService, bot: _RecordingBot, qq_client: _FakeQQClient | None = None):
     """An ``AgentBackend`` with just the attributes ``_run_schedule`` uses.
 
     Built via ``__new__`` so the (heavy) ``__init__`` — which would open the LLM
     client, build the PTB application, discover MCP, etc. — is never run. Also
     spies the venue ``reset_conversation`` / ``delete_conversation`` calls so a
     test can assert *which* ``telegram_chat_id`` (the reserved-range synthetic
-    id) is prepared and torn down, delegating to the real methods.
+    id) and principal are prepared and torn down, delegating to the real methods.
+    ``qq_client`` (the botpy stand-in) is set on ``backend._qq_client`` — ``None``
+    models a Telegram-only deployment (a qq receiver is then skipped + warned).
     """
     backend = AgentBackend.__new__(AgentBackend)
     backend.service = service
     backend.application = _App(bot)
+    backend._qq_client = qq_client
 
     reset_calls: list[tuple[int, int]] = []
     delete_calls: list[int] = []
@@ -125,10 +153,25 @@ def _make_backend(repo, service: _FakeService, bot: _RecordingBot):
     return backend
 
 
-def _spec(name: str, *, chat_id: int = 42, user_id: int = 7) -> Any:
+_UNSET = object()
+
+
+def _spec(name: str = "nightly", *, identity: str = "telegram",
+          telegram=_UNSET, qq=None) -> Any:
+    """Build a schedule spec. Defaults to a ``telegram``-identity, telegram-only
+    receiver (chat 42 / user 7) — the shape the pre-multi-channel tests assume.
+
+    Pass ``qq=ScheduleQQReceiver(user_openid=...)`` to add a QQ receiver, and/or
+    ``identity="qq"`` + ``telegram=None`` for a QQ-identity run.
+    """
     from fibrecase_agent_backend.config import ScheduleSpec
 
-    return ScheduleSpec(name=name, cron="0 7 * * *", chat_id=chat_id, user_id=user_id, prompt=PROMPT)
+    if telegram is _UNSET:
+        telegram = ScheduleTelegramReceiver(chat_id=42, user_id=7)
+    return ScheduleSpec(
+        name=name, cron="0 7 * * *", prompt=PROMPT,
+        identity=identity, telegram=telegram, qq=qq,
+    )
 
 
 def _all_text(bot: _RecordingBot) -> str:
@@ -348,6 +391,128 @@ async def test_scheduled_run_is_a_single_completion_without_tools(repo):
     assert len(service.calls) == 1
     assert len(bot.sent) == 1
     assert bot.sent[0]["chat_id"] == 42
+    assert await repo.get_conversation(schedule_chat_id("nightly")) is None
+
+
+# ---------------------------------------------------------------------------
+# multi-channel (QQ) delivery
+# ---------------------------------------------------------------------------
+OPENID = "QQ-OPENID-XYZ-123"
+
+
+async def test_qq_only_run_uses_qq_scope_and_delivers_to_qq(repo):
+    # identity=qq, only a qq receiver: the run executes under the qq scope, the
+    # row principal is the openid's synthetic chat id, delivery is a proactive
+    # C2C send to the openid (no Telegram send), and the venue is cleaned up.
+    service = _FakeService(reply=REPLY)
+    bot = _RecordingBot()
+    qq = _FakeQQClient()
+    backend = _make_backend(repo, service, bot, qq_client=qq)
+
+    await backend._run_schedule(_spec(identity="qq", telegram=None, qq=ScheduleQQReceiver(user_openid=OPENID)))
+
+    call = service.calls[0]
+    assert len(service.calls) == 1
+    assert call["text"] == PROMPT
+    assert call["memory_scope"] == f"qq:{OPENID}"
+    assert call["delivery_chat_id"] is None  # qq run: the broker routes by scope, not a chat
+
+    # The dedicated row's principal is the qq synthetic chat id (not a real chat).
+    assert backend.reset_calls == [(schedule_chat_id("nightly"), qq_chat_id(OPENID))]
+
+    # Delivered to QQ only (one C2C send to the openid), never to Telegram.
+    assert len(qq.sent) == 1
+    assert qq.sent[0]["openid"] == OPENID
+    assert qq.sent[0]["msg_type"] == 2
+    body = qq.sent[0]["markdown"]["content"]
+    assert "nightly" in body and "REPLY-BODY" in body and PROMPT not in body
+    assert bot.sent == []
+
+    assert await repo.get_conversation(schedule_chat_id("nightly")) is None
+
+
+async def test_both_receivers_deliver_to_both_channels(repo):
+    # identity=qq, both receivers present: the agent runs once, the result is
+    # delivered to BOTH the Telegram chat and the QQ openid.
+    service = _FakeService(reply=REPLY)
+    bot = _RecordingBot()
+    qq = _FakeQQClient()
+    backend = _make_backend(repo, service, bot, qq_client=qq)
+
+    await backend._run_schedule(
+        _spec(identity="qq", telegram=ScheduleTelegramReceiver(chat_id=42, user_id=7),
+              qq=ScheduleQQReceiver(user_openid=OPENID))
+    )
+
+    assert len(service.calls) == 1
+    assert service.calls[0]["memory_scope"] == f"qq:{OPENID}"
+
+    # Both channels got the notification.
+    assert len(bot.sent) == 1 and bot.sent[0]["chat_id"] == 42 and "REPLY-BODY" in bot.sent[0]["text"]
+    assert len(qq.sent) == 1 and qq.sent[0]["openid"] == OPENID and "REPLY-BODY" in qq.sent[0]["markdown"]["content"]
+    assert await repo.get_conversation(schedule_chat_id("nightly")) is None
+
+
+async def test_qq_receiver_skipped_when_channel_not_running(repo, caplog):
+    # A qq receiver but no qq client (Telegram-only deployment): the run still
+    # completes, the Telegram delivery proceeds, the QQ send is skipped + warned
+    # (never an exception), and the openid is not logged.
+    service = _FakeService(reply=REPLY)
+    bot = _RecordingBot()
+    backend = _make_backend(repo, service, bot, qq_client=None)
+
+    await backend._run_schedule(
+        _spec(identity="telegram", telegram=ScheduleTelegramReceiver(chat_id=42, user_id=7),
+              qq=ScheduleQQReceiver(user_openid=OPENID))
+    )
+
+    # Telegram delivered normally.
+    assert len(bot.sent) == 1 and bot.sent[0]["chat_id"] == 42
+    # A warning was logged (by name), and the openid never appears in a log line.
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "QQ delivery skipped" in logged
+    assert OPENID not in logged
+    assert await repo.get_conversation(schedule_chat_id("nightly")) is None
+
+
+async def test_qq_send_failure_is_swallowed_and_other_channel_still_delivers(repo, caplog):
+    # A failing QQ send must not block the Telegram delivery (best-effort per
+    # receiver) and must not leak the openid into the logs.
+    service = _FakeService(reply=REPLY)
+    bot = _RecordingBot()
+    qq = _FakeQQClient(error=RuntimeError("qq flood"))
+    backend = _make_backend(repo, service, bot, qq_client=qq)
+
+    await backend._run_schedule(
+        _spec(identity="telegram", telegram=ScheduleTelegramReceiver(chat_id=42, user_id=7),
+              qq=ScheduleQQReceiver(user_openid=OPENID))
+    )
+
+    # The Telegram receiver still got the notification despite the QQ failure.
+    assert len(bot.sent) == 1 and bot.sent[0]["chat_id"] == 42
+    assert qq.sent == []  # the qq send raised
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "notification failed (qq)" in logged
+    assert OPENID not in logged
+    assert await repo.get_conversation(schedule_chat_id("nightly")) is None
+
+
+async def test_qq_agent_error_notices_both_channels(repo):
+    # An AgentError during the run sends the fixed safe notice to every
+    # configured receiver (telegram + qq), never the prompt.
+    err = AgentError(_user_safe_for("llm_error"), "llm_error")
+    service = _FakeService(error=err)
+    bot = _RecordingBot()
+    qq = _FakeQQClient()
+    backend = _make_backend(repo, service, bot, qq_client=qq)
+
+    await backend._run_schedule(
+        _spec(identity="qq", telegram=ScheduleTelegramReceiver(chat_id=42, user_id=7),
+              qq=ScheduleQQReceiver(user_openid=OPENID))
+    )
+
+    assert "nightly" in bot.sent[0]["text"] and err.user_safe in bot.sent[0]["text"] and PROMPT not in bot.sent[0]["text"]
+    assert "nightly" in qq.sent[0]["markdown"]["content"] and PROMPT not in qq.sent[0]["markdown"]["content"]
     assert await repo.get_conversation(schedule_chat_id("nightly")) is None
 
 

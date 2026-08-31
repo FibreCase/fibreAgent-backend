@@ -365,6 +365,29 @@ class QQChannel:
 _PANEL_REMARK = "fibrecase-c2c"
 
 
+async def deliver_qq_markdown(client, openid: str, markdown_text: str) -> None:
+    """Proactively deliver ``markdown_text`` to an ``openid``'s C2C window.
+
+    The shared delivery primitive for **out-of-band** QQ sends with no inbound
+    message to reply to — the scheduled-run notification is the current user.
+    Like the approval broker's proactive card, each chunk is sent as an
+    *active* ``msg_type=2`` Markdown message (**no** ``msg_id`` / ``msg_seq``),
+    so it is never subject to the passive-reply 5-minute window and cannot
+    collide with a turn's own reply chunks. The text rides the nested
+    ``markdown.content`` field and is split on the :data:`QQ_MAX_MESSAGE_CHARS`
+    cap (no Markdown→anything conversion, mirroring ``_send_long``). The
+    ``openid`` is a *delivery target* and is never part of a log line.
+    """
+    for chunk in _split_for_qq(markdown_text):
+        if not chunk:
+            continue
+        await client.api.post_c2c_message(
+            openid=openid,
+            msg_type=QQ_MSG_TYPE_MARKDOWN,
+            markdown={"content": chunk},
+        )
+
+
 def _c2c_panel_payload() -> dict:
     """Build the full body for ``POST /v2/panels`` (create the C2C command panel).
 

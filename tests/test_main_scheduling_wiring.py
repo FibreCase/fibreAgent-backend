@@ -69,7 +69,8 @@ async def test_nonempty_schedules_wires_runner_and_tz(monkeypatch):
     from zoneinfo import ZoneInfo
 
     schedules = json.dumps(
-        [{"name": "nightly", "cron": "0 7 * * *", "chat_id": 1, "user_id": 1, "prompt": "p"}]
+        [{"name": "nightly", "cron": "0 7 * * *", "prompt": "p", "identity": "telegram",
+          "receiver": {"telegram": {"chat_id": 1, "user_id": 1}}}]
     )
     backend = _build(monkeypatch, SCHEDULES=schedules, SCHEDULE_TIMEZONE="Asia/Shanghai")
     try:
@@ -97,7 +98,7 @@ async def test_unparseable_schedule_is_rejected_at_config(monkeypatch):
     import json
     from fibrecase_agent_backend.config import ConfigError
 
-    monkeypatch.setenv("SCHEDULES", json.dumps([{"name": "bad", "cron": "* * *", "chat_id": 1, "user_id": 1, "prompt": "p"}]))
+    monkeypatch.setenv("SCHEDULES", json.dumps([{"name": "bad", "cron": "* * *", "prompt": "p", "identity": "telegram", "receiver": {"telegram": {"chat_id": 1, "user_id": 1}}}]))
     for k, v in _base_env().items():
         monkeypatch.setenv(k, v)
     with pytest.raises(ConfigError):

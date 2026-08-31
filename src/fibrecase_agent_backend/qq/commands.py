@@ -31,6 +31,14 @@ Privacy mirrors the Telegram layer: none of these commands exposes a key, token,
 endpoint, host, mount path, service name, command, ``prompt``/``chat_id``/
 ``user_id``, or the raw ``user_openid``. They operate on the opaque
 ``memory_scope`` string and the (synthetic) integer conversation id only.
+
+**One deliberate exception:** ``/user_status`` returns the caller's
+``user_openid`` **back to that same owner, in their own chat** — a user-facing
+lookup of the caller's own identity (the C2C per-app id the owner needs, e.g. to
+fill in a schedule's ``receiver.qq.user_openid``). It is *derived* from the
+``memory_scope`` (which is exactly ``"qq:" + openid``) and shown only in the
+command's reply; it is never logged, and it is not written anywhere the owner
+cannot already see it.
 """
 
 from __future__ import annotations
@@ -89,6 +97,7 @@ _QQ_COMMANDS: list[tuple[str, str]] = [
     ("mcp_status", "查看远程 MCP 工具状态"),
     ("infra_status", "查看已配置的基础设施目标"),
     ("schedule_status", "查看已配置的定时任务"),
+    ("user_status", "查看当前对话用户身份"),
 ]
 
 # The native command panel caps each item's ``name`` at 14 characters, and the
@@ -202,6 +211,24 @@ async def cmd_status(service: AgentService, repo: ConversationRepository, config
         ]
     # None of the above exposes keys, tokens, or file paths.
     return CommandReply("\n".join(lines), markdown=True)
+
+
+async def cmd_user_status(memory_scope: str) -> CommandReply:
+    """/user_status — show the caller's own ``user_openid`` (C2C per-app identity).
+
+    The openid is *derived* from the caller's ``memory_scope`` — which this
+    channel builds as exactly ``"qq:" + openid`` — so no extra wiring is needed.
+    It is shown **only in this reply, to the caller** (the owner looking up their
+    own id, e.g. to fill in a schedule's ``receiver.qq.user_openid``) and is never
+    logged. Markdown, since it carries a bold header + a fenced value.
+    """
+    openid = memory_scope.removeprefix("qq:")
+    return CommandReply(
+        "**当前对话用户：**\n\n"
+        "user_openid：`" + openid + "`\n\n"
+        "（这是你在本 Bot 中的唯一身份，可用于配置定时任务的 QQ 接收方。）",
+        markdown=True,
+    )
 
 
 async def cmd_context(service: AgentService, repo: ConversationRepository,
@@ -433,6 +460,7 @@ _DISPATCH: dict[str, "object"] = {
     "mcp_status": cmd_mcp_status,
     "infra_status": cmd_infra_status,
     "schedule_status": cmd_schedule_status,
+    "user_status": cmd_user_status,
 }
 
 
@@ -502,6 +530,8 @@ async def dispatch(
             return await handler(config, mcp_manager)
         if command == "infra_status":
             return await handler(config)
+        if command == "user_status":
+            return await handler(memory_scope)
         # command == "schedule_status"
         return await handler(config)
     except AgentError as exc:
