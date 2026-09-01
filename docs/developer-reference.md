@@ -1982,6 +1982,17 @@ Two non-obvious rules:
 - `SYSTEM_PROMPT` (env) overrides `SYSTEM_PROMPT_PATH` (file) which overrides a
   built-in fallback. File is the intended default (`config/system_prompt.txt`).
 
+### LLM / OpenAI knobs
+
+- **`REASONING_EFFORT`** (default `low`): the reasoning-effort knob sent to the
+  provider on **every** completion — a deployment-wide default, not a per-message
+  override, exactly like `OPENAI_MODEL`. It is always present on the request (never
+  omitted). Validated against `low` / `medium` / `high` / `xhigh`
+  (case-insensitive) at
+  startup; any other value raises `ConfigError` (fail-fast). Only meaningful for
+  reasoning models — a non-reasoning model that rejects the field will surface the
+  provider's error on the first call, so leave it at a value your endpoint accepts.
+
 ### Tool-calling knobs (phase 2.1)
 
 - **`ENABLE_TOOLS`** (default `true`): when `false`, `AgentService` skips the tool

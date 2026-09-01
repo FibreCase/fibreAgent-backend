@@ -61,6 +61,18 @@ OPENAI_TIMEOUT=120
 
 **说明**：单次 LLM 请求超时（秒）。
 
+#### `REASONING_EFFORT`
+
+**默认值**：`low`
+
+**示例**
+
+```
+REASONING_EFFORT=low
+```
+
+**说明**：推理强度（reasoning effort），取值 `low` / `medium` / `high` / `xhigh`（不区分大小写）。对每次 LLM 请求生效，是部署级默认值。取值非法时启动即报错（fail-fast）。仅对支持推理的模型有意义。
+
 ### Telegram
 
 #### `TELEGRAM_BOT_TOKEN`

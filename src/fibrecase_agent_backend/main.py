@@ -92,6 +92,7 @@ class AgentBackend:
             api_key=config.openai_api_key,
             model=config.openai_model,
             timeout=config.openai_timeout,
+            reasoning_effort=config.reasoning_effort,
         )
         # The tool registry is built only when tools are enabled; when disabled
         # the service degrades to the phase-one single-completion path. The two

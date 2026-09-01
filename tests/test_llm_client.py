@@ -53,10 +53,23 @@ async def test_complete_builds_openai_request():
     kwargs = create.call_args.kwargs
     assert kwargs["model"] == "gpt-test"
     assert kwargs["stream"] is False
+    # The reasoning-effort default is always sent to the provider.
+    assert kwargs["reasoning_effort"] == "low"
     assert kwargs["messages"] == [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "hello"},
     ]
+
+
+async def test_complete_sends_configured_reasoning_effort():
+    client = OpenAIClient(
+        base_url="https://example.test/v1", api_key="k", model="gpt-test",
+        timeout=5, reasoning_effort="high",
+    )
+    create = AsyncMock(return_value=_response("hi"))
+    with patch.object(client._client.chat.completions, "create", new=create):
+        await client.complete([ChatMessage("user", "hi")])
+    assert create.call_args.kwargs["reasoning_effort"] == "high"
 
 
 async def test_complete_timeout_translated():

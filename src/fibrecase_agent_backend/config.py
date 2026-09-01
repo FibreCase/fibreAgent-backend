@@ -247,6 +247,11 @@ class Config:
 
     attachment_storage_path: Path
 
+    # OpenAI reasoning-effort for reasoning models: "low" | "medium" | "high"
+    # | "xhigh" (default "low"). A deployment-wide default sent to the provider
+    # on every completion; validated against the allowed set at startup.
+    reasoning_effort: str = "low"
+
     # Phase 2.5: explicit long-term memory. All positive integers; the memory
     # estimated-token sub-budget must not exceed the total context budget.
     # Defaults keep an existing .env (without these keys) working.
@@ -565,6 +570,25 @@ def _normalize_log_color(raw: str, default: str = "auto") -> str:
     if value in ("false", "0", "no", "off"):
         return "false"
     raise ConfigError(f"invalid LOG_COLOR value: {raw!r} (expected auto/true/false)")
+
+
+# ``REASONING_EFFORT`` values. OpenAI's reasoning-effort knob for reasoning
+# models; sent to the provider on every completion.
+_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+
+
+def _normalize_reasoning_effort(raw: str, default: str = "low") -> str:
+    """Normalise ``REASONING_EFFORT`` to a value in ``_REASONING_EFFORTS``.
+
+    ``low`` is the default. Case-insensitive; an unset/blank value falls back
+    to the default. Unknown values are a config error (fail-fast at startup).
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        return default
+    if value in _REASONING_EFFORTS:
+        return value
+    raise ConfigError(f"invalid REASONING_EFFORT value: {raw!r} (expected low/medium/high/xhigh)")
 
 
 def _parse_float(raw: str, default: float) -> float:
@@ -1669,6 +1693,7 @@ def load_config() -> Config:
         openai_api_key=os.environ.get("OPENAI_API_KEY", "").strip(),
         openai_model=os.environ.get("OPENAI_MODEL", "").strip(),
         openai_timeout=_parse_float(os.environ.get("OPENAI_TIMEOUT", ""), 120.0),
+        reasoning_effort=_normalize_reasoning_effort(os.environ.get("REASONING_EFFORT", "")),
         database_url=os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./data/agent.db").strip(),
         system_prompt_path=Path(os.environ.get("SYSTEM_PROMPT_PATH", "config/system_prompt.txt")),
         max_context_messages=_parse_int(os.environ.get("MAX_CONTEXT_MESSAGES", ""), 50),

@@ -142,8 +142,11 @@ class OpenAIClient:
         api_key: str,
         model: str,
         timeout: float = 120.0,
+        *,
+        reasoning_effort: str = "low",
     ) -> None:
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self._client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
 
     async def complete(
@@ -178,6 +181,8 @@ class OpenAIClient:
             kwargs["temperature"] = temperature
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        # Always sent: unlike the optional knobs above it always has a value.
+        kwargs["reasoning_effort"] = self.reasoning_effort
         if tools:
             # Only send the argument when there is something to send; a
             # provider that predates tools may reject an empty ``tools=[]``.
